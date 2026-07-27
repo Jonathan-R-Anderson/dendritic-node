@@ -30,6 +30,81 @@ nodes for encrypted shard storage and recovery.
   maximum disk space donated to the node, enforced immediately without restart.
 - a signed presence heartbeat sent directly to the Syndichan frontend every
   five minutes with User-Agent `Syndichan-Storage-Client/1.0`.
+- an optional public HTTPS gateway candidate service with signed identity and
+  one-use challenge endpoints, strict probe admission, public-address/CGNAT
+  filtering, multi-network quorum evaluation, expiring registrations, gateway
+  health states, and provider-neutral idempotent DNS reconciliation.
+
+## Volunteer HTTPS gateway mode
+
+Gateway mode and DNS mutation are both disabled by default. Ordinary storage
+nodes need no inbound port and continue to exchange shards only over I2P.
+
+The implemented public protocol is:
+
+```text
+GET  /healthz
+GET  /readyz
+GET  /gateway/identity
+POST /gateway/challenge
+```
+
+Identity and challenge responses use the node's existing persistent libp2p
+Ed25519 key. Challenges are accepted only from configured probe identities,
+expire within 60 seconds, are one-use, size-limited, and rate-limited.
+Verification policy rejects private, loopback, link-local, documentation,
+multicast, CGNAT (`100.64.0.0/10`), IPv6 ULA, and Teredo addresses. A valid
+registration requires three admitted probe identities across at least two
+configured network trust domains by default.
+
+Copy the `gateway` and `dns` sections from `gateway.example.json` into the
+generated `config.json`. For direct TLS, install a browser-trusted certificate
+for the configured public hostname and set `tls.mode` to `existing`. For an
+existing nginx/Caddy/HAProxy frontend, set `tls.mode` to `reverse_proxy`, bind
+the client to a private high port, and have the proxy expose only the four
+routes above on public TCP 443. External probes still test the public 443
+endpoint; a local listener is never sufficient for DNS eligibility.
+
+Useful local controls:
+
+```sh
+syndichan-node -gateway-status
+syndichan-node -gateway-enable
+syndichan-node -gateway-disable
+```
+
+`-gateway-enable` validates the hostname and TLS configuration before saving.
+Do not copy a private wildcard key to volunteer machines. The compatible
+deployment is a per-node browser-trusted certificate obtained by the operator,
+or TLS termination at a trusted project edge. Certificate verification is
+never disabled.
+
+The DNS reconciler supports A and AAAA separately, preserves all unmanaged
+records, caps both the desired record count and mutations per pass, and has
+dry-run and emergency-freeze controls. Its production adapter calls a
+project-owned HTTPS authoritative-DNS API. Only a dedicated controller process
+may receive the API token through its environment; gateway nodes must not have
+it. The provider endpoint must independently restrict the token to the one
+configured hostname.
+
+Before a production DNS rollout, keep `dns.dry_run` enabled and inspect the
+planned diff. DNS removal is not instantaneous because recursive resolvers and
+clients cache answers, sometimes beyond the requested TTL.
+
+Gateway diagnostics:
+
+```sh
+# Local process only; this does not prove Internet reachability
+curl --fail http://127.0.0.1:8443/healthz
+
+# Test the real public TLS endpoint from a different network
+curl --fail https://gateway.example.com/readyz
+openssl s_client -connect PUBLIC_IP:443 -servername gateway.example.com
+```
+
+Common verification failures are missing router forwarding, host/cloud
+firewalls, CGNAT, double NAT, an occupied port, an invalid hostname certificate,
+or an IPv6 firewall. Automatic UPnP is intentionally not used.
 
 Peers never receive object keys, plaintext file data, filenames, S3 bucket
 names, MIME types, or IP addresses. A peer can see encrypted shard IDs, byte

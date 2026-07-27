@@ -25,19 +25,89 @@ type Config struct {
 	DataDir  string `json:"data_dir"`
 	S3Listen string `json:"s3_listen"`
 	// CacheOnly: serve our own content but host nothing for other peers.
-	CacheOnly     bool     `json:"cache_only"`
-	UIListen      string   `json:"ui_listen"`
-	P2PListen     []string `json:"p2p_listen"`
-	I2PSAM        string   `json:"i2p_sam"`
-	I2PHTTPProxy  string   `json:"i2p_http_proxy"`
-	AccessKey     string   `json:"access_key"`
-	SecretKey     string   `json:"secret_key"`
-	CapacityBytes int64    `json:"capacity_bytes"`
-	DataShards    int      `json:"data_shards"`
-	ParityShards  int      `json:"parity_shards"`
-	ChunkBytes    int      `json:"chunk_bytes"`
-	TLSCert       string   `json:"tls_cert,omitempty"`
-	TLSKey        string   `json:"tls_key,omitempty"`
+	CacheOnly     bool          `json:"cache_only"`
+	UIListen      string        `json:"ui_listen"`
+	P2PListen     []string      `json:"p2p_listen"`
+	I2PSAM        string        `json:"i2p_sam"`
+	I2PHTTPProxy  string        `json:"i2p_http_proxy"`
+	AccessKey     string        `json:"access_key"`
+	SecretKey     string        `json:"secret_key"`
+	CapacityBytes int64         `json:"capacity_bytes"`
+	DataShards    int           `json:"data_shards"`
+	ParityShards  int           `json:"parity_shards"`
+	ChunkBytes    int           `json:"chunk_bytes"`
+	TLSCert       string        `json:"tls_cert,omitempty"`
+	TLSKey        string        `json:"tls_key,omitempty"`
+	Gateway       GatewayConfig `json:"gateway"`
+	DNS           DNSConfig     `json:"dns"`
+}
+
+type GatewayConfig struct {
+	Enabled        bool                `json:"enabled"`
+	ProbeEnabled   bool                `json:"probe_enabled"`
+	ListenAddress  string              `json:"listen_address"`
+	ListenPort     int                 `json:"listen_port"`
+	PublicHostname string              `json:"public_hostname"`
+	AdvertiseIPv4  bool                `json:"advertise_ipv4"`
+	AdvertiseIPv6  bool                `json:"advertise_ipv6"`
+	ReverseProxy   bool                `json:"reverse_proxy"`
+	TLS            GatewayTLSConfig    `json:"tls"`
+	Verification   VerificationConfig  `json:"external_verification"`
+	Health         GatewayHealthConfig `json:"health"`
+	Eligibility    EligibilityConfig   `json:"eligibility"`
+	// TrustedProbes maps node IDs to base64-encoded public keys. An empty map
+	// admits no probes; a candidate can never authorize itself.
+	TrustedProbes   map[string]string `json:"trusted_probes,omitempty"`
+	ProbeURLs       []string          `json:"probe_urls,omitempty"`
+	PublicAddresses []string          `json:"public_addresses,omitempty"`
+	ProbeNetwork    string            `json:"probe_network,omitempty"`
+}
+
+type GatewayTLSConfig struct {
+	Mode            string `json:"mode"`
+	CertificatePath string `json:"certificate_path,omitempty"`
+	PrivateKeyPath  string `json:"private_key_path,omitempty"`
+}
+
+type VerificationConfig struct {
+	Enabled                     bool `json:"enabled"`
+	MinimumSuccessfulProbes     int  `json:"minimum_successful_probes"`
+	MinimumDistinctNetworks     int  `json:"minimum_distinct_networks"`
+	VerificationTimeoutSeconds  int  `json:"verification_timeout_seconds"`
+	RegistrationValiditySeconds int  `json:"registration_validity_seconds"`
+	ProbeResultValiditySeconds  int  `json:"probe_result_validity_seconds"`
+	ReverifyIntervalSeconds     int  `json:"reverify_interval_seconds"`
+}
+
+type GatewayHealthConfig struct {
+	FailureThreshold     int `json:"failure_threshold"`
+	RecoveryThreshold    int `json:"recovery_threshold"`
+	CheckIntervalSeconds int `json:"check_interval_seconds"`
+	DrainSeconds         int `json:"drain_seconds"`
+}
+
+type EligibilityConfig struct {
+	MinimumUploadMbps    int   `json:"minimum_upload_mbps"`
+	MinimumFreeMemoryMB  int64 `json:"minimum_free_memory_mb"`
+	MinimumFreeDiskMB    int64 `json:"minimum_free_disk_mb"`
+	MaximumCPUPercent    int   `json:"maximum_cpu_percent"`
+	RequirePublicAddress bool  `json:"require_public_address"`
+	RejectCGNAT          bool  `json:"reject_cgnat"`
+}
+
+type DNSConfig struct {
+	Enabled                       bool     `json:"enabled"`
+	Hostname                      string   `json:"hostname"`
+	TTLSeconds                    int      `json:"ttl_seconds"`
+	Provider                      string   `json:"provider"`
+	ProviderEndpoint              string   `json:"provider_endpoint,omitempty"`
+	CredentialsSource             string   `json:"credentials_source"`
+	ReconciliationIntervalSeconds int      `json:"reconciliation_interval_seconds"`
+	DryRun                        bool     `json:"dry_run"`
+	Freeze                        bool     `json:"freeze"`
+	MaxRecords                    int      `json:"max_records"`
+	MaxMutations                  int      `json:"max_mutations"`
+	GatewayNodeIDs                []string `json:"gateway_node_ids,omitempty"`
 }
 
 func DefaultDataDir() (string, error) {
@@ -66,6 +136,31 @@ func Default() (Config, error) {
 		DataShards:    6,
 		ParityShards:  3,
 		ChunkBytes:    1 << 20,
+		Gateway: GatewayConfig{
+			ListenAddress: "0.0.0.0", ListenPort: 443,
+			AdvertiseIPv4: true, AdvertiseIPv6: true,
+			TLS: GatewayTLSConfig{Mode: "existing"},
+			Verification: VerificationConfig{
+				Enabled: true, MinimumSuccessfulProbes: 3,
+				MinimumDistinctNetworks: 2, VerificationTimeoutSeconds: 15,
+				RegistrationValiditySeconds: 300, ProbeResultValiditySeconds: 120,
+				ReverifyIntervalSeconds: 60,
+			},
+			Health: GatewayHealthConfig{
+				FailureThreshold: 3, RecoveryThreshold: 2,
+				CheckIntervalSeconds: 30, DrainSeconds: 60,
+			},
+			Eligibility: EligibilityConfig{
+				MinimumUploadMbps: 10, MinimumFreeMemoryMB: 512,
+				MinimumFreeDiskMB: 1024, MaximumCPUPercent: 90,
+				RequirePublicAddress: true, RejectCGNAT: true,
+			},
+		},
+		DNS: DNSConfig{
+			TTLSeconds: 60, CredentialsSource: "environment",
+			ReconciliationIntervalSeconds: 30, DryRun: true,
+			MaxRecords: 100, MaxMutations: 10,
+		},
 	}, nil
 }
 
@@ -116,6 +211,9 @@ func (c Config) Validate() error {
 	if c.CapacityBytes > 8<<50 {
 		return errors.New("capacity_bytes must not exceed 8 PiB")
 	}
+	if err := c.validateGateway(); err != nil {
+		return err
+	}
 	uiHost, _, err := net.SplitHostPort(c.UIListen)
 	if err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", c.UIListen, err)
@@ -145,6 +243,63 @@ func (c Config) Validate() error {
 	proxyHost, _, err := net.SplitHostPort(proxy.Host)
 	if err != nil || !isLoopback(proxyHost) {
 		return errors.New("i2p_http_proxy must point to a loopback address")
+	}
+	return nil
+}
+
+func (c Config) validateGateway() error {
+	g := c.Gateway
+	if g.ListenPort < 1 || g.ListenPort > 65535 {
+		return errors.New("gateway listen_port must be between 1 and 65535")
+	}
+	if g.Enabled || g.ProbeEnabled {
+		if g.PublicHostname == "" || strings.ContainsAny(g.PublicHostname, "/:@") {
+			return errors.New("gateway public_hostname is required and must be a hostname")
+		}
+		if g.TLS.Mode != "existing" && g.TLS.Mode != "reverse_proxy" {
+			return errors.New("gateway tls mode must be existing or reverse_proxy")
+		}
+		if g.TLS.Mode == "existing" &&
+			(g.TLS.CertificatePath == "" || g.TLS.PrivateKeyPath == "") {
+			return errors.New("gateway existing TLS mode requires certificate and private key paths")
+		}
+	}
+	if g.ProbeEnabled && strings.TrimSpace(g.ProbeNetwork) == "" {
+		return errors.New("probe_network is required when probe mode is enabled")
+	}
+	if g.Enabled && g.Verification.Enabled {
+		if len(g.PublicAddresses) == 0 {
+			return errors.New("gateway public_addresses are required for external verification")
+		}
+		if len(g.ProbeURLs) < g.Verification.MinimumSuccessfulProbes {
+			return errors.New("gateway needs at least as many probe_urls as its quorum")
+		}
+	}
+	v := g.Verification
+	if v.MinimumSuccessfulProbes < 1 || v.MinimumDistinctNetworks < 1 ||
+		v.MinimumDistinctNetworks > v.MinimumSuccessfulProbes {
+		return errors.New("invalid gateway verification quorum")
+	}
+	if v.VerificationTimeoutSeconds < 1 || v.ProbeResultValiditySeconds < 1 ||
+		v.RegistrationValiditySeconds < 1 || v.ReverifyIntervalSeconds < 1 {
+		return errors.New("gateway verification durations must be positive")
+	}
+	if c.DNS.Enabled {
+		if c.DNS.Hostname == "" {
+			return errors.New("dns hostname is required")
+		}
+		if g.PublicHostname != "" && c.DNS.Hostname != g.PublicHostname {
+			return errors.New("dns hostname must match gateway public_hostname when both are configured")
+		}
+		if c.DNS.TTLSeconds < 30 || c.DNS.MaxRecords < 1 || c.DNS.MaxMutations < 1 {
+			return errors.New("invalid dns safety limits")
+		}
+		if c.DNS.Provider == "" {
+			return errors.New("dns provider is required when dns is enabled")
+		}
+		if c.DNS.Provider != "https-api" || c.DNS.ProviderEndpoint == "" {
+			return errors.New("dns provider must be https-api with provider_endpoint")
+		}
 	}
 	return nil
 }

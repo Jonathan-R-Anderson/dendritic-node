@@ -65,6 +65,26 @@ The heartbeat is signed by the libp2p identity, freshness-checked, and
 replay-protected. It uses the fixed User-Agent
 `Syndichan-Storage-Client/1.0`.
 
+## Volunteer gateway trust boundary
+
+Gateway mode is opt-in and does not make the S3 API public. Public handlers
+expose only liveness, readiness, signed identity, and bounded challenge
+responses. A candidate cannot authorize itself as a probe. Probe requests and
+results are signed, short-lived, identity-bound, and subject to an admitted
+probe list and network-diversity quorum.
+
+Probe connections use validated literal public addresses while retaining TLS
+hostname verification, do not follow redirects, and reject local, private,
+link-local, CGNAT, documentation, multicast, transition, and unspecified
+targets. This prevents a DHT record from turning probes into an SSRF primitive.
+
+DNS credentials never belong on volunteer nodes or in DHT records. The
+controller reconciles only managed A/AAAA records for one exact configured
+hostname, preserves unrelated records, and enforces record/mutation caps,
+dry-run mode, and an emergency freeze. A verified gateway remains untrusted
+with content: clients must retain end-to-end encryption and content-hash
+verification.
+
 ## Kademlia availability advisory
 
 The Go Kademlia implementation is covered by `GO-2024-3218`, an availability

@@ -22,11 +22,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	record "github.com/libp2p/go-libp2p-record"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -37,6 +39,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/syndichan/maniwani/storage-client/internal/config"
+	"github.com/syndichan/maniwani/storage-client/internal/gateway"
 	syndii2p "github.com/syndichan/maniwani/storage-client/internal/i2p"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 )
@@ -123,12 +126,15 @@ type leaseRequest struct {
 }
 
 type heartbeatRequest struct {
-	Version       int    `json:"version"`
-	NodeID        string `json:"node_id"`
-	Timestamp     int64  `json:"timestamp"`
-	Nonce         string `json:"nonce"`
-	CapacityBytes int64  `json:"capacity_bytes"`
-	Platform      string `json:"platform"`
+	Version             int                   `json:"version"`
+	NodeID              string                `json:"node_id"`
+	Timestamp           int64                 `json:"timestamp"`
+	Nonce               string                `json:"nonce"`
+	CapacityBytes       int64                 `json:"capacity_bytes"`
+	Platform            string                `json:"platform"`
+	GatewayEnabled      bool                  `json:"gateway_enabled"`
+	GatewayVerified     bool                  `json:"gateway_verified"`
+	GatewayRegistration *gateway.Registration `json:"gateway_registration,omitempty"`
 }
 
 type Node struct {
@@ -148,12 +154,36 @@ type Node struct {
 	replicated     map[string]struct{}
 	// cacheOnly nodes serve their own content but host nothing for anyone
 	// else; see the "store" branch of handleStream.
-	cacheOnly bool
+	cacheOnly           bool
+	gatewayEnabled      atomic.Bool
+	gatewayVerified     atomic.Bool
+	gatewayMu           sync.RWMutex
+	gatewayRegistration *gateway.Registration
 }
 
 // SetCacheOnly makes this node refuse to host other peers' shards. Set once at
 // startup, before the stream handler can see traffic.
 func (n *Node) SetCacheOnly(value bool) { n.cacheOnly = value }
+
+func (n *Node) SetGatewayState(enabled, verified bool) {
+	n.gatewayEnabled.Store(enabled)
+	n.gatewayVerified.Store(enabled && verified)
+}
+
+func (n *Node) SetGatewayRegistration(registration *gateway.Registration) {
+	n.gatewayMu.Lock()
+	defer n.gatewayMu.Unlock()
+	if registration == nil {
+		n.gatewayRegistration = nil
+		return
+	}
+	copy := *registration
+	n.gatewayRegistration = &copy
+}
+
+func (n *Node) RefreshHeartbeat(ctx context.Context) {
+	n.sendHeartbeat(ctx, heartbeatEndpoint)
+}
 
 func Open(ctx context.Context, dataDir, samAddr, httpProxy string, storage *store.Store, logger *log.Logger) (*Node, error) {
 	identity, err := loadOrCreateIdentity(filepath.Join(dataDir, "p2p.key"))
@@ -282,6 +312,60 @@ func (n *Node) Close() error {
 
 func (n *Node) ID() string { return n.host.ID().String() }
 
+// Sign and PublicKey expose only the public operations needed by the gateway
+// protocol. The persistent libp2p private key never leaves the peerstore.
+func (n *Node) Sign(message []byte) ([]byte, error) {
+	key := n.host.Peerstore().PrivKey(n.host.ID())
+	if key == nil {
+		return nil, errors.New("node identity unavailable")
+	}
+	return key.Sign(message)
+}
+
+func (n *Node) PublicKey() ([]byte, error) {
+	key := n.host.Peerstore().PubKey(n.host.ID())
+	if key == nil {
+		return nil, errors.New("node public key unavailable")
+	}
+	return crypto.MarshalPublicKey(key)
+}
+
+func (n *Node) DHTReady() bool {
+	return n.dht != nil && len(n.host.Network().Peers()) > 0
+}
+
+// ConfigureGatewayRecords installs the signed registration validator before
+// any gateway record is read or published. DHT values remain untrusted until
+// this validator verifies candidate identity and the admitted-probe quorum.
+func (n *Node) ConfigureGatewayRecords(validator gateway.DHTValidator) error {
+	namespaces, ok := n.dht.Validator.(record.NamespacedValidator)
+	if !ok {
+		return errors.New("DHT does not use namespaced validation")
+	}
+	namespaces[gateway.DHTNamespace] = validator
+	return nil
+}
+
+func (n *Node) PublishGatewayRegistration(ctx context.Context, registration gateway.Registration) error {
+	value, err := json.Marshal(registration)
+	if err != nil {
+		return err
+	}
+	return n.dht.PutValue(ctx, gateway.DHTKey(registration.NodeID), value)
+}
+
+func (n *Node) GatewayRegistration(ctx context.Context, nodeID string) (gateway.Registration, error) {
+	value, err := n.dht.GetValue(ctx, gateway.DHTKey(nodeID))
+	if err != nil {
+		return gateway.Registration{}, err
+	}
+	var registration gateway.Registration
+	if err := json.Unmarshal(value, &registration); err != nil {
+		return gateway.Registration{}, err
+	}
+	return registration, nil
+}
+
 // PeerCount is how many peers this node is connected to RIGHT NOW. Volunteers
 // are dial-in only behind NAT, so this drops to zero whenever the connection
 // lapses and recovers on the next bootstrap retry -- it is a live gauge, not a
@@ -378,10 +462,15 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 	if _, err := rand.Read(nonceBytes); err != nil {
 		return
 	}
+	n.gatewayMu.RLock()
+	registration := n.gatewayRegistration
+	n.gatewayMu.RUnlock()
 	payload := heartbeatRequest{
 		Version: 1, NodeID: n.host.ID().String(), Timestamp: time.Now().UTC().Unix(),
 		Nonce:         base64.RawURLEncoding.EncodeToString(nonceBytes),
 		CapacityBytes: n.store.Capacity(), Platform: runtime.GOOS + "/" + runtime.GOARCH,
+		GatewayEnabled: n.gatewayEnabled.Load(), GatewayVerified: n.gatewayVerified.Load(),
+		GatewayRegistration: registration,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

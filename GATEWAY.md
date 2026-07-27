@@ -1,0 +1,122 @@
+# Volunteer gateway operations
+
+## Architecture
+
+The storage client keeps one persistent libp2p Ed25519 identity. Kademlia and
+shard exchange remain I2P-only. Gateway verification is the deliberate
+exception: candidates contact admitted probes over direct HTTPS so probes see
+the candidate's real source address and can connect back to that exact address
+on public TCP 443.
+
+Roles are configuration-driven:
+
+- ordinary peers have both `gateway.enabled` and `gateway.probe_enabled` false;
+- candidates enable `gateway.enabled`;
+- probes enable `gateway.probe_enabled` and set a stable `probe_network` trust
+  domain (operator/ASN/prefix);
+- verified gateways are candidates whose current signed results meet quorum;
+- a DNS controller enables `dns.enabled` and is the only process given
+  `SYNDICHAN_DNS_TOKEN`.
+
+One process may be a candidate and probe, but its own probe result never counts.
+
+## Verification flow
+
+1. The candidate starts its TLS listener and confirms its DHT identity exists.
+2. It signs a short-lived request containing its explicitly configured public
+   addresses. Only port 443 is accepted.
+3. Each probe accepts the request only when its TCP source address equals the
+   claimed address. This prevents victim-address SSRF.
+4. The probe connects to that literal address while validating TLS against
+   `public_hostname`; redirects are forbidden.
+5. It fetches the signed identity, submits a signed one-use challenge, checks
+   `/readyz`, then signs its result.
+6. The candidate requires three distinct admitted identities across two
+   configured network trust domains by default.
+7. It signs a five-minute registration and publishes it under
+   `/syndichan-gateway/<node-id>` in Kademlia. Every DHT reader independently
+   validates the gateway signature, probe signatures, expiry, quorum, address
+   policy, and DHT-key binding.
+8. The controller reads only explicitly configured gateway node IDs, computes
+   desired A/AAAA records, and reconciles only managed records for the exact
+   configured hostname.
+
+## Candidate
+
+Edit the generated `config.json` using `gateway.example.json` as a reference.
+Set a real public IP in `public_addresses`, three or more HTTPS probe origins,
+the admitted probe node IDs/public keys, and either:
+
+- `tls.mode: existing` with a browser-trusted per-node certificate and key; or
+- `tls.mode: reverse_proxy`, with nginx/Caddy/HAProxy forwarding public 443 to
+  the configured private listener.
+
+Then:
+
+```sh
+syndichan-node -gateway-enable
+syndichan-node -gateway-status
+syndichan-node
+```
+
+Forward TCP 443 at the router and permit it through host, IPv6, and cloud
+firewalls. A listening socket or UPnP mapping never counts as verification.
+
+## Probe
+
+A probe needs a publicly reachable TLS listener too. Set:
+
+```json
+{
+  "gateway": {
+    "enabled": false,
+    "probe_enabled": true,
+    "probe_network": "operator-a/as64500"
+  }
+}
+```
+
+Install its public key in each candidate's `trusted_probes`. Run the ordinary
+binary; `/probe/verify` appears only when this role is enabled.
+
+## DNS controller
+
+Set `dns.enabled`, the exact `dns.hostname`, `provider: "https-api"`, the
+project authoritative API endpoint, and `gateway_node_ids`. Begin with
+`dry_run: true`. Supply the least-privilege token only to this process:
+
+```sh
+export SYNDICHAN_DNS_TOKEN='token-scoped-to-one-hostname'
+syndichan-node
+```
+
+After audit logs show the expected diff, set `dry_run` false. `freeze: true`
+stops all mutations. The provider API must mark system-owned records as
+`managed`; unmanaged records are never deleted.
+
+## Diagnostics
+
+```sh
+syndichan-node -gateway-status
+curl --fail https://gateway.example.com/healthz
+curl --fail https://gateway.example.com/readyz
+openssl s_client -connect PUBLIC_IP:443 -servername gateway.example.com
+```
+
+If local health works but external probes time out, check router forwarding,
+host/cloud firewalls, CGNAT (`100.64.0.0/10`), double NAT, ISP filtering, and
+IPv6 firewall policy. If TLS fails, correct the certificate chain, hostname,
+and reverse-proxy SNI configuration. No code path disables TLS validation.
+
+## Tests
+
+```sh
+cd storage-client
+go test ./...
+go vet ./...
+```
+
+Tests cover restricted IP ranges, CGNAT, signature binding, self-verification,
+network diversity, replay rejection, health transitions, DHT record selection,
+DNS safety/diff/idempotency, I2P-only peer addresses, signed heartbeats,
+encrypted transfer leases, S3 compatibility, storage quotas, and UI controls.

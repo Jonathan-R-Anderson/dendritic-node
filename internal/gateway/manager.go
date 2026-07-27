@@ -1,0 +1,335 @@
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+type ManagerConfig struct {
+	Addresses            []Address
+	ProbeURLs            []string
+	TrustedProbes        map[string]string
+	MinimumProbes        int
+	MinimumNetworks      int
+	RequestTimeout       time.Duration
+	ResultValidity       time.Duration
+	RegistrationValidity time.Duration
+	Interval             time.Duration
+	StatePath            string
+	SoftwareVersion      string
+	FailureThreshold     int
+	RecoveryThreshold    int
+	DrainDuration        time.Duration
+}
+
+type RegistrationPublisher interface {
+	PublishGatewayRegistration(context.Context, Registration) error
+}
+
+type Manager struct {
+	signer     Signer
+	publisher  RegistrationPublisher
+	config     ManagerConfig
+	client     *http.Client
+	logger     interface{ Printf(string, ...any) }
+	onVerified func(bool)
+	mu         sync.RWMutex
+	current    *Registration
+	health     HealthMachine
+}
+
+func NewManager(signer Signer, publisher RegistrationPublisher, config ManagerConfig,
+	logger interface{ Printf(string, ...any) }, onVerified func(bool)) (*Manager, error) {
+	config.Addresses = NormalizeAddresses(config.Addresses)
+	if len(config.Addresses) == 0 {
+		return nil, errors.New("gateway has no public addresses to verify")
+	}
+	for _, address := range config.Addresses {
+		ip, err := netip.ParseAddr(address.Address)
+		if err != nil || !PublicAddress(ip) || address.Port != 443 {
+			return nil, fmt.Errorf("gateway address %q is not eligible", address.Address)
+		}
+	}
+	if len(config.ProbeURLs) < config.MinimumProbes {
+		return nil, errors.New("fewer probe URLs than the required quorum")
+	}
+	for _, raw := range config.ProbeURLs {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+			parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return nil, fmt.Errorf("probe URL %q must be a credential-free HTTPS origin", raw)
+		}
+	}
+	manager := &Manager{
+		signer: signer, publisher: publisher, config: config, logger: logger,
+		onVerified: onVerified,
+		health:     HealthMachine{State: StateCandidate},
+		client: &http.Client{
+			Timeout: config.RequestTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return errors.New("probe redirects are forbidden")
+			},
+		},
+	}
+	manager.load()
+	return manager, nil
+}
+
+func (m *Manager) Run(ctx context.Context) {
+	m.verify(ctx)
+	interval := m.config.Interval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			m.publishDraining()
+			if m.onVerified != nil {
+				m.onVerified(false)
+			}
+			return
+		case <-ticker.C:
+			m.verify(ctx)
+		}
+	}
+}
+
+func (m *Manager) Current() *Registration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.current == nil {
+		return nil
+	}
+	copy := *m.current
+	return &copy
+}
+
+func (m *Manager) verify(ctx context.Context) {
+	now := time.Now().UTC()
+	request, err := NewVerificationRequest(m.signer, m.config.Addresses, now, m.config.ResultValidity)
+	if err != nil {
+		m.failed(ctx, "create verification request: %v", err)
+		return
+	}
+	body, _ := json.Marshal(request)
+	type response struct {
+		result ProbeResult
+		err    error
+	}
+	responses := make(chan response, len(m.config.ProbeURLs))
+	for _, rawURL := range m.config.ProbeURLs {
+		go func(rawURL string) {
+			result, err := m.requestProbe(ctx, rawURL, body)
+			responses <- response{result: result, err: err}
+		}(rawURL)
+	}
+	var results []ProbeResult
+	for range m.config.ProbeURLs {
+		item := <-responses
+		if item.err == nil {
+			results = append(results, item.result)
+		}
+	}
+	if err := EvaluateQuorum(results, m.config.TrustedProbes, time.Now(),
+		m.config.MinimumProbes, m.config.MinimumNetworks); err != nil {
+		m.failed(ctx, "external verification failed: %v", err)
+		return
+	}
+	m.mu.Lock()
+	if m.health.State == StateDraining || m.health.State == StateUnhealthy ||
+		m.health.State == StateRemoved {
+		recoveryThreshold := m.config.RecoveryThreshold
+		if recoveryThreshold < 1 {
+			recoveryThreshold = 2
+		}
+		m.health = m.health.Observe(true, time.Now(), 1, recoveryThreshold, 0)
+		if m.health.State != StateHealthy {
+			passes := m.health.ConsecutivePasses
+			m.mu.Unlock()
+			if m.logger != nil {
+				m.logger.Printf("gateway recovery check %d/%d passed",
+					passes, recoveryThreshold)
+			}
+			return
+		}
+	}
+	m.mu.Unlock()
+	sequence := uint64(1)
+	if current := m.Current(); current != nil {
+		sequence = current.Sequence + 1
+	}
+	registration, err := NewRegistration(
+		m.signer, m.config.Addresses, results, m.config.TrustedProbes,
+		time.Now(), m.config.RegistrationValidity, sequence,
+		m.config.SoftwareVersion, m.config.MinimumProbes, m.config.MinimumNetworks,
+	)
+	if err != nil {
+		m.failed(ctx, "registration failed: %v", err)
+		return
+	}
+	publishCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err = m.publisher.PublishGatewayRegistration(publishCtx, registration)
+	cancel()
+	if err != nil {
+		m.failed(ctx, "DHT registration publish failed: %v", err)
+		return
+	}
+	if err := m.save(registration); err != nil {
+		m.failed(ctx, "persist registration: %v", err)
+		return
+	}
+	m.mu.Lock()
+	m.current = &registration
+	m.health = HealthMachine{State: StateHealthy}
+	m.mu.Unlock()
+	if m.onVerified != nil {
+		m.onVerified(true)
+	}
+	if m.logger != nil {
+		m.logger.Printf("gateway verified by %d probes across %d networks; registration expires %s",
+			registration.SuccessfulProbes, registration.DistinctNetworks,
+			time.Unix(registration.ExpiresAt, 0).UTC().Format(time.RFC3339))
+	}
+}
+
+func (m *Manager) requestProbe(ctx context.Context, rawURL string, body []byte) (ProbeResult, error) {
+	var result ProbeResult
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		rawURL+"/probe/verify", bytes.NewReader(body))
+	if err != nil {
+		return result, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return result, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return result, fmt.Errorf("probe returned HTTP %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256<<10)).Decode(&result); err != nil {
+		return result, err
+	}
+	key, ok := m.config.TrustedProbes[result.ProbeNodeID]
+	if !ok {
+		return result, errors.New("result came from an untrusted probe")
+	}
+	if err := VerifyProbeResult(result, key, time.Now()); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func (m *Manager) failed(ctx context.Context, format string, args ...any) {
+	m.mu.Lock()
+	failureThreshold := m.config.FailureThreshold
+	if failureThreshold < 1 {
+		failureThreshold = 3
+	}
+	recoveryThreshold := m.config.RecoveryThreshold
+	if recoveryThreshold < 1 {
+		recoveryThreshold = 2
+	}
+	drain := m.config.DrainDuration
+	if drain <= 0 {
+		drain = time.Minute
+	}
+	m.health = m.health.Observe(false, time.Now(), failureThreshold, recoveryThreshold, drain)
+	state := m.health.State
+	m.mu.Unlock()
+	if state == StateDraining || state == StateRemoved {
+		m.publishHealth(ctx, state)
+		if m.onVerified != nil {
+			m.onVerified(false)
+		}
+	}
+	if m.logger != nil {
+		m.logger.Printf(format, args...)
+	}
+}
+
+func (m *Manager) publishHealth(ctx context.Context, state HealthState) {
+	current := m.Current()
+	if current == nil {
+		return
+	}
+	current.HealthState = state
+	current.Sequence++
+	current.IssuedAt = time.Now().Unix()
+	if state == StateRemoved {
+		current.ExpiresAt = current.IssuedAt + 1
+	}
+	current.Signature = ""
+	signature, err := signJSON(m.signer, *current)
+	if err != nil {
+		return
+	}
+	current.Signature = signature
+	publishCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	err = m.publisher.PublishGatewayRegistration(publishCtx, *current)
+	cancel()
+	if err != nil {
+		return
+	}
+	_ = m.save(*current)
+	m.mu.Lock()
+	m.current = current
+	m.mu.Unlock()
+}
+
+func (m *Manager) publishDraining() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.publishHealth(ctx, StateDraining)
+}
+
+func (m *Manager) save(registration Registration) error {
+	if m.config.StatePath == "" {
+		return nil
+	}
+	raw, err := json.MarshalIndent(registration, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(m.config.StatePath), 0700); err != nil {
+		return err
+	}
+	temp := m.config.StatePath + ".tmp"
+	if err := os.WriteFile(temp, append(raw, '\n'), 0600); err != nil {
+		return err
+	}
+	return os.Rename(temp, m.config.StatePath)
+}
+
+func (m *Manager) load() {
+	raw, err := os.ReadFile(m.config.StatePath)
+	if err != nil {
+		return
+	}
+	var registration Registration
+	if json.Unmarshal(raw, &registration) != nil {
+		return
+	}
+	// Restart never restores verified status. The old sequence is retained only
+	// to prevent rollback; a fresh external quorum is still mandatory.
+	m.current = &registration
+	if m.onVerified != nil {
+		m.onVerified(false)
+	}
+}

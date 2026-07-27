@@ -1,0 +1,58 @@
+{
+  "gateway": {
+    "enabled": false,
+    "probe_enabled": false,
+    "listen_address": "0.0.0.0",
+    "listen_port": 443,
+    "public_hostname": "gateway.example.com",
+    "advertise_ipv4": true,
+    "advertise_ipv6": true,
+    "reverse_proxy": false,
+    "tls": {
+      "mode": "existing",
+      "certificate_path": "/secure/certs/fullchain.pem",
+      "private_key_path": "/secure/certs/privkey.pem"
+    },
+    "external_verification": {
+      "enabled": true,
+      "minimum_successful_probes": 3,
+      "minimum_distinct_networks": 2,
+      "verification_timeout_seconds": 15,
+      "registration_validity_seconds": 300,
+      "probe_result_validity_seconds": 120,
+      "reverify_interval_seconds": 60
+    },
+    "health": {
+      "failure_threshold": 3,
+      "recovery_threshold": 2,
+      "check_interval_seconds": 30,
+      "drain_seconds": 60
+    },
+    "eligibility": {
+      "minimum_upload_mbps": 10,
+      "minimum_free_memory_mb": 512,
+      "minimum_free_disk_mb": 1024,
+      "maximum_cpu_percent": 90,
+      "require_public_address": true,
+      "reject_cgnat": true
+    },
+    "trusted_probes": {},
+    "probe_urls": [],
+    "public_addresses": [],
+    "probe_network": ""
+  },
+  "dns": {
+    "enabled": false,
+    "hostname": "gateway.example.com",
+    "ttl_seconds": 60,
+    "provider": "",
+    "provider_endpoint": "",
+    "credentials_source": "environment",
+    "reconciliation_interval_seconds": 30,
+    "dry_run": true,
+    "freeze": false,
+    "max_records": 100,
+    "max_mutations": 10,
+    "gateway_node_ids": []
+  }
+}

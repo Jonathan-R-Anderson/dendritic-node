@@ -48,3 +48,35 @@ func TestI2PControlEndpointsMustRemainLoopback(t *testing.T) {
 		t.Fatal("remote I2P HTTP proxy was accepted")
 	}
 }
+
+func TestGatewayAndDNSDefaultDisabled(t *testing.T) {
+	cfg := validTestConfig(t)
+	if cfg.Gateway.Enabled || cfg.DNS.Enabled {
+		t.Fatal("public gateway or DNS mutation is enabled by default")
+	}
+}
+
+func TestGatewayRequiresExternalQuorumConfiguration(t *testing.T) {
+	cfg := validTestConfig(t)
+	cfg.Gateway.Enabled = true
+	cfg.Gateway.PublicHostname = "gateway.example.com"
+	cfg.Gateway.TLS.CertificatePath = "cert.pem"
+	cfg.Gateway.TLS.PrivateKeyPath = "key.pem"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("gateway without addresses/probes was accepted")
+	}
+	cfg.Gateway.PublicAddresses = []string{"8.8.8.8"}
+	cfg.Gateway.ProbeURLs = []string{
+		"https://probe-a.example", "https://probe-b.example", "https://probe-c.example",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fully configured candidate rejected: %v", err)
+	}
+}
+
+func TestDNSHasMutationSafetyDefaults(t *testing.T) {
+	cfg := validTestConfig(t)
+	if !cfg.DNS.DryRun || cfg.DNS.MaxRecords < 1 || cfg.DNS.MaxMutations < 1 {
+		t.Fatal("DNS safety defaults are not active")
+	}
+}
