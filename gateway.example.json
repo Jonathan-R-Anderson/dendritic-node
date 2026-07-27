@@ -4,7 +4,8 @@
     "probe_enabled": false,
     "listen_address": "0.0.0.0",
     "listen_port": 443,
-    "public_hostname": "gateway.example.com",
+    "public_hostname": "gw-your-node.syndichan.org",
+    "registration_api": "https://syndichan.org/api/v1/gateways",
     "advertise_ipv4": true,
     "advertise_ipv6": true,
     "reverse_proxy": false,
@@ -40,19 +41,5 @@
     "probe_urls": [],
     "public_addresses": [],
     "probe_network": ""
-  },
-  "dns": {
-    "enabled": false,
-    "hostname": "gateway.example.com",
-    "ttl_seconds": 60,
-    "provider": "",
-    "provider_endpoint": "",
-    "credentials_source": "environment",
-    "reconciliation_interval_seconds": 30,
-    "dry_run": true,
-    "freeze": false,
-    "max_records": 100,
-    "max_mutations": 10,
-    "gateway_node_ids": []
   }
 }

@@ -49,10 +49,13 @@ func TestI2PControlEndpointsMustRemainLoopback(t *testing.T) {
 	}
 }
 
-func TestGatewayAndDNSDefaultDisabled(t *testing.T) {
+func TestGatewayDefaultDisabledAndRegistryIsPublicConfiguration(t *testing.T) {
 	cfg := validTestConfig(t)
-	if cfg.Gateway.Enabled || cfg.DNS.Enabled {
-		t.Fatal("public gateway or DNS mutation is enabled by default")
+	if cfg.Gateway.Enabled {
+		t.Fatal("public gateway is enabled by default")
+	}
+	if cfg.Gateway.RegistrationAPI != "https://syndichan.org/api/v1/gateways" {
+		t.Fatal("unexpected registration API default")
 	}
 }
 
@@ -74,9 +77,18 @@ func TestGatewayRequiresExternalQuorumConfiguration(t *testing.T) {
 	}
 }
 
-func TestDNSHasMutationSafetyDefaults(t *testing.T) {
+func TestGatewayRejectsCredentialBearingRegistrationAPI(t *testing.T) {
 	cfg := validTestConfig(t)
-	if !cfg.DNS.DryRun || cfg.DNS.MaxRecords < 1 || cfg.DNS.MaxMutations < 1 {
-		t.Fatal("DNS safety defaults are not active")
+	cfg.Gateway.Enabled = true
+	cfg.Gateway.PublicHostname = "gw-001.syndichan.org"
+	cfg.Gateway.TLS.CertificatePath = "cert.pem"
+	cfg.Gateway.TLS.PrivateKeyPath = "key.pem"
+	cfg.Gateway.PublicAddresses = []string{"8.8.8.8"}
+	cfg.Gateway.ProbeURLs = []string{
+		"https://probe-a.example", "https://probe-b.example", "https://probe-c.example",
+	}
+	cfg.Gateway.RegistrationAPI = "https://user:token@syndichan.org/api/v1/gateways"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("credential-bearing registration API was accepted")
 	}
 }

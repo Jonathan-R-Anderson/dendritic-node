@@ -15,8 +15,8 @@ Roles are configuration-driven:
 - probes enable `gateway.probe_enabled` and set a stable `probe_network` trust
   domain (operator/ASN/prefix);
 - verified gateways are candidates whose current signed results meet quorum;
-- a DNS controller enables `dns.enabled` and is the only process given
-  `SYNDICHAN_DNS_TOKEN`.
+- the separate server-side gateway controller owns all authoritative DNS
+  access; the storage binary contains no DNS provider login or mutation path.
 
 One process may be a candidate and probe, but its own probe result never counts.
 
@@ -33,13 +33,16 @@ One process may be a candidate and probe, but its own probe result never counts.
    `/readyz`, then signs its result.
 6. The candidate requires three distinct admitted identities across two
    configured network trust domains by default.
-7. It signs a five-minute registration and publishes it under
+7. It signs a five-minute registration and submits it directly to
+   `https://syndichan.org/api/v1/gateways/register`. The server ignores claimed
+   addresses, derives the HTTPS source IP, and independently checks TCP 443,
+   TLS hostname validity, HTTP 200, and `X-Gateway-Version`.
+8. Only after server acceptance is it published under
    `/syndichan-gateway/<node-id>` in Kademlia. Every DHT reader independently
    validates the gateway signature, probe signatures, expiry, quorum, address
    policy, and DHT-key binding.
-8. The controller reads only explicitly configured gateway node IDs, computes
-   desired A/AAAA records, and reconciles only managed records for the exact
-   configured hostname.
+9. The server reconciles its verified healthy registry with Name.com. Durable
+   record ownership prevents unrelated DNS records from entering the diff.
 
 ## Candidate
 
@@ -79,20 +82,17 @@ A probe needs a publicly reachable TLS listener too. Set:
 Install its public key in each candidate's `trusted_probes`. Run the ordinary
 binary; `/probe/verify` appears only when this role is enabled.
 
-## DNS controller
+## Server-side DNS controller
 
-Set `dns.enabled`, the exact `dns.hostname`, `provider: "https-api"`, the
-project authoritative API endpoint, and `gateway_node_ids`. Begin with
-`dry_run: true`. Supply the least-privilege token only to this process:
+The controller is deployed from `../gateway-controller` and
+`../k8s/gateway-controller`. Name.com credentials are injected only into that
+server workload through Kubernetes Secrets. They are not accepted by or
+needed on a volunteer node. The client setting `registration_api` is a public,
+credential-free HTTPS URL and authentication uses the node signature.
 
-```sh
-export SYNDICHAN_DNS_TOKEN='token-scoped-to-one-hostname'
-syndichan-node
-```
-
-After audit logs show the expected diff, set `dry_run` false. `freeze: true`
-stops all mutations. The provider API must mark system-owned records as
-`managed`; unmanaged records are never deleted.
+On graceful drain the client posts a signed unregister statement before its
+DHT draining record. A hard crash is removed after registration expiry or
+three consecutive server health failures.
 
 ## Diagnostics
 
@@ -118,5 +118,5 @@ go vet ./...
 
 Tests cover restricted IP ranges, CGNAT, signature binding, self-verification,
 network diversity, replay rejection, health transitions, DHT record selection,
-DNS safety/diff/idempotency, I2P-only peer addresses, signed heartbeats,
+signed registration requests, I2P-only peer addresses, signed heartbeats,
 encrypted transfer leases, S3 compatibility, storage quotas, and UI controls.

@@ -78,12 +78,14 @@ hostname verification, do not follow redirects, and reject local, private,
 link-local, CGNAT, documentation, multicast, transition, and unspecified
 targets. This prevents a DHT record from turning probes into an SSRF primitive.
 
-DNS credentials never belong on volunteer nodes or in DHT records. The
-controller reconciles only managed A/AAAA records for one exact configured
-hostname, preserves unrelated records, and enforces record/mutation caps,
-dry-run mode, and an emergency freeze. A verified gateway remains untrusted
-with content: clients must retain end-to-end encryption and content-hash
-verification.
+DNS credentials never belong on volunteer nodes, in client configuration, or
+in DHT records. The client sends a short-lived, nonce-protected statement to
+the fixed credential-free registration API, signed by its persistent Ed25519
+identity. The separate server derives the direct request source IP, verifies
+TCP/TLS/HTTP availability, and is the only component allowed to call Name.com.
+Its durable ownership table ensures it never updates or deletes unrelated DNS
+records. A verified gateway remains untrusted with content: clients must retain
+end-to-end encryption and content-hash verification.
 
 ## Kademlia availability advisory
 

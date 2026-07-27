@@ -39,7 +39,6 @@ type Config struct {
 	TLSCert       string        `json:"tls_cert,omitempty"`
 	TLSKey        string        `json:"tls_key,omitempty"`
 	Gateway       GatewayConfig `json:"gateway"`
-	DNS           DNSConfig     `json:"dns"`
 }
 
 type GatewayConfig struct {
@@ -61,6 +60,10 @@ type GatewayConfig struct {
 	ProbeURLs       []string          `json:"probe_urls,omitempty"`
 	PublicAddresses []string          `json:"public_addresses,omitempty"`
 	ProbeNetwork    string            `json:"probe_network,omitempty"`
+	// RegistrationAPI is a public, credential-free HTTPS endpoint. The node
+	// authenticates requests with its existing Ed25519 identity; authoritative
+	// DNS credentials exist only on that server.
+	RegistrationAPI string `json:"registration_api"`
 }
 
 type GatewayTLSConfig struct {
@@ -95,21 +98,6 @@ type EligibilityConfig struct {
 	RejectCGNAT          bool  `json:"reject_cgnat"`
 }
 
-type DNSConfig struct {
-	Enabled                       bool     `json:"enabled"`
-	Hostname                      string   `json:"hostname"`
-	TTLSeconds                    int      `json:"ttl_seconds"`
-	Provider                      string   `json:"provider"`
-	ProviderEndpoint              string   `json:"provider_endpoint,omitempty"`
-	CredentialsSource             string   `json:"credentials_source"`
-	ReconciliationIntervalSeconds int      `json:"reconciliation_interval_seconds"`
-	DryRun                        bool     `json:"dry_run"`
-	Freeze                        bool     `json:"freeze"`
-	MaxRecords                    int      `json:"max_records"`
-	MaxMutations                  int      `json:"max_mutations"`
-	GatewayNodeIDs                []string `json:"gateway_node_ids,omitempty"`
-}
-
 func DefaultDataDir() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
@@ -139,7 +127,8 @@ func Default() (Config, error) {
 		Gateway: GatewayConfig{
 			ListenAddress: "0.0.0.0", ListenPort: 443,
 			AdvertiseIPv4: true, AdvertiseIPv6: true,
-			TLS: GatewayTLSConfig{Mode: "existing"},
+			RegistrationAPI: "https://syndichan.org/api/v1/gateways",
+			TLS:             GatewayTLSConfig{Mode: "existing"},
 			Verification: VerificationConfig{
 				Enabled: true, MinimumSuccessfulProbes: 3,
 				MinimumDistinctNetworks: 2, VerificationTimeoutSeconds: 15,
@@ -155,11 +144,6 @@ func Default() (Config, error) {
 				MinimumFreeDiskMB: 1024, MaximumCPUPercent: 90,
 				RequirePublicAddress: true, RejectCGNAT: true,
 			},
-		},
-		DNS: DNSConfig{
-			TTLSeconds: 60, CredentialsSource: "environment",
-			ReconciliationIntervalSeconds: 30, DryRun: true,
-			MaxRecords: 100, MaxMutations: 10,
 		},
 	}, nil
 }
@@ -264,6 +248,16 @@ func (c Config) validateGateway() error {
 			return errors.New("gateway existing TLS mode requires certificate and private key paths")
 		}
 	}
+	if g.Enabled {
+		registry, err := url.Parse(g.RegistrationAPI)
+		if err != nil || registry.Scheme != "https" || registry.Host == "" ||
+			registry.User != nil || registry.RawQuery != "" || registry.Fragment != "" {
+			return errors.New("gateway registration_api must be a credential-free HTTPS URL")
+		}
+		if registry.Path == "" || registry.Path == "/" {
+			return errors.New("gateway registration_api must include its API path")
+		}
+	}
 	if g.ProbeEnabled && strings.TrimSpace(g.ProbeNetwork) == "" {
 		return errors.New("probe_network is required when probe mode is enabled")
 	}
@@ -283,23 +277,6 @@ func (c Config) validateGateway() error {
 	if v.VerificationTimeoutSeconds < 1 || v.ProbeResultValiditySeconds < 1 ||
 		v.RegistrationValiditySeconds < 1 || v.ReverifyIntervalSeconds < 1 {
 		return errors.New("gateway verification durations must be positive")
-	}
-	if c.DNS.Enabled {
-		if c.DNS.Hostname == "" {
-			return errors.New("dns hostname is required")
-		}
-		if g.PublicHostname != "" && c.DNS.Hostname != g.PublicHostname {
-			return errors.New("dns hostname must match gateway public_hostname when both are configured")
-		}
-		if c.DNS.TTLSeconds < 30 || c.DNS.MaxRecords < 1 || c.DNS.MaxMutations < 1 {
-			return errors.New("invalid dns safety limits")
-		}
-		if c.DNS.Provider == "" {
-			return errors.New("dns provider is required when dns is enabled")
-		}
-		if c.DNS.Provider != "https-api" || c.DNS.ProviderEndpoint == "" {
-			return errors.New("dns provider must be https-api with provider_endpoint")
-		}
 	}
 	return nil
 }

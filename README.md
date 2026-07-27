@@ -33,20 +33,22 @@ nodes for encrypted shard storage and recovery.
 - an optional public HTTPS gateway candidate service with signed identity and
   one-use challenge endpoints, strict probe admission, public-address/CGNAT
   filtering, multi-network quorum evaluation, expiring registrations, gateway
-  health states, and provider-neutral idempotent DNS reconciliation.
+  health states, and signed server registration.
 - independently signed probe results published as short-lived Kademlia gateway
   records; a local listener or self-reported role cannot satisfy verification;
-- candidate, probe, and DNS-controller roles in the same binary, with
-  self-verification forbidden even when an installation enables several roles;
+- candidate and probe roles in the same binary, with self-verification
+  forbidden even when an installation enables both roles;
 - verified role reporting for the admin map: storage is blue, gateway+storage
   is green/blue, visitor+storage is red/blue, and all three are red/blue/green;
-- an HTTPS authoritative-DNS API adapter with A/AAAA separation, dry-run,
-  emergency freeze, safety limits, and preservation of unrelated records.
+- a credential-free HTTPS registration client signed by the persistent node
+  identity. Name.com access and DNS mutation exist only in the separate
+  server-side `gateway-controller`.
 
 ## Volunteer HTTPS gateway mode
 
-Gateway mode and DNS mutation are both disabled by default. Ordinary storage
-nodes need no inbound port and continue to exchange shards only over I2P.
+Gateway mode is disabled by default. Ordinary storage nodes need no inbound
+port and continue to exchange shards only over I2P. The storage binary has no
+DNS-provider credential field or DNS mutation code.
 
 One installation can have one or more explicit roles:
 
@@ -56,7 +58,6 @@ One installation can have one or more explicit roles:
 | Candidate gateway | `gateway.enabled: true` | TCP 443 |
 | Probe node | `gateway.probe_enabled: true` | TCP 443 |
 | Verified gateway | Assigned only after probe quorum | TCP 443 |
-| DNS controller | `dns.enabled: true` | Not required unless also a probe/gateway |
 
 The public gateway and probe protocol is:
 
@@ -85,8 +86,9 @@ candidate signs its configured public address
     -> TLS, identity, one-use challenge, and readiness are verified
     -> candidate verifies probe identities, signatures, expiry, and networks
     -> quorum creates a signed, short-lived registration
+    -> server registry derives the direct source IP and independently verifies it
+    -> server registry reconciles only controller-owned Name.com records
     -> registration is published at /syndichan-gateway/<node-id> in Kademlia
-    -> DNS controller independently validates it before reconciliation
 ```
 
 A probe never connects to an arbitrary address merely because a request named
@@ -102,7 +104,7 @@ crash, the short-lived registration expires naturally.
 
 ### Configure a candidate
 
-Copy the `gateway` and `dns` sections from
+Copy the `gateway` section from
 [`gateway.example.json`](gateway.example.json) into the generated `config.json`.
 A candidate needs:
 
@@ -110,6 +112,8 @@ A candidate needs:
 - at least as many HTTPS `probe_urls` as the required quorum;
 - `trusted_probes`, mapping node IDs to base64 libp2p public keys;
 - a `public_hostname`;
+- the public, credential-free `registration_api` (normally the built-in
+  `https://syndichan.org/api/v1/gateways`);
 - either existing certificate paths or reverse-proxy TLS mode.
 
 For direct TLS, install a browser-trusted certificate and set `tls.mode` to
@@ -141,37 +145,19 @@ key in candidate and controller trust lists. Several probe keys on one network
 do not satisfy network diversity. An installation may be both a candidate and
 a probe, but its own result is never counted.
 
-### Configure the DNS controller
+### DNS registration security boundary
 
-The DNS reconciler supports A and AAAA separately, preserves all unmanaged
-records, caps both the desired record count and mutations per pass, and has
-dry-run and emergency-freeze controls. Its production adapter calls a
-project-owned HTTPS authoritative-DNS API. Only a dedicated controller process
-may receive the API token through its environment; gateway nodes must not have
-it. The provider endpoint must independently restrict the token to the one
-configured hostname.
+The node posts the signed registration directly—not through I2P—so the
+controller can derive the candidate's public source IPv4. The controller
+ignores every client-supplied IP, verifies TCP 443/TLS/HTTP independently,
+requires HTTP 200 plus `X-Gateway-Version`, and publishes DNS only after the
+check succeeds. Requests are timestamped, nonce-protected, sequence-checked,
+and limited to five registrations per source IP per minute.
 
-Configure `dns.gateway_node_ids` with the identities the controller may
-consider. A DHT record cannot redirect the controller to another hostname:
-only managed A/AAAA records for the exact configured hostname enter the diff.
-
-Supply the provider token only to the controller:
-
-```sh
-export SYNDICHAN_DNS_TOKEN='token-restricted-to-the-gateway-hostname'
-syndichan-node
-```
-
-PowerShell:
-
-```powershell
-$env:SYNDICHAN_DNS_TOKEN = "token-restricted-to-the-gateway-hostname"
-.\syndichan-node-windows-amd64.exe
-```
-
-Begin with `dns.dry_run: true` and inspect the logged plan. Set
-`dns.freeze: true` for an emergency stop. DNS removal is not instantaneous:
-resolvers and clients may cache records beyond the requested TTL.
+Name.com username/token values are never configured on this client. Do not add
+them to `config.json`, environment variables, command-line flags, source code,
+or release artifacts. The server implementation and Kubernetes secret setup
+are documented in [`../gateway-controller/README.md`](../gateway-controller/README.md).
 
 Gateway diagnostics:
 
@@ -541,8 +527,10 @@ the client finds the same keys, metadata, and configuration directory.
   `trusted_probes` and that enough distinct `probe_network` values are present.
 - **Gateway disappears from DNS:** inspect verification failures and
   registration expiry. Healthy gateways must continually publish fresh records.
-- **DNS controller refuses to start:** configure its HTTPS provider endpoint,
-  exact hostname, safety limits, and `SYNDICHAN_DNS_TOKEN`.
+- **Registration API rejects the node:** confirm the public request source is
+  the configured public IPv4, the hostname begins with the managed `gw-`
+  prefix, TCP 443 is reachable, `/readyz` returns 200 with
+  `X-Gateway-Version`, and the certificate matches that hostname.
 
 ## Availability and recovery
 
@@ -575,15 +563,15 @@ Run the unit, static-analysis, and concurrency checks with:
 ```sh
 go test ./...
 go vet ./...
-go test -race ./internal/gateway ./internal/dns ./internal/config ./internal/p2p
+go test -race ./internal/gateway ./internal/config ./internal/p2p
 ```
 
 The release scripts build Linux, macOS, and Windows binaries for AMD64 and
-ARM64. DNS tests use an in-memory provider and never modify real DNS.
+ARM64. Client tests never contact the registration service or Name.com.
 
 The following deployment pieces are external or not yet automatic:
 
-- the project-owned authoritative DNS API must be deployed separately;
+- the server-side gateway controller must be deployed separately;
 - TLS certificates must already exist or a configured reverse proxy must
   terminate TLS; automatic ACME issuance is not implemented;
 - UPnP/NAT-PMP port creation is not automatic;
