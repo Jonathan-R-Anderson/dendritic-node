@@ -34,19 +34,38 @@ nodes for encrypted shard storage and recovery.
   one-use challenge endpoints, strict probe admission, public-address/CGNAT
   filtering, multi-network quorum evaluation, expiring registrations, gateway
   health states, and provider-neutral idempotent DNS reconciliation.
+- independently signed probe results published as short-lived Kademlia gateway
+  records; a local listener or self-reported role cannot satisfy verification;
+- candidate, probe, and DNS-controller roles in the same binary, with
+  self-verification forbidden even when an installation enables several roles;
+- verified role reporting for the admin map: storage is blue, gateway+storage
+  is green/blue, visitor+storage is red/blue, and all three are red/blue/green;
+- an HTTPS authoritative-DNS API adapter with A/AAAA separation, dry-run,
+  emergency freeze, safety limits, and preservation of unrelated records.
 
 ## Volunteer HTTPS gateway mode
 
 Gateway mode and DNS mutation are both disabled by default. Ordinary storage
 nodes need no inbound port and continue to exchange shards only over I2P.
 
-The implemented public protocol is:
+One installation can have one or more explicit roles:
+
+| Role | Configuration | Public inbound port |
+| --- | --- | --- |
+| Ordinary storage peer | Both gateway flags false | Not required |
+| Candidate gateway | `gateway.enabled: true` | TCP 443 |
+| Probe node | `gateway.probe_enabled: true` | TCP 443 |
+| Verified gateway | Assigned only after probe quorum | TCP 443 |
+| DNS controller | `dns.enabled: true` | Not required unless also a probe/gateway |
+
+The public gateway and probe protocol is:
 
 ```text
 GET  /healthz
 GET  /readyz
 GET  /gateway/identity
 POST /gateway/challenge
+POST /probe/verify        # probe role only
 ```
 
 Identity and challenge responses use the node's existing persistent libp2p
@@ -57,13 +76,47 @@ multicast, CGNAT (`100.64.0.0/10`), IPv6 ULA, and Teredo addresses. A valid
 registration requires three admitted probe identities across at least two
 configured network trust domains by default.
 
-Copy the `gateway` and `dns` sections from `gateway.example.json` into the
-generated `config.json`. For direct TLS, install a browser-trusted certificate
-for the configured public hostname and set `tls.mode` to `existing`. For an
-existing nginx/Caddy/HAProxy frontend, set `tls.mode` to `reverse_proxy`, bind
-the client to a private high port, and have the proxy expose only the four
-routes above on public TCP 443. External probes still test the public 443
-endpoint; a local listener is never sufficient for DNS eligibility.
+### Verification and DHT publication
+
+```text
+candidate signs its configured public address
+    -> admitted probes observe the request's source IP
+    -> each probe connects back to that exact IP on TCP 443
+    -> TLS, identity, one-use challenge, and readiness are verified
+    -> candidate verifies probe identities, signatures, expiry, and networks
+    -> quorum creates a signed, short-lived registration
+    -> registration is published at /syndichan-gateway/<node-id> in Kademlia
+    -> DNS controller independently validates it before reconciliation
+```
+
+A probe never connects to an arbitrary address merely because a request named
+it. The claimed address must equal the source address the probe observed.
+Probes connect to the validated literal IP while retaining TLS hostname
+verification and refusing redirects. This blocks private-network,
+metadata-service, redirect, and DNS-rebinding SSRF.
+
+Verification repeats on the configured interval. Failures move a gateway
+through `healthy`, `suspect`, and `draining`; recovery requires consecutive
+successful rounds. Graceful shutdown publishes a draining state. After a hard
+crash, the short-lived registration expires naturally.
+
+### Configure a candidate
+
+Copy the `gateway` and `dns` sections from
+[`gateway.example.json`](gateway.example.json) into the generated `config.json`.
+A candidate needs:
+
+- one or more literal `public_addresses`;
+- at least as many HTTPS `probe_urls` as the required quorum;
+- `trusted_probes`, mapping node IDs to base64 libp2p public keys;
+- a `public_hostname`;
+- either existing certificate paths or reverse-proxy TLS mode.
+
+For direct TLS, install a browser-trusted certificate and set `tls.mode` to
+`existing`. For nginx, Caddy, or HAProxy, set `tls.mode` to `reverse_proxy`,
+bind the client to a private high port, and forward the public protocol routes
+from Internet TCP 443. External probes still test public port 443; a local
+listener is never sufficient for DNS eligibility.
 
 Useful local controls:
 
@@ -79,6 +132,17 @@ deployment is a per-node browser-trusted certificate obtained by the operator,
 or TLS termination at a trusted project edge. Certificate verification is
 never disabled.
 
+### Configure a probe
+
+Set `gateway.probe_enabled` to true, configure its public TLS listener, and
+assign a stable `probe_network` trust domain representing an independently
+operated network, ASN, or routed prefix. Install the probe node ID and public
+key in candidate and controller trust lists. Several probe keys on one network
+do not satisfy network diversity. An installation may be both a candidate and
+a probe, but its own result is never counted.
+
+### Configure the DNS controller
+
 The DNS reconciler supports A and AAAA separately, preserves all unmanaged
 records, caps both the desired record count and mutations per pass, and has
 dry-run and emergency-freeze controls. Its production adapter calls a
@@ -87,9 +151,27 @@ may receive the API token through its environment; gateway nodes must not have
 it. The provider endpoint must independently restrict the token to the one
 configured hostname.
 
-Before a production DNS rollout, keep `dns.dry_run` enabled and inspect the
-planned diff. DNS removal is not instantaneous because recursive resolvers and
-clients cache answers, sometimes beyond the requested TTL.
+Configure `dns.gateway_node_ids` with the identities the controller may
+consider. A DHT record cannot redirect the controller to another hostname:
+only managed A/AAAA records for the exact configured hostname enter the diff.
+
+Supply the provider token only to the controller:
+
+```sh
+export SYNDICHAN_DNS_TOKEN='token-restricted-to-the-gateway-hostname'
+syndichan-node
+```
+
+PowerShell:
+
+```powershell
+$env:SYNDICHAN_DNS_TOKEN = "token-restricted-to-the-gateway-hostname"
+.\syndichan-node-windows-amd64.exe
+```
+
+Begin with `dns.dry_run: true` and inspect the logged plan. Set
+`dns.freeze: true` for an emergency stop. DNS removal is not instantaneous:
+resolvers and clients may cache records beyond the requested TTL.
 
 Gateway diagnostics:
 
@@ -105,6 +187,9 @@ openssl s_client -connect PUBLIC_IP:443 -servername gateway.example.com
 Common verification failures are missing router forwarding, host/cloud
 firewalls, CGNAT, double NAT, an occupied port, an invalid hostname certificate,
 or an IPv6 firewall. Automatic UPnP is intentionally not used.
+
+See [`GATEWAY.md`](GATEWAY.md) for the detailed role, protocol, deployment, and
+security guide.
 
 Peers never receive object keys, plaintext file data, filenames, S3 bucket
 names, MIME types, or IP addresses. A peer can see encrypted shard IDs, byte
@@ -361,6 +446,12 @@ capacity, platform, User-Agent, and the egress IP of the last heartbeat, which
 is geolocated to COUNTRY level only (a country centroid, no city database) so the
 operator's admin map can show where capacity is coming from.
 
+When gateway mode is active, the heartbeat also carries the current signed
+gateway registration. The frontend independently validates the candidate
+signature, admitted probe signatures, freshness, readiness results, and
+network quorum before displaying a gateway role. A signed heartbeat that merely
+claims `gateway_verified: true` without a valid registration is rejected.
+
 To be precise about what is and is not protected: the guarantee this design makes
 is between VOLUNTEERS. Peers cannot identify one another, because shard exchange
 runs entirely over I2P and a peer only ever sees a `.b32.i2p` destination -- never
@@ -443,6 +534,15 @@ the client finds the same keys, metadata, and configuration directory.
   change the corresponding loopback address in `config.json`.
 - **A lower storage allocation is rejected:** current stored data exceeds the
   requested limit. Reject/remove shards or delete locally owned objects first.
+- **Gateway works locally but never verifies:** test from another network,
+  confirm TCP 443 reaches the process or reverse proxy, and make sure every
+  probe observes the configured literal address as the request source.
+- **Probe quorum is not met:** check that node IDs and public keys exactly match
+  `trusted_probes` and that enough distinct `probe_network` values are present.
+- **Gateway disappears from DNS:** inspect verification failures and
+  registration expiry. Healthy gateways must continually publish fresh records.
+- **DNS controller refuses to start:** configure its HTTPS provider endpoint,
+  exact hostname, safety limits, and `SYNDICHAN_DNS_TOKEN`.
 
 ## Availability and recovery
 
@@ -467,3 +567,30 @@ supported and tested against the official AWS SDK for Go v2. Versioning,
 server-side copy, object ACL evaluation beyond the narrow public-read bucket
 policy, and presigned-query authentication are not yet supported; unsupported
 calls return S3 `NotImplemented` rather than silently changing semantics.
+
+## Tests and current limitations
+
+Run the unit, static-analysis, and concurrency checks with:
+
+```sh
+go test ./...
+go vet ./...
+go test -race ./internal/gateway ./internal/dns ./internal/config ./internal/p2p
+```
+
+The release scripts build Linux, macOS, and Windows binaries for AMD64 and
+ARM64. DNS tests use an in-memory provider and never modify real DNS.
+
+The following deployment pieces are external or not yet automatic:
+
+- the project-owned authoritative DNS API must be deployed separately;
+- TLS certificates must already exist or a configured reverse proxy must
+  terminate TLS; automatic ACME issuance is not implemented;
+- UPnP/NAT-PMP port creation is not automatic;
+- CPU, free-memory, free-disk, and upload-bandwidth thresholds are represented
+  in configuration, but full cross-platform resource measurement is not yet
+  enforced;
+- a hard-crashed gateway relies on short registration expiry because it cannot
+  publish its normal draining record;
+- public multi-container Internet/DNS end-to-end tests remain deployment work;
+  ordinary tests do not contact production probes or DNS.
