@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +78,14 @@ func NewManager(signer Signer, publisher RegistrationPublisher, config ManagerCo
 		health:     HealthMachine{State: StateCandidate},
 		client: &http.Client{
 			Timeout: config.RequestTimeout,
+			Transport: &http.Transport{
+				// Probe requests must leave directly so the independent probe
+				// observes the candidate's real source address. Environment
+				// HTTP(S)_PROXY settings would both break that guarantee and
+				// commonly reject the probes' nonstandard HTTPS ports.
+				Proxy:           nil,
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+			},
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return errors.New("probe redirects are forbidden")
 			},
