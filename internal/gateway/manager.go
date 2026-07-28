@@ -209,7 +209,7 @@ func (m *Manager) verify(ctx context.Context) {
 	err = m.publisher.PublishGatewayRegistration(publishCtx, registration)
 	cancel()
 	if err != nil {
-		m.failed(ctx, "DHT registration publish failed: %v", err)
+		m.failed(ctx, "gateway registration publish failed: %v", err)
 		return
 	}
 	if err := m.save(registration); err != nil {

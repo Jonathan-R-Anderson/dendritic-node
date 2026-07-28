@@ -44,9 +44,12 @@ nodes for encrypted shard storage and recovery.
   identity. Name.com access and DNS mutation exist only in the separate
   server-side `gateway-controller`.
 - a `-gateway-only` runtime mode for dedicated edge hosts. It retains gateway
-  identity, ACME, verification, gateway DHT publication, and SNI forwarding
-  while disabling shard storage/exchange, S3, the storage dashboard, and
-  storage-node heartbeats.
+  identity, ACME, independent verification, controller registration, and SNI
+  forwarding while disabling I2P, shard storage/exchange, S3, the storage
+  dashboard, and storage-node heartbeats.
+- a `-probe-only` runtime mode for independently operated verification probes.
+  It exposes only the signed probe endpoints and does not start I2P or any
+  storage service.
 
 ## Volunteer HTTPS gateway mode
 
@@ -170,11 +173,12 @@ not a cosmetic dashboard setting. In gateway-only mode the process does not:
 - start the storage dashboard on port 9090; or
 - send the five-minute storage-node heartbeat.
 
-It still opens the persistent node identity and I2P DHT transport because
-verified gateway registrations are signed and published in the gateway DHT.
-I2P and its SAM bridge therefore remain required. Public TCP 80 is required
-when `gateway.tls.mode` is `acme`, and public TCP 443 is required for the
-gateway listener.
+It uses a persistent Ed25519 identity stored under `data-dir`, but it does not
+open I2P or join the storage DHT. The authoritative controller receives the
+signed registration directly over HTTPS. I2P and its SAM bridge are therefore
+not required on a dedicated gateway. Public TCP 80 is required when
+`gateway.tls.mode` is `acme`, and public TCP 443 is required for the gateway
+listener.
 
 Generate the configuration without starting storage services:
 
@@ -251,8 +255,8 @@ curl --fail https://gw-NODE-ID.syndichan.org/readyz
 
 Only 80/443 should be present; 9000/9090 must be absent. `/healthz` proves the
 process is running. `/readyz` must return 200 before the controller can admit
-the gateway to the shared `syndichan.org` DNS answer set. A 503 normally means
-the I2P DHT has no live peer yet or the gateway is draining.
+the gateway to the shared `syndichan.org` DNS answer set. A 503 means the
+listener is not ready or the gateway is draining.
 
 ### Configure a probe
 
@@ -262,6 +266,18 @@ operated network, ASN, or routed prefix. Install the probe node ID and public
 key in candidate and controller trust lists. Several probe keys on one network
 do not satisfy network diversity. An installation may be both a candidate and
 a probe, but its own result is never counted.
+
+For a dedicated verifier set `gateway.enabled` to false and start:
+
+```sh
+syndichan-node -probe-only -config /etc/syndichan-probe/config.json \
+  -data-dir /var/lib/syndichan-probe
+```
+
+`-probe-only` uses its own persistent Ed25519 identity and starts no I2P,
+storage, S3, dashboard, or storage heartbeat. The probe's public HTTPS port
+must be reachable by candidates, and its TLS certificate must match the URL in
+their `probe_urls`.
 
 ### DNS registration security boundary
 
