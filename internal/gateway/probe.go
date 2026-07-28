@@ -45,7 +45,8 @@ func (p *Prober) Verify(ctx context.Context, request VerificationRequest, addres
 		result.FailureReason = "restricted probe target"
 		return p.sign(result)
 	}
-	if p.PublicHostname == "" {
+	hostname := request.PublicHostname
+	if hostname == "" {
 		result.FailureReason = "probe hostname is not configured"
 		return p.sign(result)
 	}
@@ -58,7 +59,7 @@ func (p *Prober) Verify(ctx context.Context, request VerificationRequest, addres
 	transport := &http.Transport{
 		Proxy: nil,
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12, ServerName: p.PublicHostname,
+			MinVersion: tls.VersionTLS12, ServerName: hostname,
 		},
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			// Connect only to the already validated literal IP. DNS cannot
@@ -73,7 +74,7 @@ func (p *Prober) Verify(ctx context.Context, request VerificationRequest, addres
 			return errors.New("redirects are forbidden during gateway verification")
 		},
 	}
-	base := "https://" + p.PublicHostname
+	base := "https://" + hostname
 	identity, err := p.fetchIdentity(ctx, client, base)
 	if err != nil {
 		result.FailureReason = err.Error()

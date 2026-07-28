@@ -60,6 +60,7 @@ type VerificationRequest struct {
 	RequestID          string    `json:"request_id"`
 	CandidateNodeID    string    `json:"candidate_node_id"`
 	CandidatePublicKey string    `json:"candidate_public_key"`
+	PublicHostname     string    `json:"public_hostname"`
 	ClaimedAddresses   []Address `json:"claimed_addresses"`
 	ProtocolVersion    int       `json:"protocol_version"`
 	IssuedAt           int64     `json:"issued_at"`
@@ -170,7 +171,7 @@ func NewIdentity(s Signer, version string, now time.Time) (IdentityDocument, err
 	return doc, err
 }
 
-func NewVerificationRequest(s Signer, addresses []Address, now time.Time, validity time.Duration) (VerificationRequest, error) {
+func NewVerificationRequest(s Signer, hostname string, addresses []Address, now time.Time, validity time.Duration) (VerificationRequest, error) {
 	key, err := s.PublicKey()
 	if err != nil {
 		return VerificationRequest{}, err
@@ -178,6 +179,7 @@ func NewVerificationRequest(s Signer, addresses []Address, now time.Time, validi
 	request := VerificationRequest{
 		RequestID: randomID(), CandidateNodeID: s.ID(),
 		CandidatePublicKey: base64.RawStdEncoding.EncodeToString(key),
+		PublicHostname:     strings.ToLower(strings.TrimSuffix(hostname, ".")),
 		ClaimedAddresses:   append([]Address(nil), addresses...),
 		ProtocolVersion:    ProtocolVersion, IssuedAt: now.Unix(),
 		ExpiresAt: now.Add(validity).Unix(),
@@ -193,6 +195,11 @@ func (r VerificationRequest) Validate(now time.Time) error {
 	if r.IssuedAt > now.Add(30*time.Second).Unix() || r.ExpiresAt <= now.Unix() ||
 		r.ExpiresAt-r.IssuedAt > 300 {
 		return errors.New("verification request expired or excessively long")
+	}
+	if r.PublicHostname == "" || len(r.PublicHostname) > 253 ||
+		strings.ContainsAny(r.PublicHostname, "/:@") ||
+		!strings.Contains(r.PublicHostname, ".") {
+		return errors.New("candidate public hostname is invalid")
 	}
 	for _, address := range r.ClaimedAddresses {
 		if address.Port != 443 {

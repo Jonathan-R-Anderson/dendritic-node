@@ -19,6 +19,7 @@ import (
 
 type ManagerConfig struct {
 	Addresses            []Address
+	PublicHostname       string
 	ProbeURLs            []string
 	TrustedProbes        map[string]string
 	MinimumProbes        int
@@ -129,13 +130,16 @@ func (m *Manager) Current() *Registration {
 
 func (m *Manager) verify(ctx context.Context) {
 	now := time.Now().UTC()
-	request, err := NewVerificationRequest(m.signer, m.config.Addresses, now, m.config.ResultValidity)
+	request, err := NewVerificationRequest(
+		m.signer, m.config.PublicHostname, m.config.Addresses, now, m.config.ResultValidity,
+	)
 	if err != nil {
 		m.failed(ctx, "create verification request: %v", err)
 		return
 	}
 	body, _ := json.Marshal(request)
 	type response struct {
+		url    string
 		result ProbeResult
 		err    error
 	}
@@ -143,7 +147,7 @@ func (m *Manager) verify(ctx context.Context) {
 	for _, rawURL := range m.config.ProbeURLs {
 		go func(rawURL string) {
 			result, err := m.requestProbe(ctx, rawURL, body)
-			responses <- response{result: result, err: err}
+			responses <- response{url: rawURL, result: result, err: err}
 		}(rawURL)
 	}
 	var results []ProbeResult
@@ -151,6 +155,14 @@ func (m *Manager) verify(ctx context.Context) {
 		item := <-responses
 		if item.err == nil {
 			results = append(results, item.result)
+			if m.logger != nil && (!item.result.TCPReachable || !item.result.TLSValid ||
+				!item.result.IdentityValid || !item.result.ChallengeValid ||
+				!item.result.ProtocolValid) {
+				m.logger.Printf("gateway probe %s rejected candidate: %s",
+					item.url, item.result.FailureReason)
+			}
+		} else if m.logger != nil {
+			m.logger.Printf("gateway probe %s failed: %v", item.url, item.err)
 		}
 	}
 	verifiedAddresses, verifiedResults := VerifiedAddressResults(

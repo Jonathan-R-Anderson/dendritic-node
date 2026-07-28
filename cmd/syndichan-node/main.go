@@ -501,7 +501,8 @@ func main() {
 		}
 		var manager *gateway.Manager
 		manager, err = gateway.NewManager(node, publisher, gateway.ManagerConfig{
-			Addresses: addresses, ProbeURLs: cfg.Gateway.ProbeURLs,
+			Addresses: addresses, PublicHostname: cfg.Gateway.PublicHostname,
+			ProbeURLs:            cfg.Gateway.ProbeURLs,
 			TrustedProbes:        cfg.Gateway.TrustedProbes,
 			MinimumProbes:        cfg.Gateway.Verification.MinimumSuccessfulProbes,
 			MinimumNetworks:      cfg.Gateway.Verification.MinimumDistinctNetworks,
