@@ -279,6 +279,82 @@ storage, S3, dashboard, or storage heartbeat. The probe's public HTTPS port
 must be reachable by candidates, and its TLS certificate must match the URL in
 their `probe_urls`.
 
+### Automatic GitHub updates with rollback (Linux gateway)
+
+The repository includes a five-minute systemd updater for a dedicated gateway
+whose entire installation lives under one normal user's home directory. The
+reference layout is:
+
+```text
+/home/ubuntu/syndichan-node/
+├── bin/
+│   ├── syndichan-node
+│   ├── syndichan-node.previous
+│   └── update-from-github
+├── config/config.json
+├── data/
+├── source.git
+├── deployed.sha
+└── update-status
+```
+
+Use
+[`syndichan-node-gateway-home.service`](packaging/systemd/syndichan-node-gateway-home.service)
+for the gateway and install
+[`syndichan-node-update.service`](packaging/systemd/syndichan-node-update.service)
+plus
+[`syndichan-node-update.timer`](packaging/systemd/syndichan-node-update.timer)
+for updates. Replace the example `/readyz` hostname in the update service with
+the controller-assigned `gw-...syndichan.org` name before enabling it.
+
+The updater does not install a downloaded opaque executable. It:
+
+1. fetches `main` from the configured GitHub repository over authenticated
+   SSH into a bare mirror;
+2. exports the exact commit to a fresh temporary directory;
+3. runs `go test ./...`, builds with `CGO_ENABLED=0`, and loads the real
+   configuration in a non-listening preflight;
+4. retains the current executable as `syndichan-node.previous`, atomically
+   installs the candidate, and restarts the service;
+5. accepts the commit only when the public `https://gw-.../readyz` endpoint
+   succeeds; and
+6. restores and restarts the previous executable automatically if restart or
+   readiness fails.
+
+Install and enable it:
+
+```sh
+sudo install -m 0755 scripts/update-from-github.sh \
+  /home/ubuntu/syndichan-node/bin/update-from-github
+sudo install -m 0644 packaging/systemd/syndichan-node-gateway-home.service \
+  /etc/systemd/system/syndichan-node.service
+sudo install -m 0644 packaging/systemd/syndichan-node-update.service \
+  /etc/systemd/system/
+sudo install -m 0644 packaging/systemd/syndichan-node-update.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now syndichan-node syndichan-node-update.timer
+```
+
+Inspect update state or run one check immediately:
+
+```sh
+cat /home/ubuntu/syndichan-node/update-status
+systemctl list-timers syndichan-node-update.timer
+sudo systemctl start syndichan-node-update.service
+sudo journalctl -u syndichan-node-update.service -n 100 --no-pager
+```
+
+Requirements are `git`, `go`, `curl`, `tar`, `flock`, and GNU `timeout`. The
+SSH deploy key remains in the account's `.ssh` directory and is never copied
+into source, configuration, logs, or release binaries.
+
+This deliberately makes the configured GitHub branch a remote-code deployment
+channel: Go builds and tests execute code from that branch as root in the
+updater unit. Protect `main` with required review and restrict the deploy key
+to read-only repository access. A successful update refreshes the updater
+script itself, but never rewrites its systemd privilege boundary.
+
 ### DNS registration security boundary
 
 The node posts the signed registration directly—not through I2P—so the
