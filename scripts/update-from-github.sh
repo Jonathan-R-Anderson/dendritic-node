@@ -9,7 +9,7 @@ set -euo pipefail
 # fresh temporary directory, and never executes a mutable working tree.
 
 INSTALL_DIR="${SYNDICHAN_INSTALL_DIR:-}"
-GIT_URL="${SYNDICHAN_GIT_URL:-git@github.com:Jonathan-R-Anderson/syndichan-node.git}"
+GIT_URL="${SYNDICHAN_GIT_URL:-https://github.com/Jonathan-R-Anderson/syndichan-node.git}"
 GIT_BRANCH="${SYNDICHAN_GIT_BRANCH:-main}"
 SERVICE="${SYNDICHAN_SERVICE:-syndichan-node.service}"
 HEALTH_URL="${SYNDICHAN_UPDATE_HEALTH_URL:-}"

@@ -309,8 +309,8 @@ the controller-assigned `gw-...syndichan.org` name before enabling it.
 
 The updater does not install a downloaded opaque executable. It:
 
-1. fetches `main` from the configured GitHub repository over authenticated
-   SSH into a bare mirror;
+1. fetches `main` from the configured public GitHub HTTPS repository into a
+   bare mirror;
 2. exports the exact commit to a fresh temporary directory;
 3. runs `go test ./...`, builds with `CGO_ENABLED=0`, and loads the real
    configuration in a non-listening preflight;
@@ -345,15 +345,15 @@ sudo systemctl start syndichan-node-update.service
 sudo journalctl -u syndichan-node-update.service -n 100 --no-pager
 ```
 
-Requirements are `git`, `go`, `curl`, `tar`, `flock`, and GNU `timeout`. The
-SSH deploy key remains in the account's `.ssh` directory and is never copied
-into source, configuration, logs, or release binaries.
+Requirements are `git`, `go`, `curl`, `tar`, `flock`, and GNU `timeout`. No
+GitHub credential is needed for the public repository, and none is stored in
+source, configuration, logs, or release binaries.
 
 This deliberately makes the configured GitHub branch a remote-code deployment
 channel: Go builds and tests execute code from that branch as root in the
-updater unit. Protect `main` with required review and restrict the deploy key
-to read-only repository access. A successful update refreshes the updater
-script itself, but never rewrites its systemd privilege boundary.
+updater unit. Protect `main` with required review. A successful update
+refreshes the updater script itself, but never rewrites its systemd privilege
+boundary.
 
 ### DNS registration security boundary
 
