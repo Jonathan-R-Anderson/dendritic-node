@@ -42,6 +42,7 @@ func main() {
 	var gatewayStatus bool
 	var gatewayEnable bool
 	var gatewayDisable bool
+	var gatewayOnly bool
 	flag.StringVar(&configFile, "config", "", "path to config.json")
 	// Data location is deliberately separate from config location. Previously
 	// DataDir was always the config file's own directory, so putting shards on
@@ -71,6 +72,8 @@ func main() {
 	flag.BoolVar(&gatewayStatus, "gateway-status", false, "show persisted gateway configuration, then exit")
 	flag.BoolVar(&gatewayEnable, "gateway-enable", false, "enable configured volunteer gateway mode")
 	flag.BoolVar(&gatewayDisable, "gateway-disable", false, "disable volunteer gateway mode")
+	flag.BoolVar(&gatewayOnly, "gateway-only", false,
+		"run gateway/probe services without storage sharing, S3, dashboard, or storage heartbeat")
 	flag.Parse()
 
 	path, err := config.ConfigPath(configFile)
@@ -178,6 +181,9 @@ func main() {
 		}
 	}
 	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
+	if gatewayOnly && !cfg.Gateway.Enabled && !cfg.Gateway.ProbeEnabled {
+		logger.Fatal("-gateway-only requires gateway.enabled or gateway.probe_enabled")
+	}
 	if showCredentials {
 		// Deliberate, explicit retrieval. The operator owns this machine and
 		// this mode-0600 file, so this reveals nothing they cannot already
@@ -206,27 +212,37 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Retrieve it deliberately with:  syndichan-node -show-credentials")
 	}
 
-	storage, err := store.Open(
-		filepath.Join(cfg.DataDir, "storage"),
-		cfg.DataShards, cfg.ParityShards, cfg.ChunkBytes, cfg.CapacityBytes,
-	)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	defer storage.Close()
-	if err := storage.CleanupObjectPrefix(".syndichan-multipart/"); err != nil {
-		logger.Fatal("clean interrupted multipart uploads: ", err)
+	var storageNode *store.Store
+	if !gatewayOnly {
+		storageNode, err = store.Open(
+			filepath.Join(cfg.DataDir, "storage"),
+			cfg.DataShards, cfg.ParityShards, cfg.ChunkBytes, cfg.CapacityBytes,
+		)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		defer storageNode.Close()
+		if err := storageNode.CleanupObjectPrefix(".syndichan-multipart/"); err != nil {
+			logger.Fatal("clean interrupted multipart uploads: ", err)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	node, err := p2p.Open(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, storage, logger)
+	var node *p2p.Node
+	if gatewayOnly {
+		node, err = p2p.OpenGateway(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, logger)
+	} else {
+		node, err = p2p.Open(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, storageNode, logger)
+	}
 	if err != nil {
 		logger.Fatal(err)
 	}
 	defer node.Close()
 	node.SetGatewayState(cfg.Gateway.Enabled, false)
-	go node.RefreshHeartbeat(ctx)
+	if !gatewayOnly {
+		go node.RefreshHeartbeat(ctx)
+	}
 	gatewayValidator := gateway.DHTValidator{
 		TrustedProbes:   cfg.Gateway.TrustedProbes,
 		MinimumProbes:   cfg.Gateway.Verification.MinimumSuccessfulProbes,
@@ -288,39 +304,42 @@ func main() {
 			logger.Printf("controller reserved %s for ACME", reservation.Hostname)
 		}
 	}
-	if cacheOnly || cfg.CacheOnly {
+	if !gatewayOnly && (cacheOnly || cfg.CacheOnly) {
 		// Contribute no storage to the network: this node keeps only what it
 		// caches of its own content, so its disk grows with the site rather
 		// than with the number of peers.
 		node.SetCacheOnly(true)
 		logger.Printf("cache-only: this node will not host shards for other peers")
 	}
-	storage.SetShardFetcher(node.FetchShard)
-	storage.SetShardAdvertiser(func(shardID string) {
-		provideCtx, provideCancel := context.WithTimeout(ctx, 30*time.Second)
-		defer provideCancel()
-		if err := node.Provide(provideCtx, shardID); err != nil {
-			logger.Printf("could not advertise shard %s: %v", shardID[:12], err)
-		}
-	})
-	storage.SetObjectDistributor(func(manifest store.Manifest) {
-		distributeCtx, distributeCancel := context.WithTimeout(ctx, 5*time.Minute)
-		defer distributeCancel()
-		node.DistributeManifest(distributeCtx, manifest)
-	})
-	go node.AdvertiseStored(ctx)
+	var s3Server, uiServer *http.Server
+	if !gatewayOnly {
+		storageNode.SetShardFetcher(node.FetchShard)
+		storageNode.SetShardAdvertiser(func(shardID string) {
+			provideCtx, provideCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer provideCancel()
+			if err := node.Provide(provideCtx, shardID); err != nil {
+				logger.Printf("could not advertise shard %s: %v", shardID[:12], err)
+			}
+		})
+		storageNode.SetObjectDistributor(func(manifest store.Manifest) {
+			distributeCtx, distributeCancel := context.WithTimeout(ctx, 5*time.Minute)
+			defer distributeCancel()
+			node.DistributeManifest(distributeCtx, manifest)
+		})
+		go node.AdvertiseStored(ctx)
 
-	s3Server := &http.Server{
-		Addr: cfg.S3Listen, Handler: s3api.New(storage, cfg.AccessKey, cfg.SecretKey, logger),
-		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute,
-		WriteTimeout: 10 * time.Minute, IdleTimeout: 90 * time.Second,
-		MaxHeaderBytes: 64 << 10,
-	}
-	uiServer := &http.Server{
-		Addr: cfg.UIListen, Handler: ui.New(storage, node, logger),
-		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
-		WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second,
-		MaxHeaderBytes: 32 << 10,
+		s3Server = &http.Server{
+			Addr: cfg.S3Listen, Handler: s3api.New(storageNode, cfg.AccessKey, cfg.SecretKey, logger),
+			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute,
+			WriteTimeout: 10 * time.Minute, IdleTimeout: 90 * time.Second,
+			MaxHeaderBytes: 64 << 10,
+		}
+		uiServer = &http.Server{
+			Addr: cfg.UIListen, Handler: ui.New(storageNode, node, logger),
+			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+			WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second,
+			MaxHeaderBytes: 32 << 10,
+		}
 	}
 	var gatewayServer *http.Server
 	var gatewayACMEHTTPServer *http.Server
@@ -483,22 +502,26 @@ func main() {
 			} else {
 				node.SetGatewayRegistration(nil)
 			}
-			go node.RefreshHeartbeat(ctx)
+			if !gatewayOnly {
+				go node.RefreshHeartbeat(ctx)
+			}
 		})
 		if err != nil {
 			logger.Fatalf("gateway verification manager: %v", err)
 		}
 		go manager.Run(ctx)
 	}
-	uiServer.Handler.(*ui.Server).SetStoragePaths(cfg.DataDir, func(target string) error {
-		// Persist only; the store is open and moving it live would risk
-		// corrupting it. Takes effect on the next start (see ui.setStorageDir).
-		next := cfg
-		next.DataDir = target
-		return config.Save(path, next)
-	})
-	go serve(s3Server, cfg, logger, "S3 gateway")
-	go serve(uiServer, cfg, logger, "dashboard")
+	if !gatewayOnly {
+		uiServer.Handler.(*ui.Server).SetStoragePaths(cfg.DataDir, func(target string) error {
+			// Persist only; the store is open and moving it live would risk
+			// corrupting it. Takes effect on the next start (see ui.setStorageDir).
+			next := cfg
+			next.DataDir = target
+			return config.Save(path, next)
+		})
+		go serve(s3Server, cfg, logger, "S3 gateway")
+		go serve(uiServer, cfg, logger, "dashboard")
+	}
 	// Tray icon when built with -tags tray; nil otherwise. It does not keep the
 	// node alive -- the node is a service and outlives any window -- it just
 	// makes that visible and gives the dashboard somewhere to be reopened from.
@@ -506,7 +529,11 @@ func main() {
 		runTray(ctx, "http://"+cfg.UIListen, logger, cancel)
 	}
 	logger.Printf("node %s started on %s; bootstrap=%s", node.ID(), config.PlatformLabel(), config.BootstrapURL)
-	logger.Printf("S3 gateway: %s; dashboard: %s", cfg.S3Listen, cfg.UIListen)
+	if gatewayOnly {
+		logger.Printf("gateway-only mode: storage sharing, S3, dashboard, and storage heartbeat disabled")
+	} else {
+		logger.Printf("S3 gateway: %s; dashboard: %s", cfg.S3Listen, cfg.UIListen)
+	}
 
 	<-ctx.Done()
 	shutdownTimeout := 15 * time.Second
@@ -530,8 +557,12 @@ func main() {
 	if gatewayACMEHTTPServer != nil {
 		_ = gatewayACMEHTTPServer.Shutdown(shutdownCtx)
 	}
-	_ = s3Server.Shutdown(shutdownCtx)
-	_ = uiServer.Shutdown(shutdownCtx)
+	if s3Server != nil {
+		_ = s3Server.Shutdown(shutdownCtx)
+	}
+	if uiServer != nil {
+		_ = uiServer.Shutdown(shutdownCtx)
+	}
 	logger.Printf("shutdown complete")
 }
 

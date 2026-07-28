@@ -186,6 +186,25 @@ func (n *Node) RefreshHeartbeat(ctx context.Context) {
 }
 
 func Open(ctx context.Context, dataDir, samAddr, httpProxy string, storage *store.Store, logger *log.Logger) (*Node, error) {
+	return openI2PNode(ctx, dataDir, samAddr, httpProxy, storage, logger, true)
+}
+
+// OpenGateway creates the identity and I2P DHT transport needed to publish
+// independently verified gateway records, but deliberately does not install
+// the shard protocol, advertise/replicate stored data, or send storage-node
+// heartbeats. It is the networking substrate for the command's gateway-only
+// mode, not a storage peer with its UI hidden.
+func OpenGateway(ctx context.Context, dataDir, samAddr, httpProxy string, logger *log.Logger) (*Node, error) {
+	return openI2PNode(ctx, dataDir, samAddr, httpProxy, nil, logger, false)
+}
+
+func openI2PNode(
+	ctx context.Context,
+	dataDir, samAddr, httpProxy string,
+	storage *store.Store,
+	logger *log.Logger,
+	storageEnabled bool,
+) (*Node, error) {
 	identity, err := loadOrCreateIdentity(filepath.Join(dataDir, "p2p.key"))
 	if err != nil {
 		return nil, err
@@ -235,7 +254,7 @@ func Open(ctx context.Context, dataDir, samAddr, httpProxy string, storage *stor
 			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 		},
 	}
-	return finishNode(ctx, h, storage, logger, httpClient, directHTTP, true, true)
+	return finishNode(ctx, h, storage, logger, httpClient, directHTTP, true, true, storageEnabled)
 }
 
 func openNode(ctx context.Context, dataDir string, listen []string, storage *store.Store, logger *log.Logger, useCoordinatorBootstrap bool) (*Node, error) {
@@ -256,7 +275,7 @@ func openNode(ctx context.Context, dataDir string, listen []string, storage *sto
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
 	}
-	return finishNode(ctx, h, storage, logger, httpClient, httpClient, useCoordinatorBootstrap, false)
+	return finishNode(ctx, h, storage, logger, httpClient, httpClient, useCoordinatorBootstrap, false, true)
 }
 
 func finishNode(
@@ -268,6 +287,7 @@ func finishNode(
 	directHTTP *http.Client,
 	useCoordinatorBootstrap bool,
 	i2pOnly bool,
+	storageEnabled bool,
 ) (*Node, error) {
 	kad, err := dht.New(h, dht.Mode(dht.ModeAutoServer))
 	if err != nil {
@@ -280,7 +300,9 @@ func finishNode(
 		directHTTP: directHTTP, i2pOnly: i2pOnly,
 		replicated: make(map[string]struct{}),
 	}
-	h.SetStreamHandler(ProtocolID, n.handleStream)
+	if storageEnabled {
+		h.SetStreamHandler(ProtocolID, n.handleStream)
+	}
 	if err := kad.Bootstrap(ctx); err != nil {
 		h.Close()
 		return nil, err
@@ -288,10 +310,12 @@ func finishNode(
 	if useCoordinatorBootstrap {
 		go n.bootstrapLoop(ctx)
 	}
-	if i2pOnly {
+	if i2pOnly && storageEnabled {
 		go n.heartbeatLoop(ctx)
 	}
-	go n.ReplicateStored(ctx)
+	if storageEnabled {
+		go n.ReplicateStored(ctx)
+	}
 	return n, nil
 }
 
