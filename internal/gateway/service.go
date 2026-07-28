@@ -181,15 +181,6 @@ func (s *Service) challenge(w http.ResponseWriter, r *http.Request) {
 		host = r.RemoteAddr
 	}
 	now := s.now().UTC()
-	s.mu.Lock()
-	if last := s.lastRequest[host]; !last.IsZero() && now.Sub(last) < time.Second {
-		s.mu.Unlock()
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
-		return
-	}
-	s.lastRequest[host] = now
-	s.mu.Unlock()
-
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChallengeBody))
 	if err != nil {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "invalid challenge"})
@@ -219,6 +210,19 @@ func (s *Service) challenge(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid probe signature"})
 		return
 	}
+	// Multiple admitted probes can legitimately share one public NAT address.
+	// Pace each authenticated probe/source pair rather than letting one probe
+	// rate-limit every other identity on that network.
+	rateKey := host + "\x00" + challenge.ProbeID
+	s.mu.Lock()
+	if last := s.lastRequest[rateKey]; !last.IsZero() && now.Sub(last) < time.Second {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		return
+	}
+	s.lastRequest[rateKey] = now
+	s.mu.Unlock()
+
 	replayKey := challenge.ProbeID + "\x00" + challenge.ChallengeID + "\x00" + challenge.Nonce
 	s.mu.Lock()
 	s.purgeReplays(now.Unix())
