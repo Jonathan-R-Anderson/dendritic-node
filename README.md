@@ -43,6 +43,10 @@ nodes for encrypted shard storage and recovery.
 - a credential-free HTTPS registration client signed by the persistent node
   identity. Name.com access and DNS mutation exist only in the separate
   server-side `gateway-controller`.
+- a `-gateway-only` runtime mode for dedicated edge hosts. It retains gateway
+  identity, ACME, verification, gateway DHT publication, and SNI forwarding
+  while disabling shard storage/exchange, S3, the storage dashboard, and
+  storage-node heartbeats.
 
 ## Volunteer HTTPS gateway mode
 
@@ -153,6 +157,102 @@ Do not copy a private wildcard key to volunteer machines. The compatible
 deployment is a per-node browser-trusted certificate obtained by the operator,
 or TLS termination at a trusted project edge. Certificate verification is
 never disabled.
+
+### Run a dedicated gateway without storage
+
+Use `-gateway-only` on an edge server that should forward HTTPS traffic but
+must not donate disk or appear as a storage node. This is a real role boundary,
+not a cosmetic dashboard setting. In gateway-only mode the process does not:
+
+- open the encrypted shard/object store;
+- accept, fetch, advertise, or replicate storage shards;
+- start the loopback S3 service on port 9000;
+- start the storage dashboard on port 9090; or
+- send the five-minute storage-node heartbeat.
+
+It still opens the persistent node identity and I2P DHT transport because
+verified gateway registrations are signed and published in the gateway DHT.
+I2P and its SAM bridge therefore remain required. Public TCP 80 is required
+when `gateway.tls.mode` is `acme`, and public TCP 443 is required for the
+gateway listener.
+
+Generate the configuration without starting storage services:
+
+```sh
+./syndichan-node -gateway-status
+```
+
+Edit the generated `config.json`, copy in the `gateway` object from
+[`gateway.example.json`](gateway.example.json), and configure at minimum:
+
+- `gateway.enabled: true`;
+- the host's literal `public_addresses`;
+- `tls.mode: "acme"` or paths for an existing certificate;
+- `frontend.enabled: true` to forward `syndichan.org`;
+- the supplied origin address and exact SNI allowlist; and
+- the admitted probe URLs and public keys required by the verification quorum.
+
+Then start only the gateway role:
+
+```sh
+# Linux
+./syndichan-node-linux-amd64 -gateway-only
+
+# macOS (Apple Silicon)
+./syndichan-node-darwin-arm64 -gateway-only
+```
+
+```powershell
+# Windows
+.\syndichan-node-windows-amd64.exe -gateway-only
+```
+
+Pass `-config` and `-data-dir` when using service-owned paths:
+
+```sh
+/usr/local/bin/syndichan-node \
+  -gateway-only \
+  -config /var/lib/syndichan/config.json \
+  -data-dir /var/lib/syndichan/data
+```
+
+For the packaged Linux systemd unit, create an override so package updates do
+not erase the role selection:
+
+```sh
+sudo systemctl edit syndichan-node
+```
+
+Enter:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/syndichan-node -gateway-only -config /var/lib/syndichan/config.json -data-dir /var/lib/syndichan/data
+```
+
+Then reload and start it:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now syndichan-node
+sudo systemctl status syndichan-node
+```
+
+Do not launch a second copy while the system service is running; only one
+process can own ports 80 and 443. Verify the role and listeners with:
+
+```sh
+systemctl show syndichan-node -p ExecStart
+ss -lnt | grep -E ':80 |:443 |:9000 |:9090 '
+curl --fail https://gw-NODE-ID.syndichan.org/healthz
+curl --fail https://gw-NODE-ID.syndichan.org/readyz
+```
+
+Only 80/443 should be present; 9000/9090 must be absent. `/healthz` proves the
+process is running. `/readyz` must return 200 before the controller can admit
+the gateway to the shared `syndichan.org` DNS answer set. A 503 normally means
+the I2P DHT has no live peer yet or the gateway is draining.
 
 ### Configure a probe
 
