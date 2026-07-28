@@ -47,7 +47,12 @@ One process may be a candidate and probe, but its own probe result never counts.
    validates the gateway signature, probe signatures, expiry, quorum, address
    policy, and DHT-key binding.
 10. The server reconciles its verified healthy registry with Name.com. Durable
-   record ownership prevents unrelated DNS records from entering the diff.
+    record ownership prevents unrelated DNS records from entering the diff.
+
+Address families are authorized independently. A dual-stack node must meet the
+full configured probe and network quorum over its IPv4 literal before IPv4 is
+advertised, and independently over its IPv6 literal before IPv6 is advertised.
+A successful IPv4 path is never evidence that the IPv6 path is reachable.
 
 ## Candidate
 

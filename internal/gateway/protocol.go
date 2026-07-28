@@ -253,22 +253,77 @@ func EvaluateQuorum(results []ProbeResult, trusted map[string]string, now time.T
 	return nil
 }
 
+// VerifiedAddressResults keeps only addresses which independently met the
+// configured probe and network quorum. A successful IPv4 probe can therefore
+// never authorize an advertised IPv6 address, or vice versa.
+func VerifiedAddressResults(
+	addresses []Address,
+	results []ProbeResult,
+	trusted map[string]string,
+	now time.Time,
+	successes, networks int,
+) ([]Address, []ProbeResult) {
+	var verified []Address
+	var accepted []ProbeResult
+	for _, address := range NormalizeAddresses(addresses) {
+		var matching []ProbeResult
+		for _, result := range results {
+			if result.TestedAddress == address.Address &&
+				result.TestedPort == address.Port {
+				matching = append(matching, result)
+			}
+		}
+		if EvaluateQuorum(matching, trusted, now, successes, networks) != nil {
+			continue
+		}
+		verified = append(verified, address)
+		seenProbes := map[string]struct{}{}
+		for _, result := range matching {
+			probeKey, admitted := trusted[result.ProbeNodeID]
+			if !admitted {
+				continue
+			}
+			if _, duplicate := seenProbes[result.ProbeNodeID]; duplicate {
+				continue
+			}
+			if VerifyProbeResult(result, probeKey, now) != nil ||
+				!(result.TCPReachable && result.TLSValid && result.IdentityValid &&
+					result.ChallengeValid && result.ProtocolValid) {
+				continue
+			}
+			seenProbes[result.ProbeNodeID] = struct{}{}
+			accepted = append(accepted, result)
+		}
+	}
+	return verified, accepted
+}
+
 func NewRegistration(s Signer, addresses []Address, results []ProbeResult, trusted map[string]string,
 	now time.Time, validity time.Duration, sequence uint64, version string,
 	minimumSuccesses, minimumNetworks int) (Registration, error) {
-	if err := EvaluateQuorum(results, trusted, now, minimumSuccesses, minimumNetworks); err != nil {
-		return Registration{}, err
+	normalized := NormalizeAddresses(addresses)
+	verifiedAddresses, verifiedResults := VerifiedAddressResults(
+		normalized, results, trusted, now, minimumSuccesses, minimumNetworks,
+	)
+	if len(normalized) == 0 || len(verifiedAddresses) != len(normalized) {
+		return Registration{}, errors.New("every advertised address must independently meet verification quorum")
 	}
 	key, err := s.PublicKey()
 	if err != nil {
 		return Registration{}, err
 	}
 	networks := map[string]struct{}{}
+	seenProbes := map[string]struct{}{}
 	successes := 0
-	for _, result := range results {
-		if _, ok := trusted[result.ProbeNodeID]; ok &&
+	for _, result := range verifiedResults {
+		probeKey, ok := trusted[result.ProbeNodeID]
+		if _, duplicate := seenProbes[result.ProbeNodeID]; duplicate {
+			continue
+		}
+		if ok && VerifyProbeResult(result, probeKey, now) == nil &&
 			result.TCPReachable && result.TLSValid && result.IdentityValid &&
 			result.ChallengeValid && result.ProtocolValid {
+			seenProbes[result.ProbeNodeID] = struct{}{}
 			successes++
 			networks[result.ProbeNetwork] = struct{}{}
 		}
@@ -276,13 +331,13 @@ func NewRegistration(s Signer, addresses []Address, results []ProbeResult, trust
 	registration := Registration{
 		RecordType: "verified_gateway", NodeID: s.ID(),
 		PublicKey: base64.RawStdEncoding.EncodeToString(key),
-		Addresses: NormalizeAddresses(addresses), ProtocolVersion: ProtocolVersion,
+		Addresses: verifiedAddresses, ProtocolVersion: ProtocolVersion,
 		SoftwareVersion:  version,
 		Capabilities:     []string{"https_gateway", "dht_lookup", "content_proxy"},
 		SuccessfulProbes: successes, DistinctNetworks: len(networks),
 		VerifiedAt: now.Unix(), HealthState: StateHealthy,
 		IssuedAt: now.Unix(), ExpiresAt: now.Add(validity).Unix(),
-		Sequence: sequence, ProbeResults: append([]ProbeResult(nil), results...),
+		Sequence: sequence, ProbeResults: append([]ProbeResult(nil), verifiedResults...),
 	}
 	registration.Signature, err = signJSON(s, registration)
 	return registration, err
@@ -305,8 +360,21 @@ func (r Registration) Validate(trusted map[string]string, now time.Time, minimum
 		verificationTime.Before(now.Add(-15*time.Minute)) {
 		return errors.New("invalid registration verification time")
 	}
-	if err := EvaluateQuorum(r.ProbeResults, trusted, verificationTime, minimumSuccesses, minimumNetworks); err != nil {
-		return err
+	normalized := NormalizeAddresses(r.Addresses)
+	if len(normalized) != len(r.Addresses) {
+		return errors.New("registration addresses must be unique and canonical")
+	}
+	for index := range normalized {
+		if normalized[index] != r.Addresses[index] {
+			return errors.New("registration address family or canonical form is invalid")
+		}
+	}
+	verifiedAddresses, _ := VerifiedAddressResults(
+		normalized, r.ProbeResults, trusted, verificationTime,
+		minimumSuccesses, minimumNetworks,
+	)
+	if len(verifiedAddresses) != len(normalized) {
+		return errors.New("every advertised address must independently meet verification quorum")
 	}
 	unsigned := r
 	unsigned.Signature = ""

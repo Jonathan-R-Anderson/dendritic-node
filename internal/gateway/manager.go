@@ -144,9 +144,12 @@ func (m *Manager) verify(ctx context.Context) {
 			results = append(results, item.result)
 		}
 	}
-	if err := EvaluateQuorum(results, m.config.TrustedProbes, time.Now(),
-		m.config.MinimumProbes, m.config.MinimumNetworks); err != nil {
-		m.failed(ctx, "external verification failed: %v", err)
+	verifiedAddresses, verifiedResults := VerifiedAddressResults(
+		m.config.Addresses, results, m.config.TrustedProbes, time.Now(),
+		m.config.MinimumProbes, m.config.MinimumNetworks,
+	)
+	if len(verifiedAddresses) == 0 {
+		m.failed(ctx, "external verification failed: no address family met quorum")
 		return
 	}
 	m.mu.Lock()
@@ -173,7 +176,7 @@ func (m *Manager) verify(ctx context.Context) {
 		sequence = current.Sequence + 1
 	}
 	registration, err := NewRegistration(
-		m.signer, m.config.Addresses, results, m.config.TrustedProbes,
+		m.signer, verifiedAddresses, verifiedResults, m.config.TrustedProbes,
 		time.Now(), m.config.RegistrationValidity, sequence,
 		m.config.SoftwareVersion, m.config.MinimumProbes, m.config.MinimumNetworks,
 	)
@@ -200,7 +203,8 @@ func (m *Manager) verify(ctx context.Context) {
 		m.onVerified(true)
 	}
 	if m.logger != nil {
-		m.logger.Printf("gateway verified by %d probes across %d networks; registration expires %s",
+		m.logger.Printf("gateway verified at %d address(es) by %d probes across %d networks; registration expires %s",
+			len(registration.Addresses),
 			registration.SuccessfulProbes, registration.DistinctNetworks,
 			time.Unix(registration.ExpiresAt, 0).UTC().Format(time.RFC3339))
 	}

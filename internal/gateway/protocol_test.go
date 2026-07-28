@@ -93,6 +93,57 @@ func TestSignedQuorumRequiresDistinctAdmittedProbes(t *testing.T) {
 	}
 }
 
+func TestAddressFamiliesMustMeetQuorumIndependently(t *testing.T) {
+	now := time.Now().UTC()
+	candidate := newTestSigner(t)
+	probes := []*testSigner{newTestSigner(t), newTestSigner(t), newTestSigner(t)}
+	trusted := map[string]string{}
+	var results []ProbeResult
+	for index, probe := range probes {
+		trusted[probe.ID()] = publicKeyString(t, probe)
+		for _, address := range []string{"8.8.8.8", "2606:4700:4700::1111"} {
+			if address[0] == '2' && index == 2 {
+				continue // IPv6 has only two probes and must not be advertised.
+			}
+			result := ProbeResult{
+				RequestID: "request", CandidateNodeID: candidate.ID(),
+				ProbeNodeID: probe.ID(), ProbeNetwork: []string{"a", "b", "c"}[index],
+				TestedAddress: address, TestedPort: 443,
+				TCPReachable: true, TLSValid: true, IdentityValid: true,
+				ChallengeValid: true, ProtocolValid: true,
+				ObservedAt: now.Unix(), ExpiresAt: now.Add(time.Minute).Unix(),
+			}
+			result.Signature, _ = signJSON(probe, result)
+			results = append(results, result)
+		}
+	}
+	addresses, accepted := VerifiedAddressResults(
+		[]Address{
+			{Address: "8.8.8.8", Port: 443},
+			{Address: "2606:4700:4700::1111", Port: 443},
+		},
+		results, trusted, now, 3, 2,
+	)
+	if len(addresses) != 1 || addresses[0].Address != "8.8.8.8" {
+		t.Fatalf("verified addresses = %#v", addresses)
+	}
+	for _, result := range accepted {
+		if result.TestedAddress != "8.8.8.8" {
+			t.Fatal("unverified IPv6 result entered registration")
+		}
+	}
+	if _, err := NewRegistration(
+		candidate,
+		[]Address{
+			{Address: "8.8.8.8", Port: 443},
+			{Address: "2606:4700:4700::1111", Port: 443},
+		},
+		results, trusted, now, time.Minute, 1, "test", 3, 2,
+	); err == nil {
+		t.Fatal("registration admitted an address which did not meet quorum")
+	}
+}
+
 func TestHealthTransitionsDrainBeforeRemoval(t *testing.T) {
 	now := time.Now()
 	state := HealthMachine{State: StateHealthy}
