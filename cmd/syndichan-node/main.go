@@ -79,21 +79,41 @@ func main() {
 		"run only a signed verification probe; no storage, I2P, S3, dashboard, or heartbeat")
 	flag.Parse()
 
+	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
+
+	// The runtime role is resolved from the command line FIRST, before the
+	// configuration is read or validated. Everything downstream -- which
+	// settings are required, which subsystems are constructed -- is derived
+	// from it, so a dedicated gateway is never asked for storage settings it
+	// will not use.
+	role, err := runtimeRole(gatewayOnly, probeOnly)
+	if err != nil {
+		logger.Fatal(err)
+	}
+	// These four flags read or edit config.json and then return -- they never
+	// reach subsystem startup below. Holding them to a runtime role would mean
+	// a dedicated gateway could not inspect its own storage-free config file.
+	if gatewayStatus || gatewayEnable || gatewayDisable || showCredentials {
+		role = config.RoleManagement
+	}
 	path, err := config.ConfigPath(configFile)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
-	cfg, created, err := config.LoadOrCreate(path)
+	logger.Printf("runtime role: %s (%s)", role, role.Description())
+	logger.Printf("loading configuration: %s", path)
+	cfg, created, err := config.LoadOrCreate(path, role)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatalf("configuration %s: %v", path, err)
 	}
+	logger.Printf("configuration accepted for the %s role", role)
 	if gatewayEnable && gatewayDisable {
-		log.Fatal("-gateway-enable and -gateway-disable are mutually exclusive")
+		logger.Fatal("-gateway-enable and -gateway-disable are mutually exclusive")
 	}
 	if gatewayEnable || gatewayDisable {
 		cfg.Gateway.Enabled = gatewayEnable
-		if err := config.Save(path, cfg); err != nil {
-			log.Fatalf("persist gateway mode: %v", err)
+		if err := config.Save(path, cfg, role); err != nil {
+			logger.Fatalf("persist gateway mode: %v", err)
 		}
 		fmt.Printf("Gateway mode enabled: %t\n", cfg.Gateway.Enabled)
 		return
@@ -143,11 +163,11 @@ func main() {
 			}
 		}
 		if changed {
-			if err := cfg.Validate(); err != nil {
-				log.Fatalf("listen/TLS flags: %v", err)
+			if err := cfg.ValidateForRole(role); err != nil {
+				logger.Fatalf("listen/TLS flags: %v", err)
 			}
-			if err := config.Save(path, cfg); err != nil {
-				log.Fatalf("persist listen/TLS flags: %v", err)
+			if err := config.Save(path, cfg, role); err != nil {
+				logger.Fatalf("persist listen/TLS flags: %v", err)
 			}
 			fmt.Fprintf(os.Stderr, "S3 gateway configured on %s\n", cfg.S3Listen)
 		}
@@ -156,11 +176,11 @@ func main() {
 	if dataDir != "" {
 		resolved, err := filepath.Abs(dataDir)
 		if err != nil {
-			log.Fatalf("-data-dir: %v", err)
+			logger.Fatalf("-data-dir: %v", err)
 		}
 		// 0700: the store holds encrypted shards and local object manifests.
 		if err := os.MkdirAll(resolved, 0700); err != nil {
-			log.Fatalf("-data-dir %s: %v", resolved, err)
+			logger.Fatalf("-data-dir %s: %v", resolved, err)
 		}
 		if cfg.DataDir != resolved {
 			cfg.DataDir = resolved
@@ -168,32 +188,22 @@ func main() {
 			// Scheduler entries in the README) do not need the flag repeated,
 			// and so a forgotten flag cannot silently start a second, empty
 			// store in the default location.
-			if err := config.Save(path, cfg); err != nil {
-				log.Fatalf("persist -data-dir: %v", err)
+			if err := config.Save(path, cfg, role); err != nil {
+				logger.Fatalf("persist -data-dir: %v", err)
 			}
 			fmt.Fprintf(os.Stderr, "Storage directory set to %s\n", resolved)
 		}
 	}
 	if capacityGiB != 0 {
 		if math.IsNaN(capacityGiB) || math.IsInf(capacityGiB, 0) || capacityGiB <= 0 {
-			log.Fatal("-capacity-gib must be a positive finite number")
+			logger.Fatal("-capacity-gib must be a positive finite number")
 		}
 		cfg.CapacityBytes = int64(math.Round(capacityGiB * (1 << 30)))
-		if err := cfg.Validate(); err != nil {
-			log.Fatalf("-capacity-gib: %v", err)
+		if err := cfg.ValidateForRole(role); err != nil {
+			logger.Fatalf("-capacity-gib: %v", err)
 		}
 	}
-	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
-	if gatewayOnly && probeOnly {
-		logger.Fatal("-gateway-only and -probe-only are mutually exclusive")
-	}
-	if gatewayOnly && !cfg.Gateway.Enabled && !cfg.Gateway.ProbeEnabled {
-		logger.Fatal("-gateway-only requires gateway.enabled or gateway.probe_enabled")
-	}
-	if probeOnly && (!cfg.Gateway.ProbeEnabled || cfg.Gateway.Enabled) {
-		logger.Fatal("-probe-only requires gateway.probe_enabled=true and gateway.enabled=false")
-	}
-	noStorage := gatewayOnly || probeOnly
+	noStorage := !role.NeedsStorage()
 	if showCredentials {
 		// Deliberate, explicit retrieval. The operator owns this machine and
 		// this mode-0600 file, so this reveals nothing they cannot already
@@ -223,7 +233,11 @@ func main() {
 	}
 
 	var storageNode *store.Store
+	if noStorage {
+		logger.Printf("storage subsystems skipped: shard store, S3, dashboard, I2P, heartbeat")
+	}
 	if !noStorage {
+		logger.Printf("opening encrypted shard store: %s", filepath.Join(cfg.DataDir, "storage"))
 		storageNode, err = store.Open(
 			filepath.Join(cfg.DataDir, "storage"),
 			cfg.DataShards, cfg.ParityShards, cfg.ChunkBytes, cfg.CapacityBytes,
@@ -241,9 +255,11 @@ func main() {
 	defer cancel()
 	var node *p2p.Node
 	var signer gateway.Signer
-	if probeOnly || gatewayOnly {
+	if noStorage {
+		logger.Printf("loading standalone gateway identity from %s", cfg.DataDir)
 		signer, err = gateway.LoadOrCreateFileIdentity(cfg.DataDir)
 	} else {
+		logger.Printf("starting I2P transport and storage DHT via SAM %s", cfg.I2PSAM)
 		node, err = p2p.Open(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, storageNode, logger)
 	}
 	if err != nil {
@@ -253,9 +269,9 @@ func main() {
 		defer node.Close()
 		signer = node
 		node.SetGatewayState(cfg.Gateway.Enabled, false)
-		if !gatewayOnly {
-			go node.RefreshHeartbeat(ctx)
-		}
+		// node is non-nil only in the storage role, which is also the only role
+		// that sends the five-minute storage heartbeat.
+		go node.RefreshHeartbeat(ctx)
 	}
 	if node != nil {
 		gatewayValidator := gateway.DHTValidator{
@@ -313,7 +329,7 @@ func main() {
 			}
 			if cfg.Gateway.PublicHostname != reservation.Hostname {
 				cfg.Gateway.PublicHostname = reservation.Hostname
-				if saveErr := config.Save(path, cfg); saveErr != nil {
+				if saveErr := config.Save(path, cfg, role); saveErr != nil {
 					logger.Fatalf("persist controller-assigned gateway hostname: %v", saveErr)
 				}
 			}
@@ -365,7 +381,9 @@ func main() {
 	if cfg.Gateway.Enabled || cfg.Gateway.ProbeEnabled {
 		gatewayService = gateway.NewService(signer, "1.0.0", cfg.Gateway.TrustedProbes, logger)
 		gatewayService.SetTrustLoopbackProxy(cfg.Gateway.TLS.Mode == "reverse_proxy")
-		gatewayService.SetRequireDHTReady(!gatewayOnly)
+		// The storage DHT only exists in the storage role; a standalone
+		// gateway or probe reports readiness from its listener alone.
+		gatewayService.SetRequireDHTReady(!noStorage)
 		if cfg.Gateway.ProbeEnabled {
 			gatewayService.SetProber(&gateway.Prober{
 				Signer: signer, Network: cfg.Gateway.ProbeNetwork,
@@ -539,9 +557,11 @@ func main() {
 			// corrupting it. Takes effect on the next start (see ui.setStorageDir).
 			next := cfg
 			next.DataDir = target
-			return config.Save(path, next)
+			return config.Save(path, next, role)
 		})
+		logger.Printf("starting S3 gateway on %s", cfg.S3Listen)
 		go serve(s3Server, cfg, logger, "S3 gateway")
+		logger.Printf("starting storage dashboard on %s", cfg.UIListen)
 		go serve(uiServer, cfg, logger, "dashboard")
 	}
 	// Tray icon when built with -tags tray; nil otherwise. It does not keep the
@@ -555,10 +575,8 @@ func main() {
 	} else {
 		logger.Printf("node %s started on %s", signer.ID(), config.PlatformLabel())
 	}
-	if probeOnly {
-		logger.Printf("probe-only mode: storage, I2P, S3, dashboard, and heartbeat disabled")
-	} else if gatewayOnly {
-		logger.Printf("gateway-only mode: storage sharing, S3, dashboard, and storage heartbeat disabled")
+	if noStorage {
+		logger.Printf("%s mode: %s", role, role.Description())
 	} else {
 		logger.Printf("S3 gateway: %s; dashboard: %s", cfg.S3Listen, cfg.UIListen)
 	}
@@ -592,6 +610,22 @@ func main() {
 		_ = uiServer.Shutdown(shutdownCtx)
 	}
 	logger.Printf("shutdown complete")
+}
+
+// runtimeRole maps the mutually exclusive role flags onto a config.Role. It
+// touches no configuration, so the role is known before the config file is
+// even opened.
+func runtimeRole(gatewayOnly, probeOnly bool) (config.Role, error) {
+	switch {
+	case gatewayOnly && probeOnly:
+		return "", errors.New("-gateway-only and -probe-only are mutually exclusive")
+	case gatewayOnly:
+		return config.RoleGatewayOnly, nil
+	case probeOnly:
+		return config.RoleProbeOnly, nil
+	default:
+		return config.RoleStorage, nil
+	}
 }
 
 func readSecretFile(path string) (string, error) {

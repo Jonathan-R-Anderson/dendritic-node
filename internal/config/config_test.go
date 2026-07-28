@@ -157,10 +157,10 @@ func TestGatewayFrontendSaveLoadRoundTrip(t *testing.T) {
 	cfg.Gateway.Frontend.OriginServerName = "syndichan.org"
 	cfg.Gateway.Frontend.SNIAllowlist = []string{"syndichan.org"}
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := Save(path, cfg); err != nil {
+	if err := Save(path, cfg, RoleStorage); err != nil {
 		t.Fatal(err)
 	}
-	loaded, created, err := LoadOrCreate(path)
+	loaded, created, err := LoadOrCreate(path, RoleStorage)
 	if err != nil {
 		t.Fatal(err)
 	}

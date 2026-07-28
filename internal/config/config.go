@@ -19,6 +19,47 @@ import (
 // the direct five-minute presence heartbeat remain separate concerns.
 const BootstrapURL = "https://node.syndichan.org/.well-known/syndichan/storage-node.json"
 
+// Role is the runtime role selected on the command line. It is resolved before
+// the configuration is read, so validation only ever demands settings the role
+// will actually use. A dedicated gateway has no shard store, no S3 service and
+// no dashboard, so it must not be asked for S3 credentials, an erasure layout,
+// a capacity, or an I2P bridge.
+type Role string
+
+const (
+	// RoleStorage is the default full node: shard storage, S3, dashboard and
+	// I2P, plus the gateway/probe services if the config enables them.
+	RoleStorage Role = "storage"
+	// RoleGatewayOnly runs the gateway and/or probe services alone (-gateway-only).
+	RoleGatewayOnly Role = "gateway-only"
+	// RoleProbeOnly runs only the signed verification probe (-probe-only).
+	RoleProbeOnly Role = "probe-only"
+	// RoleManagement inspects or edits the config file and exits
+	// (-gateway-status, -gateway-enable, -gateway-disable, -show-credentials).
+	// It starts nothing, so it checks the gateway settings it may touch and
+	// demands neither storage settings nor a startable runtime role.
+	RoleManagement Role = "config-management"
+)
+
+// NeedsStorage reports whether the role initializes any storage subsystem. It
+// is the single switch that decides both what gets validated and what gets
+// started, so the two can never drift apart.
+func (r Role) NeedsStorage() bool { return r == RoleStorage }
+
+func (r Role) Description() string {
+	switch r {
+	case RoleStorage:
+		return "shard storage, S3, dashboard, I2P, heartbeat; gateway/probe if configured"
+	case RoleGatewayOnly:
+		return "gateway/probe services only; no storage, S3, dashboard, I2P, or heartbeat"
+	case RoleProbeOnly:
+		return "signed verification probe only; no storage, S3, dashboard, I2P, or heartbeat"
+	case RoleManagement:
+		return "inspect or update the configuration file; no subsystem is started"
+	}
+	return string(r)
+}
+
 type Config struct {
 	DataDir  string `json:"data_dir"`
 	S3Listen string `json:"s3_listen"`
@@ -179,7 +220,12 @@ func Default() (Config, error) {
 	}, nil
 }
 
-func LoadOrCreate(path string) (Config, bool, error) {
+// LoadOrCreate reads the config at path, or creates a default one if it is
+// missing, and validates it for the caller's runtime role. The role must be
+// resolved from the command line before this is called: validating a
+// gateway-only node as if it were a storage node is what used to reject a
+// perfectly good gateway config for having no S3 credentials.
+func LoadOrCreate(path string, role Role) (Config, bool, error) {
 	cfg, err := Default()
 	if err != nil {
 		return Config{}, false, err
@@ -189,12 +235,15 @@ func LoadOrCreate(path string) (Config, bool, error) {
 		if err := json.Unmarshal(raw, &cfg); err != nil {
 			return Config{}, false, fmt.Errorf("parse config: %w", err)
 		}
-		return cfg, false, cfg.Validate()
+		return cfg, false, cfg.ValidateForRole(role)
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return Config{}, false, err
 	}
 	cfg.DataDir = filepath.Dir(path)
+	// Generated regardless of role so a freshly created file is a complete,
+	// reusable storage config. A storage-free role validates and starts
+	// without them; it simply never reads them.
 	cfg.AccessKey = "SYN" + randomToken(12)
 	cfg.SecretKey = randomToken(32)
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -207,10 +256,54 @@ func LoadOrCreate(path string) (Config, bool, error) {
 	if err := os.WriteFile(path, append(raw, '\n'), 0600); err != nil {
 		return Config{}, false, err
 	}
-	return cfg, true, cfg.Validate()
+	return cfg, true, cfg.ValidateForRole(role)
 }
 
+// Validate checks a full storage node. It is the RoleStorage case of
+// ValidateForRole; anything that selects a role must call ValidateForRole so a
+// storage-free role is never held to storage requirements.
 func (c Config) Validate() error {
+	return c.ValidateForRole(RoleStorage)
+}
+
+// ValidateForRole checks only the configuration the given role consumes.
+func (c Config) ValidateForRole(role Role) error {
+	if err := c.validateRole(role); err != nil {
+		return err
+	}
+	if role.NeedsStorage() {
+		if err := c.validateStorage(); err != nil {
+			return err
+		}
+	}
+	return c.validateGateway()
+}
+
+// validateRole checks that the config actually supports the requested role.
+func (c Config) validateRole(role Role) error {
+	switch role {
+	case RoleStorage, RoleManagement:
+		return nil
+	case RoleGatewayOnly:
+		if !c.Gateway.Enabled && !c.Gateway.ProbeEnabled {
+			return errors.New("gateway-only mode requires gateway.enabled or gateway.probe_enabled")
+		}
+		return nil
+	case RoleProbeOnly:
+		if !c.Gateway.ProbeEnabled || c.Gateway.Enabled {
+			return errors.New("probe-only mode requires gateway.probe_enabled=true and gateway.enabled=false")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown runtime role %q", role)
+	}
+}
+
+// validateStorage covers every setting that only a storage node consumes: the
+// loopback S3 gateway and its credentials, the erasure layout, the donated
+// capacity, the dashboard, and the I2P control endpoints. A gateway-only or
+// probe-only process starts none of these and must never reach this function.
+func (c Config) validateStorage() error {
 	if c.AccessKey == "" || len(c.SecretKey) < 32 {
 		return errors.New("S3 credentials are missing or too short")
 	}
@@ -225,9 +318,6 @@ func (c Config) Validate() error {
 	}
 	if c.CapacityBytes > 8<<50 {
 		return errors.New("capacity_bytes must not exceed 8 PiB")
-	}
-	if err := c.validateGateway(); err != nil {
-		return err
 	}
 	uiHost, _, err := net.SplitHostPort(c.UIListen)
 	if err != nil {
@@ -414,8 +504,8 @@ func randomToken(bytes int) string {
 // Save writes the config back atomically at mode 0600. Used when a flag such
 // as -data-dir changes a persisted value, so the setting survives restarts
 // instead of having to be repeated on every launch.
-func Save(path string, cfg Config) error {
-	if err := cfg.Validate(); err != nil {
+func Save(path string, cfg Config, role Role) error {
+	if err := cfg.ValidateForRole(role); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(cfg, "", "  ")
