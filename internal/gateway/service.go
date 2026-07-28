@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,18 +21,19 @@ const (
 )
 
 type Service struct {
-	signer        Signer
-	version       string
-	trustedProbes map[string]string
-	logger        *log.Logger
-	now           func() time.Time
-	mu            sync.Mutex
-	used          map[string]int64
-	lastRequest   map[string]time.Time
-	listenerReady bool
-	draining      bool
-	prober        *Prober
-	probeSlots    chan struct{}
+	signer             Signer
+	version            string
+	trustedProbes      map[string]string
+	logger             *log.Logger
+	now                func() time.Time
+	mu                 sync.Mutex
+	used               map[string]int64
+	lastRequest        map[string]time.Time
+	listenerReady      bool
+	draining           bool
+	prober             *Prober
+	probeSlots         chan struct{}
+	trustLoopbackProxy bool
 }
 
 func NewService(signer Signer, version string, trustedProbes map[string]string, logger *log.Logger) *Service {
@@ -49,6 +51,11 @@ func NewService(signer Signer, version string, trustedProbes map[string]string, 
 }
 
 func (s *Service) SetProber(prober *Prober) { s.prober = prober }
+
+// SetTrustLoopbackProxy allows an explicitly configured reverse proxy on the
+// same host to supply the observed candidate address. The header is ignored
+// unless the direct peer is loopback.
+func (s *Service) SetTrustLoopbackProxy(value bool) { s.trustLoopbackProxy = value }
 
 func (s *Service) SetListenerReady(ready bool) {
 	s.mu.Lock()
@@ -109,6 +116,15 @@ func (s *Service) probe(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source address unavailable"})
 		return
+	}
+	peerIP := net.ParseIP(host)
+	if s.trustLoopbackProxy && peerIP != nil && peerIP.IsLoopback() {
+		forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0])
+		if forwarded == "" || net.ParseIP(forwarded) == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "forwarded source address unavailable"})
+			return
+		}
+		host = forwarded
 	}
 	observedIP, err := netip.ParseAddr(host)
 	if err != nil || !PublicAddress(observedIP) {

@@ -43,6 +43,7 @@ func main() {
 	var gatewayEnable bool
 	var gatewayDisable bool
 	var gatewayOnly bool
+	var probeOnly bool
 	flag.StringVar(&configFile, "config", "", "path to config.json")
 	// Data location is deliberately separate from config location. Previously
 	// DataDir was always the config file's own directory, so putting shards on
@@ -74,6 +75,8 @@ func main() {
 	flag.BoolVar(&gatewayDisable, "gateway-disable", false, "disable volunteer gateway mode")
 	flag.BoolVar(&gatewayOnly, "gateway-only", false,
 		"run gateway/probe services without storage sharing, S3, dashboard, or storage heartbeat")
+	flag.BoolVar(&probeOnly, "probe-only", false,
+		"run only a signed verification probe; no storage, I2P, S3, dashboard, or heartbeat")
 	flag.Parse()
 
 	path, err := config.ConfigPath(configFile)
@@ -181,9 +184,16 @@ func main() {
 		}
 	}
 	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
+	if gatewayOnly && probeOnly {
+		logger.Fatal("-gateway-only and -probe-only are mutually exclusive")
+	}
 	if gatewayOnly && !cfg.Gateway.Enabled && !cfg.Gateway.ProbeEnabled {
 		logger.Fatal("-gateway-only requires gateway.enabled or gateway.probe_enabled")
 	}
+	if probeOnly && (!cfg.Gateway.ProbeEnabled || cfg.Gateway.Enabled) {
+		logger.Fatal("-probe-only requires gateway.probe_enabled=true and gateway.enabled=false")
+	}
+	noStorage := gatewayOnly || probeOnly
 	if showCredentials {
 		// Deliberate, explicit retrieval. The operator owns this machine and
 		// this mode-0600 file, so this reveals nothing they cannot already
@@ -213,7 +223,7 @@ func main() {
 	}
 
 	var storageNode *store.Store
-	if !gatewayOnly {
+	if !noStorage {
 		storageNode, err = store.Open(
 			filepath.Join(cfg.DataDir, "storage"),
 			cfg.DataShards, cfg.ParityShards, cfg.ChunkBytes, cfg.CapacityBytes,
@@ -230,7 +240,10 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	var node *p2p.Node
-	if gatewayOnly {
+	var signer gateway.Signer
+	if probeOnly {
+		signer, err = gateway.LoadOrCreateFileIdentity(cfg.DataDir)
+	} else if gatewayOnly {
 		node, err = p2p.OpenGateway(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, logger)
 	} else {
 		node, err = p2p.Open(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, storageNode, logger)
@@ -238,23 +251,28 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	defer node.Close()
-	node.SetGatewayState(cfg.Gateway.Enabled, false)
-	if !gatewayOnly {
-		go node.RefreshHeartbeat(ctx)
+	if node != nil {
+		defer node.Close()
+		signer = node
+		node.SetGatewayState(cfg.Gateway.Enabled, false)
+		if !gatewayOnly {
+			go node.RefreshHeartbeat(ctx)
+		}
 	}
-	gatewayValidator := gateway.DHTValidator{
-		TrustedProbes:   cfg.Gateway.TrustedProbes,
-		MinimumProbes:   cfg.Gateway.Verification.MinimumSuccessfulProbes,
-		MinimumNetworks: cfg.Gateway.Verification.MinimumDistinctNetworks,
-	}
-	if err := node.ConfigureGatewayRecords(gatewayValidator); err != nil {
-		logger.Fatal("configure gateway DHT records: ", err)
+	if node != nil {
+		gatewayValidator := gateway.DHTValidator{
+			TrustedProbes:   cfg.Gateway.TrustedProbes,
+			MinimumProbes:   cfg.Gateway.Verification.MinimumSuccessfulProbes,
+			MinimumNetworks: cfg.Gateway.Verification.MinimumDistinctNetworks,
+		}
+		if err := node.ConfigureGatewayRecords(gatewayValidator); err != nil {
+			logger.Fatal("configure gateway DHT records: ", err)
+		}
 	}
 	var gatewayRegistry *gateway.RegistryClient
 	if cfg.Gateway.Enabled {
 		gatewayRegistry, err = gateway.NewRegistryClient(
-			cfg.Gateway.RegistrationAPI, cfg.Gateway.PublicHostname, node,
+			cfg.Gateway.RegistrationAPI, cfg.Gateway.PublicHostname, signer,
 		)
 		if err != nil {
 			logger.Fatalf("gateway registration API: %v", err)
@@ -304,7 +322,7 @@ func main() {
 			logger.Printf("controller reserved %s for ACME", reservation.Hostname)
 		}
 	}
-	if !gatewayOnly && (cacheOnly || cfg.CacheOnly) {
+	if !noStorage && (cacheOnly || cfg.CacheOnly) {
 		// Contribute no storage to the network: this node keeps only what it
 		// caches of its own content, so its disk grows with the site rather
 		// than with the number of peers.
@@ -312,7 +330,7 @@ func main() {
 		logger.Printf("cache-only: this node will not host shards for other peers")
 	}
 	var s3Server, uiServer *http.Server
-	if !gatewayOnly {
+	if !noStorage {
 		storageNode.SetShardFetcher(node.FetchShard)
 		storageNode.SetShardAdvertiser(func(shardID string) {
 			provideCtx, provideCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -347,10 +365,11 @@ func main() {
 	var gatewayService *gateway.Service
 	var gatewayFrontend *gatewayfrontend.Server
 	if cfg.Gateway.Enabled || cfg.Gateway.ProbeEnabled {
-		gatewayService = gateway.NewService(node, "1.0.0", cfg.Gateway.TrustedProbes, logger)
+		gatewayService = gateway.NewService(signer, "1.0.0", cfg.Gateway.TrustedProbes, logger)
+		gatewayService.SetTrustLoopbackProxy(cfg.Gateway.TLS.Mode == "reverse_proxy")
 		if cfg.Gateway.ProbeEnabled {
 			gatewayService.SetProber(&gateway.Prober{
-				Signer: node, Network: cfg.Gateway.ProbeNetwork,
+				Signer: signer, Network: cfg.Gateway.ProbeNetwork,
 				PublicHostname: cfg.Gateway.PublicHostname,
 				Timeout:        time.Duration(cfg.Gateway.Verification.VerificationTimeoutSeconds) * time.Second,
 				ResultValidity: time.Duration(cfg.Gateway.Verification.ProbeResultValiditySeconds) * time.Second,
@@ -511,7 +530,7 @@ func main() {
 		}
 		go manager.Run(ctx)
 	}
-	if !gatewayOnly {
+	if !noStorage {
 		uiServer.Handler.(*ui.Server).SetStoragePaths(cfg.DataDir, func(target string) error {
 			// Persist only; the store is open and moving it live would risk
 			// corrupting it. Takes effect on the next start (see ui.setStorageDir).
@@ -528,8 +547,10 @@ func main() {
 	if runTray != nil {
 		runTray(ctx, "http://"+cfg.UIListen, logger, cancel)
 	}
-	logger.Printf("node %s started on %s; bootstrap=%s", node.ID(), config.PlatformLabel(), config.BootstrapURL)
-	if gatewayOnly {
+	logger.Printf("node %s started on %s; bootstrap=%s", signer.ID(), config.PlatformLabel(), config.BootstrapURL)
+	if probeOnly {
+		logger.Printf("probe-only mode: storage, I2P, S3, dashboard, and heartbeat disabled")
+	} else if gatewayOnly {
 		logger.Printf("gateway-only mode: storage sharing, S3, dashboard, and storage heartbeat disabled")
 	} else {
 		logger.Printf("S3 gateway: %s; dashboard: %s", cfg.S3Listen, cfg.UIListen)
