@@ -241,10 +241,8 @@ func main() {
 	defer cancel()
 	var node *p2p.Node
 	var signer gateway.Signer
-	if probeOnly {
+	if probeOnly || gatewayOnly {
 		signer, err = gateway.LoadOrCreateFileIdentity(cfg.DataDir)
-	} else if gatewayOnly {
-		node, err = p2p.OpenGateway(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, logger)
 	} else {
 		node, err = p2p.Open(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, storageNode, logger)
 	}
@@ -496,7 +494,7 @@ func main() {
 		}
 		gatewayRegistry.PublicHostname = cfg.Gateway.PublicHostname
 		var publisher gateway.RegistrationPublisher = gatewayRegistry
-		if !gatewayOnly {
+		if node != nil {
 			publisher = gateway.MultiPublisher{
 				// The central controller verifies the direct source IP and owns
 				// DNS. The DHT receives the record only after that request succeeds.
@@ -504,7 +502,7 @@ func main() {
 			}
 		}
 		var manager *gateway.Manager
-		manager, err = gateway.NewManager(node, publisher, gateway.ManagerConfig{
+		manager, err = gateway.NewManager(signer, publisher, gateway.ManagerConfig{
 			Addresses: addresses, PublicHostname: cfg.Gateway.PublicHostname,
 			ProbeURLs:            cfg.Gateway.ProbeURLs,
 			TrustedProbes:        cfg.Gateway.TrustedProbes,
@@ -520,25 +518,13 @@ func main() {
 			RecoveryThreshold:    cfg.Gateway.Health.RecoveryThreshold,
 			DrainDuration:        time.Duration(cfg.Gateway.Health.DrainSeconds) * time.Second,
 		}, logger, func(verified bool) {
-			node.SetGatewayState(true, verified)
-			if verified && manager != nil {
-				node.SetGatewayRegistration(manager.Current())
-				if gatewayOnly {
-					registration := manager.Current()
-					go func() {
-						publishCtx, publishCancel := context.WithTimeout(ctx, 30*time.Second)
-						defer publishCancel()
-						if registration != nil {
-							if publishErr := node.PublishGatewayRegistration(publishCtx, *registration); publishErr != nil {
-								logger.Printf("best-effort gateway DHT publication failed: %v", publishErr)
-							}
-						}
-					}()
+			if node != nil {
+				node.SetGatewayState(true, verified)
+				if verified && manager != nil {
+					node.SetGatewayRegistration(manager.Current())
+				} else {
+					node.SetGatewayRegistration(nil)
 				}
-			} else {
-				node.SetGatewayRegistration(nil)
-			}
-			if !gatewayOnly {
 				go node.RefreshHeartbeat(ctx)
 			}
 		})
@@ -564,7 +550,11 @@ func main() {
 	if runTray != nil {
 		runTray(ctx, "http://"+cfg.UIListen, logger, cancel)
 	}
-	logger.Printf("node %s started on %s; bootstrap=%s", signer.ID(), config.PlatformLabel(), config.BootstrapURL)
+	if node != nil {
+		logger.Printf("node %s started on %s; bootstrap=%s", signer.ID(), config.PlatformLabel(), config.BootstrapURL)
+	} else {
+		logger.Printf("node %s started on %s", signer.ID(), config.PlatformLabel())
+	}
 	if probeOnly {
 		logger.Printf("probe-only mode: storage, I2P, S3, dashboard, and heartbeat disabled")
 	} else if gatewayOnly {
