@@ -367,6 +367,7 @@ func main() {
 	if cfg.Gateway.Enabled || cfg.Gateway.ProbeEnabled {
 		gatewayService = gateway.NewService(signer, "1.0.0", cfg.Gateway.TrustedProbes, logger)
 		gatewayService.SetTrustLoopbackProxy(cfg.Gateway.TLS.Mode == "reverse_proxy")
+		gatewayService.SetRequireDHTReady(!gatewayOnly)
 		if cfg.Gateway.ProbeEnabled {
 			gatewayService.SetProber(&gateway.Prober{
 				Signer: signer, Network: cfg.Gateway.ProbeNetwork,
@@ -494,10 +495,13 @@ func main() {
 			logger.Fatal("gateway registration client was not initialized")
 		}
 		gatewayRegistry.PublicHostname = cfg.Gateway.PublicHostname
-		publisher := gateway.MultiPublisher{
-			// The central controller verifies the direct source IP and owns
-			// DNS. The DHT receives the record only after that request succeeds.
-			Publishers: []gateway.RegistrationPublisher{gatewayRegistry, node},
+		var publisher gateway.RegistrationPublisher = gatewayRegistry
+		if !gatewayOnly {
+			publisher = gateway.MultiPublisher{
+				// The central controller verifies the direct source IP and owns
+				// DNS. The DHT receives the record only after that request succeeds.
+				Publishers: []gateway.RegistrationPublisher{gatewayRegistry, node},
+			}
 		}
 		var manager *gateway.Manager
 		manager, err = gateway.NewManager(node, publisher, gateway.ManagerConfig{
@@ -519,6 +523,18 @@ func main() {
 			node.SetGatewayState(true, verified)
 			if verified && manager != nil {
 				node.SetGatewayRegistration(manager.Current())
+				if gatewayOnly {
+					registration := manager.Current()
+					go func() {
+						publishCtx, publishCancel := context.WithTimeout(ctx, 30*time.Second)
+						defer publishCancel()
+						if registration != nil {
+							if publishErr := node.PublishGatewayRegistration(publishCtx, *registration); publishErr != nil {
+								logger.Printf("best-effort gateway DHT publication failed: %v", publishErr)
+							}
+						}
+					}()
+				}
 			} else {
 				node.SetGatewayRegistration(nil)
 			}

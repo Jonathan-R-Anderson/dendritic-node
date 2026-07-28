@@ -34,6 +34,7 @@ type Service struct {
 	prober             *Prober
 	probeSlots         chan struct{}
 	trustLoopbackProxy bool
+	requireDHTReady    bool
 }
 
 func NewService(signer Signer, version string, trustedProbes map[string]string, logger *log.Logger) *Service {
@@ -46,7 +47,7 @@ func NewService(signer Signer, version string, trustedProbes map[string]string, 
 	return &Service{
 		signer: signer, version: version, trustedProbes: trusted, logger: logger,
 		now: time.Now, used: make(map[string]int64), lastRequest: make(map[string]time.Time),
-		probeSlots: make(chan struct{}, 8),
+		probeSlots: make(chan struct{}, 8), requireDHTReady: true,
 	}
 }
 
@@ -56,6 +57,8 @@ func (s *Service) SetProber(prober *Prober) { s.prober = prober }
 // same host to supply the observed candidate address. The header is ignored
 // unless the direct peer is loopback.
 func (s *Service) SetTrustLoopbackProxy(value bool) { s.trustLoopbackProxy = value }
+
+func (s *Service) SetRequireDHTReady(value bool) { s.requireDHTReady = value }
 
 func (s *Service) SetListenerReady(ready bool) {
 	s.mu.Lock()
@@ -154,7 +157,7 @@ func (s *Service) ready(w http.ResponseWriter) {
 	s.mu.Lock()
 	listenerReady, draining := s.listenerReady, s.draining
 	s.mu.Unlock()
-	if !listenerReady || draining || !s.signer.DHTReady() {
+	if !listenerReady || draining || (s.requireDHTReady && !s.signer.DHTReady()) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"status": "not_ready", "protocol_version": ProtocolVersion,
 		})
