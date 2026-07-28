@@ -111,16 +111,34 @@ A candidate needs:
 - one or more literal `public_addresses`;
 - at least as many HTTPS `probe_urls` as the required quorum;
 - `trusted_probes`, mapping node IDs to base64 libp2p public keys;
-- a `public_hostname`;
 - the public, credential-free `registration_api` (normally the built-in
   `https://syndichan.org/api/v1/gateways`);
-- either existing certificate paths or reverse-proxy TLS mode.
+- existing certificate paths, client-managed ACME, or reverse-proxy TLS mode.
 
 For direct TLS, install a browser-trusted certificate and set `tls.mode` to
-`existing`. For nginx, Caddy, or HAProxy, set `tls.mode` to `reverse_proxy`,
+`existing`. To let the client issue and renew its own per-node certificate, set
+`tls.mode` to `acme`, provide an optional `acme_email`, and forward public TCP
+80 and 443 to the client. Before ACME begins, the client signs a reservation
+request with its existing node identity. The server derives and temporarily
+publishes `gw-<identity-hash>.syndichan.org` to the request's actual source IP;
+the client cannot choose a DNS name or submit an IP address. After public DNS
+propagates, the exact-host ACME policy authorizes only that assigned hostname.
+Private keys remain in the owner-only data-directory cache and renewed
+certificates are selected without restarting the listener.
+
+For nginx, Caddy, or HAProxy, set `tls.mode` to `reverse_proxy`,
 bind the client to a private high port, and forward the public protocol routes
 from Internet TCP 443. External probes still test public port 443; a local
 listener is never sufficient for DNS eligibility.
+
+To serve the public site through the volunteer as well, enable
+`gateway.frontend`. The frontend reads only the bounded TLS ClientHello, accepts
+only literal names in `sni_allowlist`, routes the gateway's own hostname to its
+local identity endpoint, and splices the public hostname to `origin_address`.
+It prepends PROXY protocol v2 so the origin retains the visitor's real address.
+The origin must trust PROXY headers only from verified gateways; trusting them
+from arbitrary sources lets an attacker forge IP bans, geolocation, and bot
+locks.
 
 Useful local controls:
 
@@ -290,8 +308,9 @@ The client expects:
 | HTTP proxy | `127.0.0.1:4444` |
 | Router console | `127.0.0.1:7657` |
 
-The HTTP proxy needs a working outproxy because the fixed coordinator,
-`syndichan.org`, is reached through I2P. Allow a newly installed router
+The HTTP proxy needs a working outproxy because bootstrap begins at
+`node.syndichan.org` and coordinator leases use `syndichan.org`, both through
+I2P. Allow a newly installed router
 several minutes to integrate into the I2P network before diagnosing initial
 connection failures.
 
@@ -323,6 +342,15 @@ chmod 755 syndichan-node-linux-amd64
 
 For 64-bit ARM, substitute `syndichan-node-linux-arm64`. Do not run the storage
 client as root.
+
+For a dedicated Linux host, the hardened system service in
+[`packaging/systemd/syndichan-node.service`](packaging/systemd/syndichan-node.service)
+runs the client as an unprivileged `syndichan` account and grants only
+`CAP_NET_BIND_SERVICE` for optional ACME/gateway ports 80 and 443. The companion
+[`i2pd-syndichan.default`](packaging/systemd/i2pd-syndichan.default) enables SAM
+and the HTTP proxy on loopback. Review paths and storage capacity, then install
+them as `/etc/systemd/system/syndichan-node.service` and `/etc/default/i2pd`;
+do not put S3 keys, DNS tokens, or account credentials in either file.
 
 ## Run on macOS
 
@@ -541,12 +569,15 @@ manifest/key database.
 
 The client retains a full local shard set until coordinator-leased remote
 placements are acknowledged. A failed bootstrap or lease request never deletes
-the local copy. `syndichan.org` publishes only `/garlic32/.../p2p/...`
-peer multiaddresses and the coordinator public key at:
+the local copy. The dedicated data-node edge publishes only
+`/garlic32/.../p2p/...` peer multiaddresses and the coordinator public key at:
 
 ```text
-https://syndichan.org/.well-known/syndichan/storage-node.json
+https://node.syndichan.org/.well-known/syndichan/storage-node.json
 ```
+
+The edge owns and automatically renews its `node.syndichan.org` certificate; it
+returns 404 for unrelated paths and receives no Name.com credential.
 
 ## Current S3 scope
 
@@ -572,8 +603,8 @@ ARM64. Client tests never contact the registration service or Name.com.
 The following deployment pieces are external or not yet automatic:
 
 - the server-side gateway controller must be deployed separately;
-- TLS certificates must already exist or a configured reverse proxy must
-  terminate TLS; automatic ACME issuance is not implemented;
+- ACME needs public TCP 80 and 443 plus a gateway DNS record resolving to the
+  volunteer before its first issuance;
 - UPnP/NAT-PMP port creation is not automatic;
 - CPU, free-memory, free-disk, and upload-bandwidth thresholds are represented
   in configuration, but full cross-platform resource measurement is not yet

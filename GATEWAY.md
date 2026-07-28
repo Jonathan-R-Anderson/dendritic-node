@@ -22,26 +22,31 @@ One process may be a candidate and probe, but its own probe result never counts.
 
 ## Verification flow
 
-1. The candidate starts its TLS listener and confirms its DHT identity exists.
-2. It signs a short-lived request containing its explicitly configured public
+1. The candidate signs a short-lived hostname reservation with its persistent
+   node identity. The controller deterministically derives
+   `gw-<identity-hash>.syndichan.org`, points it only at the observed request
+   source IP, and returns after the DNS provider accepts the change.
+2. The candidate confirms that public DNS resolves its assigned name to that
+   exact address, then starts exact-host ACME and its TLS listener.
+3. It signs a short-lived request containing its explicitly configured public
    addresses. Only port 443 is accepted.
-3. Each probe accepts the request only when its TCP source address equals the
+4. Each probe accepts the request only when its TCP source address equals the
    claimed address. This prevents victim-address SSRF.
-4. The probe connects to that literal address while validating TLS against
+5. The probe connects to that literal address while validating TLS against
    `public_hostname`; redirects are forbidden.
-5. It fetches the signed identity, submits a signed one-use challenge, checks
+6. It fetches the signed identity, submits a signed one-use challenge, checks
    `/readyz`, then signs its result.
-6. The candidate requires three distinct admitted identities across two
+7. The candidate requires three distinct admitted identities across two
    configured network trust domains by default.
-7. It signs a five-minute registration and submits it directly to
+8. It signs a five-minute registration and submits it directly to
    `https://syndichan.org/api/v1/gateways/register`. The server ignores claimed
    addresses, derives the HTTPS source IP, and independently checks TCP 443,
    TLS hostname validity, HTTP 200, and `X-Gateway-Version`.
-8. Only after server acceptance is it published under
+9. Only after server acceptance is it published under
    `/syndichan-gateway/<node-id>` in Kademlia. Every DHT reader independently
    validates the gateway signature, probe signatures, expiry, quorum, address
    policy, and DHT-key binding.
-9. The server reconciles its verified healthy registry with Name.com. Durable
+10. The server reconciles its verified healthy registry with Name.com. Durable
    record ownership prevents unrelated DNS records from entering the diff.
 
 ## Candidate
@@ -51,6 +56,7 @@ Set a real public IP in `public_addresses`, three or more HTTPS probe origins,
 the admitted probe node IDs/public keys, and either:
 
 - `tls.mode: existing` with a browser-trusted per-node certificate and key; or
+- `tls.mode: acme` to reserve a deterministic `gw-` name and issue automatically; or
 - `tls.mode: reverse_proxy`, with nginx/Caddy/HAProxy forwarding public 443 to
   the configured private listener.
 

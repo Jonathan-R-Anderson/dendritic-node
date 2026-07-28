@@ -14,12 +14,10 @@ import (
 	"strings"
 )
 
-// The coordinator is the main site, not a separate host: syndichan.org already
-// terminates TLS, runs the backend that serves this document and issues leases,
-// and is the same origin the presence heartbeat posts to. A dedicated
-// node.syndichan.org would mean a second cert, a second edge, and a second
-// place for the storage routes to be missing -- for no gain.
-const BootstrapURL = "https://syndichan.org/.well-known/syndichan/storage-node.json"
+// Peer discovery starts at the dedicated data-node edge. That edge exposes only
+// this well-known document over publicly trusted TLS; coordinator leases and
+// the direct five-minute presence heartbeat remain separate concerns.
+const BootstrapURL = "https://node.syndichan.org/.well-known/syndichan/storage-node.json"
 
 type Config struct {
 	DataDir  string `json:"data_dir"`
@@ -63,13 +61,35 @@ type GatewayConfig struct {
 	// RegistrationAPI is a public, credential-free HTTPS endpoint. The node
 	// authenticates requests with its existing Ed25519 identity; authoritative
 	// DNS credentials exist only on that server.
-	RegistrationAPI string `json:"registration_api"`
+	RegistrationAPI string                `json:"registration_api"`
+	Frontend        GatewayFrontendConfig `json:"frontend"`
+}
+
+type GatewayFrontendConfig struct {
+	Enabled                 bool     `json:"enabled"`
+	OriginAddress           string   `json:"origin_address"`
+	OriginServerName        string   `json:"origin_server_name"`
+	SNIAllowlist            []string `json:"sni_allowlist"`
+	MaxConnections          int      `json:"max_connections"`
+	MaxBytesPerSecond       int64    `json:"max_bytes_per_second"`
+	HandshakeTimeoutSeconds int      `json:"handshake_timeout_seconds"`
+	DialTimeoutSeconds      int      `json:"dial_timeout_seconds"`
+	IdleTimeoutSeconds      int      `json:"idle_timeout_seconds"`
+	DrainSeconds            int      `json:"drain_seconds"`
+	ProxyProtocol           bool     `json:"proxy_protocol"`
+	// AllowPrivateOrigin is an explicit development escape hatch. Production
+	// configurations must never silently turn a volunteer into a route to its
+	// loopback or private network.
+	AllowPrivateOrigin bool `json:"allow_private_origin,omitempty"`
 }
 
 type GatewayTLSConfig struct {
-	Mode            string `json:"mode"`
-	CertificatePath string `json:"certificate_path,omitempty"`
-	PrivateKeyPath  string `json:"private_key_path,omitempty"`
+	Mode               string `json:"mode"`
+	CertificatePath    string `json:"certificate_path,omitempty"`
+	PrivateKeyPath     string `json:"private_key_path,omitempty"`
+	ACMEEmail          string `json:"acme_email,omitempty"`
+	ACMEHTTPAddress    string `json:"acme_http_address,omitempty"`
+	ACMECacheDirectory string `json:"acme_cache_directory,omitempty"`
 }
 
 type VerificationConfig struct {
@@ -128,7 +148,9 @@ func Default() (Config, error) {
 			ListenAddress: "0.0.0.0", ListenPort: 443,
 			AdvertiseIPv4: true, AdvertiseIPv6: true,
 			RegistrationAPI: "https://syndichan.org/api/v1/gateways",
-			TLS:             GatewayTLSConfig{Mode: "existing"},
+			TLS: GatewayTLSConfig{
+				Mode: "existing", ACMEHTTPAddress: "0.0.0.0:80",
+			},
 			Verification: VerificationConfig{
 				Enabled: true, MinimumSuccessfulProbes: 3,
 				MinimumDistinctNetworks: 2, VerificationTimeoutSeconds: 15,
@@ -143,6 +165,15 @@ func Default() (Config, error) {
 				MinimumUploadMbps: 10, MinimumFreeMemoryMB: 512,
 				MinimumFreeDiskMB: 1024, MaximumCPUPercent: 90,
 				RequirePublicAddress: true, RejectCGNAT: true,
+			},
+			Frontend: GatewayFrontendConfig{
+				Enabled: false, OriginAddress: "",
+				OriginServerName: "syndichan.org",
+				SNIAllowlist:     []string{"syndichan.org"},
+				MaxConnections:   1024, MaxBytesPerSecond: 16 << 20,
+				HandshakeTimeoutSeconds: 10,
+				DialTimeoutSeconds:      10, IdleTimeoutSeconds: 300,
+				DrainSeconds: 60, ProxyProtocol: true,
 			},
 		},
 	}, nil
@@ -237,15 +268,30 @@ func (c Config) validateGateway() error {
 		return errors.New("gateway listen_port must be between 1 and 65535")
 	}
 	if g.Enabled || g.ProbeEnabled {
-		if g.PublicHostname == "" || strings.ContainsAny(g.PublicHostname, "/:@") {
+		if strings.ContainsAny(g.PublicHostname, "/:@") {
 			return errors.New("gateway public_hostname is required and must be a hostname")
 		}
-		if g.TLS.Mode != "existing" && g.TLS.Mode != "reverse_proxy" {
-			return errors.New("gateway tls mode must be existing or reverse_proxy")
+		if g.PublicHostname == "" && (!g.Enabled || g.TLS.Mode != "acme") {
+			return errors.New("gateway public_hostname is required unless ACME uses controller reservation")
+		}
+		if g.TLS.Mode != "existing" && g.TLS.Mode != "acme" &&
+			g.TLS.Mode != "reverse_proxy" {
+			return errors.New("gateway tls mode must be existing, acme, or reverse_proxy")
 		}
 		if g.TLS.Mode == "existing" &&
 			(g.TLS.CertificatePath == "" || g.TLS.PrivateKeyPath == "") {
 			return errors.New("gateway existing TLS mode requires certificate and private key paths")
+		}
+		if g.TLS.Mode == "acme" {
+			if g.PublicHostname != "" && !validLiteralHostname(g.PublicHostname) {
+				return errors.New("gateway ACME mode requires a literal public hostname")
+			}
+			if _, _, err := net.SplitHostPort(g.TLS.ACMEHTTPAddress); err != nil {
+				return errors.New("gateway ACME HTTP address must be host:port")
+			}
+		}
+		if g.Frontend.Enabled && g.TLS.Mode == "reverse_proxy" {
+			return errors.New("gateway frontend requires existing or ACME TLS for its local identity endpoint")
 		}
 	}
 	if g.Enabled {
@@ -278,7 +324,78 @@ func (c Config) validateGateway() error {
 		v.RegistrationValiditySeconds < 1 || v.ReverifyIntervalSeconds < 1 {
 		return errors.New("gateway verification durations must be positive")
 	}
+	if err := validateGatewayFrontend(g.Frontend); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateGatewayFrontend(frontend GatewayFrontendConfig) error {
+	if !frontend.Enabled {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(frontend.OriginAddress)
+	if err != nil || strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" {
+		return errors.New("gateway frontend origin_address must be host:port")
+	}
+	if _, err := net.LookupPort("tcp", port); err != nil {
+		return errors.New("gateway frontend origin_address has an invalid port")
+	}
+	originHost := strings.Trim(strings.ToLower(host), "[]")
+	if !frontend.AllowPrivateOrigin && isPrivateOrLocalHost(originHost) {
+		return errors.New("gateway frontend origin is loopback/private; set allow_private_origin only for development")
+	}
+	if !validLiteralHostname(frontend.OriginServerName) {
+		return errors.New("gateway frontend origin_server_name must be a literal hostname")
+	}
+	if len(frontend.SNIAllowlist) == 0 {
+		return errors.New("gateway frontend sni_allowlist must not be empty")
+	}
+	for _, hostname := range frontend.SNIAllowlist {
+		if !validLiteralHostname(hostname) {
+			return fmt.Errorf("gateway frontend SNI entry %q must be a literal hostname", hostname)
+		}
+	}
+	if frontend.MaxConnections < 1 {
+		return errors.New("gateway frontend max_connections must be positive")
+	}
+	if frontend.MaxBytesPerSecond < 1 {
+		return errors.New("gateway frontend max_bytes_per_second must be positive")
+	}
+	if frontend.HandshakeTimeoutSeconds < 1 || frontend.DialTimeoutSeconds < 1 ||
+		frontend.IdleTimeoutSeconds < 1 || frontend.DrainSeconds < 0 {
+		return errors.New("gateway frontend timeouts must be positive and drain_seconds non-negative")
+	}
+	return nil
+}
+
+func validLiteralHostname(value string) bool {
+	value = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".")
+	if value == "" || len(value) > 253 || strings.ContainsAny(value, "* /:@[]") ||
+		net.ParseIP(value) != nil {
+		return false
+	}
+	labels := strings.Split(value, ".")
+	for _, label := range labels {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isPrivateOrLocalHost(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && (address.IsLoopback() || address.IsPrivate() ||
+		address.IsLinkLocalUnicast() || address.IsUnspecified())
 }
 
 func isLoopback(host string) bool {
