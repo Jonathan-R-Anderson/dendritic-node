@@ -20,7 +20,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +39,7 @@ import (
 
 	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
+	"github.com/syndichan/maniwani/storage-client/internal/heartbeat"
 	syndii2p "github.com/syndichan/maniwani/storage-client/internal/i2p"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 )
@@ -49,7 +49,7 @@ const (
 	maxHeaderBytes   = 64 << 10
 	maxNetworkShard  = 32 << 20
 	bootstrapRefresh = 15 * time.Minute
-	heartbeatRefresh = 5 * time.Minute
+	heartbeatRefresh = heartbeat.Interval
 	// An I2P dial is nothing like a TCP dial. Before libp2p's Noise handshake
 	// can even begin, the router must look the destination's LeaseSet up from
 	// the floodfills, build or reuse a tunnel pair, and complete several
@@ -73,10 +73,10 @@ const (
 	// it can be placed, so this is a trickle, not a flush.
 	replicateInterval = 5 * time.Minute
 	replicateBatch    = 5
-	StorageUserAgent  = "Syndichan-Storage-Client/1.0"
+	StorageUserAgent  = heartbeat.UserAgent
 )
 
-var heartbeatEndpoint = "https://syndichan.org/api/v1/storage/nodes/heartbeat"
+var heartbeatEndpoint = heartbeat.Endpoint
 
 // A var, like heartbeatEndpoint above, so tests can point the lease exchange at
 // a local server instead of reaching the production coordinator.
@@ -123,18 +123,6 @@ type leaseRequest struct {
 	Size      int64  `json:"size"`
 	Timestamp int64  `json:"timestamp"`
 	Nonce     string `json:"nonce"`
-}
-
-type heartbeatRequest struct {
-	Version             int                   `json:"version"`
-	NodeID              string                `json:"node_id"`
-	Timestamp           int64                 `json:"timestamp"`
-	Nonce               string                `json:"nonce"`
-	CapacityBytes       int64                 `json:"capacity_bytes"`
-	Platform            string                `json:"platform"`
-	GatewayEnabled      bool                  `json:"gateway_enabled"`
-	GatewayVerified     bool                  `json:"gateway_verified"`
-	GatewayRegistration *gateway.Registration `json:"gateway_registration,omitempty"`
 }
 
 type Node struct {
@@ -481,54 +469,24 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 	}
 }
 
+// sendHeartbeat delegates to the shared client so a storage node and a
+// dedicated gateway put exactly the same signed document on the wire.
 func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
-	nonceBytes := make([]byte, 16)
-	if _, err := rand.Read(nonceBytes); err != nil {
-		return
+	client := &heartbeat.Client{
+		Signer: n, Endpoint: endpoint, HTTP: n.directHTTP, Logger: n.logger,
+		Snapshot: func() heartbeat.State {
+			n.gatewayMu.RLock()
+			registration := n.gatewayRegistration
+			n.gatewayMu.RUnlock()
+			return heartbeat.State{
+				CapacityBytes:   n.store.Capacity(),
+				GatewayEnabled:  n.gatewayEnabled.Load(),
+				GatewayVerified: n.gatewayVerified.Load(),
+				Registration:    registration,
+			}
+		},
 	}
-	n.gatewayMu.RLock()
-	registration := n.gatewayRegistration
-	n.gatewayMu.RUnlock()
-	payload := heartbeatRequest{
-		Version: 1, NodeID: n.host.ID().String(), Timestamp: time.Now().UTC().Unix(),
-		Nonce:         base64.RawURLEncoding.EncodeToString(nonceBytes),
-		CapacityBytes: n.store.Capacity(), Platform: runtime.GOOS + "/" + runtime.GOARCH,
-		GatewayEnabled: n.gatewayEnabled.Load(), GatewayVerified: n.gatewayVerified.Load(),
-		GatewayRegistration: registration,
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-	privateKey := n.host.Peerstore().PrivKey(n.host.ID())
-	if privateKey == nil {
-		n.logger.Printf("storage heartbeat skipped: node identity unavailable")
-		return
-	}
-	signature, err := privateKey.Sign(body)
-	if err != nil {
-		n.logger.Printf("storage heartbeat signing failed: %v", err)
-		return
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("User-Agent", StorageUserAgent)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Syndichan-Node", n.host.ID().String())
-	req.Header.Set("X-Syndichan-Signature", base64.RawStdEncoding.EncodeToString(signature))
-	resp, err := n.directHTTP.Do(req)
-	if err != nil {
-		n.logger.Printf("storage heartbeat unavailable: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxHeaderBytes))
-	if resp.StatusCode != http.StatusOK {
-		n.logger.Printf("storage heartbeat returned HTTP %d", resp.StatusCode)
-	}
+	client.Send(ctx)
 }
 
 func (n *Node) refreshBootstrap(ctx context.Context) {

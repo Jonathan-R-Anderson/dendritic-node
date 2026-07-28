@@ -14,12 +14,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
 	gatewayfrontend "github.com/syndichan/maniwani/storage-client/internal/gateway/frontend"
+	"github.com/syndichan/maniwani/storage-client/internal/heartbeat"
 	"github.com/syndichan/maniwani/storage-client/internal/p2p"
 	"github.com/syndichan/maniwani/storage-client/internal/s3api"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
@@ -74,9 +76,9 @@ func main() {
 	flag.BoolVar(&gatewayEnable, "gateway-enable", false, "enable configured volunteer gateway mode")
 	flag.BoolVar(&gatewayDisable, "gateway-disable", false, "disable volunteer gateway mode")
 	flag.BoolVar(&gatewayOnly, "gateway-only", false,
-		"run gateway/probe services without storage sharing, S3, dashboard, or storage heartbeat")
+		"run gateway/probe services without storage sharing, S3, dashboard, or I2P")
 	flag.BoolVar(&probeOnly, "probe-only", false,
-		"run only a signed verification probe; no storage, I2P, S3, dashboard, or heartbeat")
+		"run only a signed verification probe; no storage, I2P, S3, or dashboard")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
@@ -145,7 +147,7 @@ func main() {
 		if s3AccessKeyFile != "" {
 			value, err := readSecretFile(s3AccessKeyFile)
 			if err != nil {
-				log.Fatalf("-s3-access-key-file: %v", err)
+				logger.Fatalf("-s3-access-key-file: %v", err)
 			}
 			if cfg.AccessKey != value {
 				cfg.AccessKey = value
@@ -155,7 +157,7 @@ func main() {
 		if s3SecretKeyFile != "" {
 			value, err := readSecretFile(s3SecretKeyFile)
 			if err != nil {
-				log.Fatalf("-s3-secret-key-file: %v", err)
+				logger.Fatalf("-s3-secret-key-file: %v", err)
 			}
 			if cfg.SecretKey != value {
 				cfg.SecretKey = value
@@ -234,7 +236,7 @@ func main() {
 
 	var storageNode *store.Store
 	if noStorage {
-		logger.Printf("storage subsystems skipped: shard store, S3, dashboard, I2P, heartbeat")
+		logger.Printf("storage subsystems skipped: shard store, S3, dashboard, I2P")
 	}
 	if !noStorage {
 		logger.Printf("opening encrypted shard store: %s", filepath.Join(cfg.DataDir, "storage"))
@@ -283,6 +285,10 @@ func main() {
 			logger.Fatal("configure gateway DHT records: ", err)
 		}
 	}
+	// Shared with the presence heartbeat so a gateway that gains or loses
+	// verification is reflected in the next beacon.
+	var gatewayVerified atomic.Bool
+	var gatewayManager *gateway.Manager
 	var gatewayRegistry *gateway.RegistryClient
 	if cfg.Gateway.Enabled {
 		gatewayRegistry, err = gateway.NewRegistryClient(
@@ -495,7 +501,11 @@ func main() {
 		logger.Printf("volunteer gateway candidate listening on %s for %s",
 			gatewayAddress, cfg.Gateway.PublicHostname)
 	}
-	if cfg.Gateway.Enabled && cfg.Gateway.Verification.Enabled {
+	// Registration is what makes a gateway reachable, so it runs whenever the
+	// gateway role is on. external_verification only decides HOW the address
+	// is proven: by a peer probe quorum, or by the controller's own
+	// independent connect-back alone.
+	if cfg.Gateway.Enabled {
 		addresses := make([]gateway.Address, 0, len(cfg.Gateway.PublicAddresses))
 		for _, value := range cfg.Gateway.PublicAddresses {
 			ip := net.ParseIP(value)
@@ -535,7 +545,9 @@ func main() {
 			FailureThreshold:     cfg.Gateway.Health.FailureThreshold,
 			RecoveryThreshold:    cfg.Gateway.Health.RecoveryThreshold,
 			DrainDuration:        time.Duration(cfg.Gateway.Health.DrainSeconds) * time.Second,
+			RequireProbeQuorum:   cfg.Gateway.Verification.Enabled,
 		}, logger, func(verified bool) {
+			gatewayVerified.Store(verified)
 			if node != nil {
 				node.SetGatewayState(true, verified)
 				if verified && manager != nil {
@@ -549,7 +561,31 @@ func main() {
 		if err != nil {
 			logger.Fatalf("gateway verification manager: %v", err)
 		}
+		gatewayManager = manager
 		go manager.Run(ctx)
+	}
+	// Presence heartbeat for the storage-free roles. A storage node sends its
+	// own from inside the p2p node; a dedicated gateway or probe has no p2p
+	// node, but it still has a persistent identity and the operator still
+	// needs to see it. It reports zero capacity, which is exactly how the
+	// frontend tells a gateway apart from a storage node.
+	if noStorage {
+		presence := &heartbeat.Client{
+			Signer: signer, Logger: logger,
+			Snapshot: func() heartbeat.State {
+				state := heartbeat.State{
+					CapacityBytes:   0,
+					GatewayEnabled:  cfg.Gateway.Enabled,
+					GatewayVerified: gatewayVerified.Load(),
+				}
+				if state.GatewayVerified && gatewayManager != nil {
+					state.Registration = gatewayManager.Current()
+				}
+				return state
+			},
+		}
+		logger.Printf("presence heartbeat every %s to %s", heartbeat.Interval, heartbeat.Endpoint)
+		go presence.Run(ctx)
 	}
 	if !noStorage {
 		uiServer.Handler.(*ui.Server).SetStoragePaths(cfg.DataDir, func(target string) error {

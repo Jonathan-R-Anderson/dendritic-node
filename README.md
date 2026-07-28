@@ -187,13 +187,42 @@ For a VPS or spare box that should only forward HTTPS and store nothing:
 ```
 
 `-gateway-only` starts the gateway and nothing else. No shard store, no S3, no
-dashboard, no I2P, no storage heartbeat — and it asks you for none of that
-configuration, so a gateway config file contains gateway settings only. Copy
+dashboard, no I2P — and it asks you for none of that configuration, so a gateway
+config file contains gateway settings only. Copy
 [`gateway.example.json`](gateway.example.json) as a starting point and set at
 minimum `gateway.enabled`, your public address, and how TLS is handled.
 
-There is also `-probe-only`, which runs just the verification probe service
-used to check other people's gateways.
+It does still send the five-minute presence heartbeat, reporting zero capacity.
+That is how the operator's map knows your gateway exists and separates it from
+a storage node.
+
+### About `probe_urls`
+
+Before a gateway is trusted, something has to prove it is genuinely reachable
+from the outside rather than just claiming to be. Two independent things can do
+that, and `gateway.external_verification` picks which you use:
+
+- **`enabled: true` (the default)** — your node asks other volunteers running
+  `-probe-only` to connect back to your public address and confirm it. Those
+  volunteers' URLs go in `probe_urls`, and you need at least as many as
+  `minimum_successful_probes` (3 by default), spread across at least two
+  different networks. This is the stronger check, but it needs a probe fleet to
+  exist.
+- **`enabled: false`** — skip the peer probes. Your node still registers with
+  the controller, and the controller still connects back to your address and
+  checks `/readyz` itself before putting you in DNS. You just don't get the
+  independent multi-network opinion, so your node never reports itself as
+  "verified".
+
+If you are standing up the first gateway there are no probes to point at yet,
+so use the second form:
+
+```json
+"external_verification": { "enabled": false }
+```
+
+There is also `-probe-only`, which runs just the verification probe service —
+that is what other people would point their `probe_urls` at.
 
 Quick local controls:
 
@@ -222,6 +251,12 @@ systemd units, and automatic updates — is in [`GATEWAY.md`](GATEWAY.md).
 - **`-gateway-only` won't start** — it needs `gateway.enabled` or
   `gateway.probe_enabled` set to true in the config file you pointed it at.
   The startup log prints the role and the exact config path it loaded.
+- **`gateway.external_verification needs 3 probe_urls`** — you have no probe
+  fleet to verify against. Set `external_verification.enabled` to false and let
+  the controller do the reachability check; see the section above.
+- **`gateway public_addresses is empty`** — list this host's literal public IP,
+  e.g. `"public_addresses": ["203.0.113.10"]`. Run `curl ifconfig.me` on the
+  box to find it.
 
 ## More detail
 

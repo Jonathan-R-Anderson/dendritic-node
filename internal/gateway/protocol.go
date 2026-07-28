@@ -350,6 +350,50 @@ func NewRegistration(s Signer, addresses []Address, results []ProbeResult, trust
 	return registration, err
 }
 
+// NewControllerRegistration builds a registration that carries no peer probe
+// results, for a gateway that is not running a peer probe quorum.
+//
+// This is not a weaker claim smuggled in under the same name -- it is a
+// different claim. It asserts only "this identity owns these addresses"; it
+// asserts nothing about reachability. The authoritative controller performs
+// its own independent connect-back to the address before it will publish DNS,
+// and that check is what actually gates traffic.
+//
+// Because SuccessfulProbes and DistinctNetworks are zero, this registration is
+// rejected by DHTValidator and by the frontend's gateway-role check. A node
+// holding one must report gateway_verified=false in its heartbeat: it is
+// registered, not independently verified.
+func NewControllerRegistration(s Signer, addresses []Address, now time.Time,
+	validity time.Duration, sequence uint64, version string) (Registration, error) {
+	normalized := NormalizeAddresses(addresses)
+	if len(normalized) == 0 {
+		return Registration{}, errors.New("gateway has no public addresses to register")
+	}
+	for _, address := range normalized {
+		ip, err := netip.ParseAddr(address.Address)
+		if err != nil || !PublicAddress(ip) || address.Port != 443 {
+			return Registration{}, fmt.Errorf("address %q is not eligible", address.Address)
+		}
+	}
+	key, err := s.PublicKey()
+	if err != nil {
+		return Registration{}, err
+	}
+	registration := Registration{
+		RecordType: "verified_gateway", NodeID: s.ID(),
+		PublicKey: base64.RawStdEncoding.EncodeToString(key),
+		Addresses: normalized, ProtocolVersion: ProtocolVersion,
+		SoftwareVersion:  version,
+		Capabilities:     []string{"https_gateway", "dht_lookup", "content_proxy"},
+		SuccessfulProbes: 0, DistinctNetworks: 0,
+		VerifiedAt: now.Unix(), HealthState: StateHealthy,
+		IssuedAt: now.Unix(), ExpiresAt: now.Add(validity).Unix(),
+		Sequence: sequence,
+	}
+	registration.Signature, err = signJSON(s, registration)
+	return registration, err
+}
+
 func (r Registration) Validate(trusted map[string]string, now time.Time, minimumSuccesses, minimumNetworks int) error {
 	if r.RecordType != "verified_gateway" || r.ProtocolVersion != ProtocolVersion ||
 		r.ExpiresAt <= now.Unix() || r.ExpiresAt-r.IssuedAt > 900 ||

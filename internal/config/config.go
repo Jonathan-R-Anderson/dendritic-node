@@ -51,9 +51,9 @@ func (r Role) Description() string {
 	case RoleStorage:
 		return "shard storage, S3, dashboard, I2P, heartbeat; gateway/probe if configured"
 	case RoleGatewayOnly:
-		return "gateway/probe services only; no storage, S3, dashboard, I2P, or heartbeat"
+		return "gateway/probe services and presence heartbeat; no storage, S3, dashboard, or I2P"
 	case RoleProbeOnly:
-		return "signed verification probe only; no storage, S3, dashboard, I2P, or heartbeat"
+		return "signed verification probe and presence heartbeat; no storage, S3, dashboard, or I2P"
 	case RoleManagement:
 		return "inspect or update the configuration file; no subsystem is started"
 	}
@@ -397,12 +397,25 @@ func (c Config) validateGateway() error {
 	if g.ProbeEnabled && strings.TrimSpace(g.ProbeNetwork) == "" {
 		return errors.New("probe_network is required when probe mode is enabled")
 	}
-	if g.Enabled && g.Verification.Enabled {
+	if g.Enabled {
+		// Needed for the registration itself, quorum or not: the node has to
+		// declare which address it is claiming.
 		if len(g.PublicAddresses) == 0 {
-			return errors.New("gateway public_addresses are required for external verification")
+			return errors.New(
+				"gateway public_addresses is empty: list this host's literal public IP, e.g. [\"203.0.113.10\"]")
 		}
+	}
+	if g.Enabled && g.Verification.Enabled {
+		// probe_urls are OTHER volunteers running -probe-only who connect back
+		// to this host and independently confirm it is reachable. If no such
+		// probe fleet is available, turn external_verification off: the
+		// controller still verifies reachability itself before publishing DNS.
 		if len(g.ProbeURLs) < g.Verification.MinimumSuccessfulProbes {
-			return errors.New("gateway needs at least as many probe_urls as its quorum")
+			return fmt.Errorf(
+				"gateway.external_verification needs %d probe_urls but %d are configured; "+
+					"set gateway.external_verification.enabled to false to rely on the "+
+					"controller's own reachability check instead",
+				g.Verification.MinimumSuccessfulProbes, len(g.ProbeURLs))
 		}
 	}
 	v := g.Verification

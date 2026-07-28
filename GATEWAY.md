@@ -76,12 +76,42 @@ syndichan-node
 Forward TCP 443 at the router and permit it through host, IPv6, and cloud
 firewalls. A listening socket or UPnP mapping never counts as verification.
 
+### Two ways an address gets proven
+
+`gateway.external_verification.enabled` selects which check gates registration.
+Registration itself always happens when `gateway.enabled` is true.
+
+| | `enabled: true` | `enabled: false` |
+| --- | --- | --- |
+| Peer probe quorum | required (`probe_urls` ≥ `minimum_successful_probes`, ≥ 2 networks) | not run |
+| Controller connect-back | yes | yes |
+| DNS publication | after both | after the controller's own check |
+| Reports `gateway_verified` | yes, once quorum passes | never |
+| Registration carries probe results | yes | no (`successful_probes: 0`) |
+| Accepted by `DHTValidator` | yes | no |
+
+The second mode exists because a network with no probe fleet cannot bootstrap
+its first gateway otherwise: the quorum requires probes, and probes are other
+volunteers who must themselves be running. It is not a way to skip
+reachability checking — the controller still connects back to the derived
+source address and requires HTTP 200 with `X-Gateway-Version` on `/readyz`
+before it will publish DNS. What it gives up is the independent multi-network
+opinion, which is exactly why such a node never claims to be verified and its
+registration is refused by the DHT validator.
+
 ## Dedicated gateway host
 
 `-gateway-only` is a distinct runtime role, resolved from the command line
 before any configuration is read. The process does not open the shard/object
 store, accept or replicate shards, start S3 on 9000, start the dashboard on
-9090, open I2P, join the storage DHT, or send the storage heartbeat.
+9090, open I2P, or join the storage DHT.
+
+It does send the five-minute presence heartbeat, signed by the same identity
+and carrying `capacity_bytes: 0`. Presence is a property of the node, not of
+the storage role: without it a dedicated gateway would be invisible to the
+operator. Zero capacity is what distinguishes it — the frontend counts it as a
+gateway, excludes it from the storage-node count, and adds nothing to network
+capacity.
 
 Because the role is decided first, a gateway-only config is validated against
 gateway settings only. It needs no S3 credentials, capacity, erasure layout,

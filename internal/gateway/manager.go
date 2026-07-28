@@ -33,6 +33,11 @@ type ManagerConfig struct {
 	FailureThreshold     int
 	RecoveryThreshold    int
 	DrainDuration        time.Duration
+	// RequireProbeQuorum runs the peer verification round before registering.
+	// When false the node still registers with the controller, which performs
+	// its own independent connect-back; it simply never claims to be
+	// peer-verified. This is what external_verification.enabled selects.
+	RequireProbeQuorum bool
 }
 
 type RegistrationPublisher interface {
@@ -63,7 +68,7 @@ func NewManager(signer Signer, publisher RegistrationPublisher, config ManagerCo
 			return nil, fmt.Errorf("gateway address %q is not eligible", address.Address)
 		}
 	}
-	if len(config.ProbeURLs) < config.MinimumProbes {
+	if config.RequireProbeQuorum && len(config.ProbeURLs) < config.MinimumProbes {
 		return nil, errors.New("fewer probe URLs than the required quorum")
 	}
 	for _, raw := range config.ProbeURLs {
@@ -129,6 +134,10 @@ func (m *Manager) Current() *Registration {
 }
 
 func (m *Manager) verify(ctx context.Context) {
+	if !m.config.RequireProbeQuorum {
+		m.registerWithoutQuorum(ctx)
+		return
+	}
 	now := time.Now().UTC()
 	request, err := NewVerificationRequest(
 		m.signer, m.config.PublicHostname, m.config.Addresses, now, m.config.ResultValidity,
@@ -227,6 +236,54 @@ func (m *Manager) verify(ctx context.Context) {
 		m.logger.Printf("gateway verified at %d address(es) by %d probes across %d networks; registration expires %s",
 			len(registration.Addresses),
 			registration.SuccessfulProbes, registration.DistinctNetworks,
+			time.Unix(registration.ExpiresAt, 0).UTC().Format(time.RFC3339))
+	}
+}
+
+// registerWithoutQuorum submits a signed registration and lets the controller
+// be the one that proves reachability. The controller connects back to the
+// derived source address, requires HTTP 200 and X-Gateway-Version on /readyz,
+// and publishes DNS only if that succeeds -- so a gateway that is not actually
+// reachable still never enters the answer set. What is lost relative to a
+// probe quorum is the independent multi-network view, which is why this path
+// never reports itself as verified.
+func (m *Manager) registerWithoutQuorum(ctx context.Context) {
+	sequence := uint64(1)
+	if current := m.Current(); current != nil {
+		sequence = current.Sequence + 1
+	}
+	registration, err := NewControllerRegistration(
+		m.signer, m.config.Addresses, time.Now(),
+		m.config.RegistrationValidity, sequence, m.config.SoftwareVersion,
+	)
+	if err != nil {
+		m.failed(ctx, "registration failed: %v", err)
+		return
+	}
+	publishCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err = m.publisher.PublishGatewayRegistration(publishCtx, registration)
+	cancel()
+	if err != nil {
+		m.failed(ctx, "gateway registration publish failed: %v", err)
+		return
+	}
+	if err := m.save(registration); err != nil {
+		m.failed(ctx, "persist registration: %v", err)
+		return
+	}
+	m.mu.Lock()
+	m.current = &registration
+	m.health = HealthMachine{State: StateHealthy}
+	m.mu.Unlock()
+	// Deliberately false: registered with the controller, but not
+	// independently peer-verified. The frontend shows a gateway role only for
+	// the latter.
+	if m.onVerified != nil {
+		m.onVerified(false)
+	}
+	if m.logger != nil {
+		m.logger.Printf("gateway registered with the controller at %d address(es) without a peer probe quorum; registration expires %s",
+			len(registration.Addresses),
 			time.Unix(registration.ExpiresAt, 0).UTC().Format(time.RFC3339))
 	}
 }
