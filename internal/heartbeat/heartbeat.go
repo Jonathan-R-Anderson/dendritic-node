@@ -55,6 +55,10 @@ type State struct {
 	GatewayEnabled  bool
 	GatewayVerified bool
 	Registration    *gateway.Registration
+	// DCSWorker is true when this node accepts container deployments (dcs.enabled
+	// + role.worker). It is what makes the node draw its yellow role on the
+	// operator's map and marks it as a container host on the network.
+	DCSWorker bool
 }
 
 type request struct {
@@ -67,6 +71,7 @@ type request struct {
 	GatewayEnabled      bool                  `json:"gateway_enabled"`
 	GatewayVerified     bool                  `json:"gateway_verified"`
 	GatewayRegistration *gateway.Registration `json:"gateway_registration,omitempty"`
+	DCSWorker           bool                  `json:"dcs_worker"`
 }
 
 // Client posts the signed beacon. Endpoint and HTTP are injected so tests can
@@ -135,6 +140,7 @@ func (c *Client) Send(ctx context.Context) {
 		// the frontend re-validates it before showing a gateway role.
 		GatewayVerified:     state.GatewayVerified,
 		GatewayRegistration: state.Registration,
+		DCSWorker:           state.DCSWorker,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

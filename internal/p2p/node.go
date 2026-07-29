@@ -146,6 +146,7 @@ type Node struct {
 	cacheOnly           bool
 	gatewayEnabled      atomic.Bool
 	gatewayVerified     atomic.Bool
+	dcsWorker           atomic.Bool
 	gatewayMu           sync.RWMutex
 	gatewayRegistration *gateway.Registration
 }
@@ -153,6 +154,10 @@ type Node struct {
 // SetCacheOnly makes this node refuse to host other peers' shards. Set once at
 // startup, before the stream handler can see traffic.
 func (n *Node) SetCacheOnly(value bool) { n.cacheOnly = value }
+
+// SetDCSWorker marks the node as accepting container deployments, so its
+// heartbeat reports the DCS role and the operator's map draws it yellow.
+func (n *Node) SetDCSWorker(on bool) { n.dcsWorker.Store(on) }
 
 func (n *Node) SetGatewayState(enabled, verified bool) {
 	n.gatewayEnabled.Store(enabled)
@@ -580,6 +585,7 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 				GatewayEnabled:  n.gatewayEnabled.Load(),
 				GatewayVerified: n.gatewayVerified.Load(),
 				Registration:    registration,
+				DCSWorker:       n.dcsWorker.Load(),
 			}
 		},
 	}

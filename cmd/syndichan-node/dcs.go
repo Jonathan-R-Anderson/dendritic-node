@@ -106,6 +106,10 @@ func startDCSWorker(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 		func(format string, args ...any) { logger.Printf(format, args...) })
 	go reaper.Run(ctx)
 
+	// Tell the heartbeat this node is now a container host, so the operator's map
+	// draws its yellow role and the site sees it as DCS-capable.
+	node.SetDCSWorker(true)
+
 	// Publish the capability record, and republish on the advertise interval so
 	// the record never expires while the worker is alive.
 	go advertiseWorker(ctx, cfg, node, admission, logger)
