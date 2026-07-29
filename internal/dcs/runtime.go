@@ -207,6 +207,45 @@ func (c *DockerClient) Create(ctx context.Context, spec ContainerSpec) (string, 
 	return out.ID, nil
 }
 
+// BuildImage builds an image from a packed build context (a gzip'd tar with a
+// Dockerfile at its root -- exactly what PackBuildContext produces). The build
+// runs in the local Docker daemon; the resulting image is tagged and then run
+// like any other. Build output is drained but not returned to the deployer,
+// which would leak host paths and the daemon's environment.
+func (c *DockerClient) BuildImage(ctx context.Context, contextBlob []byte, tag string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.apiBase+"/build?t="+tag+"&dockerfile=Dockerfile&forcerm=1&networkmode=none", bytes.NewReader(contextBlob))
+	if err != nil {
+		return err
+	}
+	// Docker auto-detects a gzip'd tar; application/x-tar is the documented type.
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("dcs: docker build: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("dcs: docker build failed: HTTP %d", resp.StatusCode)
+	}
+	// The /build response streams newline-delimited JSON with a final error
+	// object if the build failed despite a 200. Scan for it rather than trust
+	// the status code alone.
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var msg struct {
+			Error string `json:"error"`
+		}
+		if err := dec.Decode(&msg); err != nil {
+			break // EOF or done
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("dcs: docker build failed: %s", msg.Error)
+		}
+	}
+	return nil
+}
+
 func (c *DockerClient) Start(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodPost, "/containers/"+id+"/start", nil, nil)
 }

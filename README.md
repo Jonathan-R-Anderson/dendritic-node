@@ -431,6 +431,118 @@ and 443.
 Full setup — TLS modes, probe quorum, serving `syndichan.org` through your box,
 systemd units, and automatic updates — is in [`GATEWAY.md`](GATEWAY.md).
 
+## Run a container worker (Distributed Container Service)
+
+Optional, **off by default**, and a real donation of compute: a container
+worker runs Docker containers for other people over I2P — a decentralized,
+registry-free, coordinator-free container service. Only enable it if you mean to
+lend your machine's CPU and memory to strangers.
+
+A worker runs **alongside** a storage node — it reuses the same I2P bridge, the
+same peer identity, the same DHT, and the same shard store — so you start it by
+adding a `dcs` block to a normal storage node's `config.json`, not by running a
+separate program.
+
+### What you need
+
+- A working storage node (the section above): I2P running, SAM enabled.
+- **Docker**, reachable at the endpoint in the config (default
+  `unix:///var/run/docker.sock`). Your user must be able to talk to it (be in the
+  `docker` group). If Docker is not reachable the node logs it and keeps running
+  as a plain storage node — the worker just does not start.
+
+### Turn it on
+
+Edit `config.json` and set at least `enabled` and `role.worker`:
+
+```json
+"dcs": {
+  "enabled": true,
+  "role": { "worker": true, "lab": false, "gpu": false, "volumes": false },
+  "limits": {
+    "max_containers": 4,
+    "ram_bytes": 4294967296,
+    "max_runtime_seconds": 0,
+    "lab_max_runtime_seconds": 14400
+  },
+  "docker_endpoint": "unix:///var/run/docker.sock"
+}
+```
+
+Then start the node the normal way:
+
+```sh
+./syndichan-node-linux-amd64
+```
+
+You should see, after the node comes up:
+
+```text
+dcs: container worker started (slots=4, lab=false, ttl=24h0m0s)
+```
+
+That is the whole thing. The worker now:
+
+- **publishes a capability record** to the DHT so others can find it (expires
+  and refreshes on its own, like the gateway record — a crashed worker vanishes);
+- **accepts signed deployment requests** over I2P on `/syndichan/dcs/1.0.0`;
+- **caps concurrent containers** at `max_containers`. Beyond that, further
+  requests are **queued** and the requester is told their place in line and an
+  estimated wait — nobody is bogged down past what you set;
+- **allows one running instance per requester**, so a single user cannot fill
+  your worker (different users running the *same* image as separate instances is
+  fine);
+- **auto-spins-down every instance after 24 hours** (`max_runtime_seconds`, or
+  the default), so a forgotten container is always reclaimed;
+- **gives each container its own I2P destination** and nothing else — no clearnet
+  egress, no host network, dropped capabilities, read-only root filesystem.
+
+### The limits are yours
+
+Every knob under `limits` is a promise to yourself about how much this costs:
+
+| Field | Meaning |
+| --- | --- |
+| `max_containers` | Hard cap on simultaneous containers. This is the "don't bog down my machine" dial. |
+| `ram_bytes` | Advertised memory; also the per-container ceiling. |
+| `max_runtime_seconds` | Auto spin-down for any instance. `0` uses the 24-hour default. |
+| `lab_max_runtime_seconds` | Stricter ceiling for lab workloads (default 4h). |
+| `image_cache_bytes` | Disk budget for cached build layers. |
+
+Everything under `policy` defaults to a refusal: no interactive shell
+(`allow_exec`), no clearnet egress for containers (`allow_clearnet_egress`), no
+public gateway exposure (`allow_gateway_publish`). Turn one on only if you
+understand what it lets a stranger's container do on your machine.
+
+### Registry-free images: the Dockerfile lives on the DHT
+
+There is no Docker Hub in this design. A deployer packs a **build context** —
+the Dockerfile plus its supporting files — into one content-addressed blob that
+is stored on the network as encrypted shards, exactly like any other object. A
+worker fetches that blob by digest, verifies it, and runs `docker build`
+locally. So the image is reproduced from source on your machine; nothing is
+pulled from a registry, and a tampered build context fails its digest check.
+
+### Vulnerable-host labs (Attack Range)
+
+`role.lab` is a **separate** opt-in from `role.worker`. Set it only if you are
+willing to host deliberately-vulnerable containers (e.g. Splunk Attack Range)
+for security researchers. A lab container is reachable **only** at an I2P
+destination that is never published anywhere — the researcher who deployed it is
+the sole party told the address — and it is denied clearnet egress and gateway
+exposure unconditionally, and destroyed after its (short) TTL no matter what. A
+plain `worker` never receives lab workloads. Do not enable `lab` casually; see
+[`DCS.md`](DCS.md) §19 for exactly what it means to host one.
+
+### Turn it off
+
+Set `"enabled": false` (or `"role": {"worker": false}`) and restart. Running
+containers are reclaimed as they hit their TTL, or immediately with a normal
+`docker stop`/`rm` — they are ordinary containers with DCS labels.
+
+The full architecture — scheduling, the RPC protocol, image distribution,
+failure recovery, the security model, and the roadmap — is in [`DCS.md`](DCS.md).
+
 ## When something goes wrong
 
 - **`connect to local I2P SAM bridge ... connection refused`** — I2P isn't
@@ -453,10 +565,17 @@ systemd units, and automatic updates — is in [`GATEWAY.md`](GATEWAY.md).
 - **`gateway public_addresses is empty`** — list this host's literal public IP,
   e.g. `"public_addresses": ["203.0.113.10"]`. Run `curl ifconfig.me` on the
   box to find it.
+- **`dcs: Docker is not reachable ... worker not started`** — the node is fine
+  as a storage node, but the container worker needs Docker. Check the daemon is
+  running and your user can reach `docker_endpoint` (`docker ps` should work).
+- **`dcs: worker role requires full storage mode; not started`** — a container
+  worker can't run in `-gateway-only`/`-probe-only`; it needs the storage node's
+  I2P, DHT and shard store. Run it as a normal storage node with the `dcs` block.
 
 ## More detail
 
 - [`GATEWAY.md`](GATEWAY.md) — gateway roles, verification protocol, and deployment
+- [`DCS.md`](DCS.md) — the container service: architecture, RPC, scheduling, security
 - [`SECURITY.md`](SECURITY.md) — what is and isn't protected, and from whom
 - [`../gateway-controller/README.md`](../gateway-controller/README.md) — the
   server side that owns DNS

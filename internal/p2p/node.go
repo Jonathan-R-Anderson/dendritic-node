@@ -38,6 +38,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/syndichan/maniwani/storage-client/internal/config"
+	"github.com/syndichan/maniwani/storage-client/internal/dcs"
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
 	"github.com/syndichan/maniwani/storage-client/internal/heartbeat"
 	syndii2p "github.com/syndichan/maniwani/storage-client/internal/i2p"
@@ -356,6 +357,102 @@ func (n *Node) ConfigureGatewayRecords(validator gateway.DHTValidator) error {
 	}
 	namespaces[gateway.DHTNamespace] = validator
 	return nil
+}
+
+// Host exposes the libp2p host so the DCS subsystem can register its stream
+// protocol and open streams to workers over the SAME I2P transport the storage
+// protocol uses. DCS reuses this host rather than opening a second network.
+func (n *Node) Host() host.Host { return n.host }
+
+// ConfigureDCSRecords registers the validator for dcs_worker DHT records, so a
+// worker's capability advertisement is validated and selected-by-sequence just
+// like a gateway registration.
+func (n *Node) ConfigureDCSRecords(validator dcs.WorkerDHTValidator) error {
+	namespaces, ok := n.dht.Validator.(record.NamespacedValidator)
+	if !ok {
+		return errors.New("DHT does not use namespaced validation")
+	}
+	namespaces[dcs.DHTWorkerNamespace] = validator
+	return nil
+}
+
+// PublishDCSWorker stores this node's signed worker record in the DHT under its
+// own key AND advertises it at the worker rendezvous point, so deployers can
+// enumerate workers (Kademlia cannot list a namespace by itself). Republished
+// on the DCS advertise interval, expired-not-deleted, so a crashed worker
+// vanishes on its own.
+func (n *Node) PublishDCSWorker(ctx context.Context, record dcs.WorkerRecord) error {
+	value, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if err := n.dht.PutValue(ctx, dcs.WorkerDHTKey(record.NodeID), value); err != nil {
+		return err
+	}
+	// Rendezvous: every worker provides the same well-known CID, so a deployer
+	// finds all of them with one FindProviders and then reads each record.
+	rendezvous, err := dcsRendezvousCID()
+	if err != nil {
+		return err
+	}
+	return n.dht.Provide(ctx, rendezvous, true)
+}
+
+// FindDCSWorkers discovers container workers: find the providers of the
+// rendezvous CID, read each one's signed capability record, and return the
+// valid, unexpired ones. This is the deployer's view of available capacity.
+func (n *Node) FindDCSWorkers(ctx context.Context, limit int) ([]dcs.WorkerRecord, error) {
+	rendezvous, err := dcsRendezvousCID()
+	if err != nil {
+		return nil, err
+	}
+	validator := dcs.WorkerDHTValidator{}
+	seen := map[peer.ID]struct{}{}
+	var workers []dcs.WorkerRecord
+	for provider := range n.dht.FindProvidersAsync(ctx, rendezvous, limit) {
+		if provider.ID == n.host.ID() {
+			continue // do not schedule onto ourselves
+		}
+		if _, dup := seen[provider.ID]; dup {
+			continue
+		}
+		seen[provider.ID] = struct{}{}
+
+		value, err := n.dht.GetValue(ctx, dcs.WorkerDHTKey(provider.ID.String()))
+		if err != nil {
+			continue
+		}
+		// Validate the record itself (signature, freshness, self-key) before
+		// trusting anything it claims.
+		if validator.Validate(dcs.WorkerDHTKey(provider.ID.String()), value) != nil {
+			continue
+		}
+		var rec dcs.WorkerRecord
+		if json.Unmarshal(value, &rec) != nil {
+			continue
+		}
+		// Teach the host how to reach this worker for the later DCS stream.
+		if len(provider.Addrs) > 0 {
+			n.host.Peerstore().AddAddrs(provider.ID, provider.Addrs, 30*time.Minute)
+		}
+		workers = append(workers, rec)
+		if limit > 0 && len(workers) >= limit {
+			break
+		}
+	}
+	return workers, nil
+}
+
+// dcsRendezvousCID is the well-known content id every DCS worker provides. It is
+// the SHA-256 of a fixed label, so any node computes the same CID without
+// coordination.
+func dcsRendezvousCID() (cid.Cid, error) {
+	digest := sha256.Sum256([]byte("syndichan-dcs-worker-rendezvous/1"))
+	mh, err := multihash.Encode(digest[:], multihash.SHA2_256)
+	if err != nil {
+		return cid.Undef, err
+	}
+	return cid.NewCidV1(cid.Raw, mh), nil
 }
 
 func (n *Node) PublishGatewayRegistration(ctx context.Context, registration gateway.Registration) error {

@@ -94,6 +94,13 @@ type NetworkHandle interface {
 	Detach()
 }
 
+// Builder builds an image from a packed build context. *DockerClient satisfies
+// it. Used when a deploy references a DHT-sharded build context instead of a
+// prebuilt image.
+type Builder interface {
+	BuildImage(ctx context.Context, contextBlob []byte, tag string) error
+}
+
 // AuditSink records what strangers did with the worker's hardware. The agent
 // never proceeds without logging the decision first, so a crash mid-launch
 // still leaves a record of what was attempted.
@@ -143,6 +150,8 @@ type Agent struct {
 	alloc       Allocator
 	audit       AuditSink
 	network     NetworkAttacher      // optional; nil means "address allocated but not bridged"
+	builder     Builder              // optional; required only for build-context deploys
+	blobs       BlobStore            // optional; the DHT-backed build-context store
 	admission   *AdmissionController // optional; nil means unlimited (no cap, no queue)
 	instanceTTL time.Duration        // general auto-spin-down; 0 -> DefaultInstanceTTL
 	now         func() time.Time
@@ -170,6 +179,14 @@ func (a *Agent) SetAdmission(admission *AdmissionController, instanceTTL time.Du
 	a.instanceTTL = instanceTTL
 }
 
+// SetBuilder wires the image builder and the DHT-backed build-context store, so
+// a deploy that references a build-context digest is fetched from the shard
+// store, verified, and built locally rather than pulled as a prebuilt image.
+func (a *Agent) SetBuilder(builder Builder, blobs BlobStore) {
+	a.builder = builder
+	a.blobs = blobs
+}
+
 // DefaultLabPort is where a portless inbound stream is routed when the deploy
 // request does not name a primary port. 80 is the common case for a web-facing
 // vulnerable box; a request can override it via DeployRequest.PrimaryPort.
@@ -190,8 +207,8 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		a.refuse(owner, "", "bind", err.Error())
 		return DeployReply{}, ErrBadRequest
 	}
-	if req.Image == "" || req.DeploymentID == "" {
-		a.refuse(owner, req.DeploymentID, "validate", "missing image or deployment id")
+	if req.DeploymentID == "" || (req.Image == "" && req.BuildContextDigest == "") {
+		a.refuse(owner, req.DeploymentID, "validate", "missing image/build context or deployment id")
 		return DeployReply{}, ErrBadRequest
 	}
 	if !a.cfg.ownerAllowed(owner) {
@@ -251,13 +268,44 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		}
 	}
 
+	// Build from a DHT-sharded build context when one is referenced: fetch the
+	// Dockerfile+files blob by digest, verify it, and build the image locally.
+	// This is the registry-free path -- the worker reproduces the image from
+	// source rather than pulling prebuilt layers.
+	image := req.Image
+	if req.BuildContextDigest != "" {
+		if a.builder == nil || a.blobs == nil {
+			releaseSlot()
+			a.refuse(owner, req.DeploymentID, "build", "this worker cannot build from a context")
+			return DeployReply{}, errors.New("dcs: build-context deploys are not enabled on this worker")
+		}
+		files, ferr := FetchBuildContext(ctx, a.blobs, req.BuildContextDigest)
+		if ferr != nil {
+			releaseSlot()
+			a.refuse(owner, req.DeploymentID, "fetch_build_context", ferr.Error())
+			return DeployReply{}, fmt.Errorf("fetch build context: %w", ferr)
+		}
+		blob, perr := PackBuildContext(files) // re-pack the VALIDATED files only
+		if perr != nil {
+			releaseSlot()
+			a.refuse(owner, req.DeploymentID, "pack_build_context", perr.Error())
+			return DeployReply{}, perr
+		}
+		image = "dcs-build-" + shortDigest(req.BuildContextDigest)
+		if berr := a.builder.BuildImage(ctx, blob, image); berr != nil {
+			releaseSlot()
+			a.refuse(owner, req.DeploymentID, "build", berr.Error())
+			return DeployReply{}, fmt.Errorf("build image: %w", berr)
+		}
+	}
+
 	// A lab container's destination is private and never leaves the agent
 	// except to this owner; a normal one may later be advertised.
 	private := req.Lab
 
 	containerID, err := a.runtime.Create(ctx, ContainerSpec{
 		Name:  "dcs-" + req.DeploymentID,
-		Image: req.Image, Cmd: req.Cmd, Env: req.Env,
+		Image: image, Cmd: req.Cmd, Env: req.Env,
 		MemoryLimitBytes: req.MemoryLimitBytes, NanoCPUs: req.NanoCPUs,
 		Lab: req.Lab,
 	})
@@ -377,6 +425,14 @@ func (a *Agent) HandleQueueStatus(ticket string) (DeployReply, bool) {
 		Queued: true, Ticket: decision.Ticket, Position: decision.Position,
 		ETASeconds: decision.ETASeconds, InstanceTTL: decision.InstanceTTL,
 	}, true
+}
+
+func shortDigest(digest string) string {
+	d := strings.TrimPrefix(digest, "sha256:")
+	if len(d) > 16 {
+		return d[:16]
+	}
+	return d
 }
 
 func (a *Agent) refuse(owner, deployment, phase, reason string) {

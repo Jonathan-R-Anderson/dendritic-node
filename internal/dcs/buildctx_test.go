@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // A build context (Dockerfile + files) round-trips through pack/unpack and is
@@ -122,5 +123,53 @@ func TestFetchRejectsTamperedBlob(t *testing.T) {
 	store.blobs[digest] = []byte("not the real build context")
 	if _, err := FetchBuildContext(context.Background(), store, digest); !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("a tampered build context was accepted: %v", err)
+	}
+}
+
+// A build-context deploy end to end through the agent: fetch from the (fake)
+// shard store, build the image, run it -- registry-free.
+type fakeBuilder struct{ built []string }
+
+func (b *fakeBuilder) BuildImage(_ context.Context, blob []byte, tag string) error {
+	b.built = append(b.built, tag)
+	return nil
+}
+
+func TestAgentBuildsFromDHTContext(t *testing.T) {
+	researcher := newIdentity(t)
+	worker := newIdentity(t)
+	rt := &fakeRuntime{}
+	blobs := newMemBlobStore()
+	builder := &fakeBuilder{}
+	agent := NewAgent(AgentConfig{AcceptsLab: true, NodeID: worker.ID()},
+		rt, NewAddressAllocator(&fakeOpener{}, t.TempDir()), &memAudit{})
+	agent.SetBuilder(builder, blobs)
+	agent.now = fixedClock(time.Unix(1700000000, 0))
+
+	// Store a build context on the "DHT".
+	digest, err := StoreBuildContext(context.Background(), blobs, []BuildFile{
+		{Path: "Dockerfile", Data: []byte("FROM nginx\nCOPY index.html /usr/share/nginx/html/\n")},
+		{Path: "index.html", Data: []byte("<h1>lab</h1>")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deploy referencing the build context, no prebuilt image.
+	env, _ := NewEnvelope(researcher, worker.ID(), MethodLaunch,
+		DeployRequest{DeploymentID: "b1", BuildContextDigest: digest, Lab: true, RuntimeSecs: 60},
+		time.Unix(1700000000, 0))
+	reply, err := agent.HandleLaunch(context.Background(), env)
+	if err != nil {
+		t.Fatalf("build-context deploy failed: %v", err)
+	}
+	if len(builder.built) != 1 {
+		t.Fatalf("expected one build, got %d", len(builder.built))
+	}
+	if len(rt.created) != 1 || rt.created[0].Image != builder.built[0] {
+		t.Fatalf("container was not created from the built image: %+v", rt.created)
+	}
+	if reply.ContainerID == "" {
+		t.Fatal("no container from a build-context deploy")
 	}
 }

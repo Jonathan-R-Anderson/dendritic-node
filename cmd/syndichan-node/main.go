@@ -624,6 +624,12 @@ func main() {
 		logger.Printf("starting storage dashboard on %s", cfg.UIListen)
 		go serve(uiServer, cfg, logger, "dashboard")
 	}
+	// Distributed Container Service. Off unless dcs.enabled + role.worker; a
+	// no-op otherwise, and non-fatal if Docker is unreachable. Needs the full
+	// storage node (host, DHT, I2P, store), so it is wired here in that path.
+	if !noStorage {
+		startDCSWorker(ctx, cfg, node, storageNode, logger)
+	}
 	// Tray icon when built with -tags tray; nil otherwise. It does not keep the
 	// node alive -- the node is a service and outlives any window -- it just
 	// makes that visible and gives the dashboard somewhere to be reopened from.
