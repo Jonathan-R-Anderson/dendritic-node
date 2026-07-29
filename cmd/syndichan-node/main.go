@@ -79,6 +79,24 @@ func main() {
 		"run gateway/probe services without storage sharing, S3, dashboard, or I2P")
 	flag.BoolVar(&probeOnly, "probe-only", false,
 		"run only a signed verification probe; no storage, I2P, S3, or dashboard")
+	var dcsDeploy bool
+	var dcsImage string
+	var dcsBuildDir string
+	var dcsLab bool
+	var dcsRuntime int
+	var dcsPrimaryPort int
+	flag.BoolVar(&dcsDeploy, "dcs-deploy", false,
+		"deploy a container to a random DCS worker over I2P, print its I2P address, then exit")
+	flag.StringVar(&dcsImage, "dcs-image", "",
+		"image reference to deploy (with -dcs-deploy); or use -dcs-build-context")
+	flag.StringVar(&dcsBuildDir, "dcs-build-context", "",
+		"directory with a Dockerfile to pack, store on the DHT, and build on the worker")
+	flag.BoolVar(&dcsLab, "dcs-lab", false,
+		"deploy as a lab (deliberately-vulnerable) workload; reachable only at its private I2P address")
+	flag.IntVar(&dcsRuntime, "dcs-runtime", 0,
+		"requested runtime in seconds before auto spin-down (0 = worker default)")
+	flag.IntVar(&dcsPrimaryPort, "dcs-port", 0,
+		"the container's primary service port (default 80)")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
@@ -205,6 +223,18 @@ func main() {
 			logger.Fatalf("-capacity-gib: %v", err)
 		}
 	}
+	// -dcs-deploy is a one-shot client: it opens an I2P node, finds a worker,
+	// deploys, prints the container's I2P address (or a queue countdown), then
+	// exits. The container's 24h TTL means fire-and-forget is safe -- the worker
+	// reclaims it whether or not the deployer stays online.
+	if dcsDeploy {
+		runDCSDeploy(cfg, dcsDeployOptions{
+			image: dcsImage, buildDir: dcsBuildDir, lab: dcsLab,
+			runtimeSecs: dcsRuntime, primaryPort: dcsPrimaryPort,
+		}, logger)
+		return
+	}
+
 	noStorage := !role.NeedsStorage()
 	if showCredentials {
 		// Deliberate, explicit retrieval. The operator owns this machine and

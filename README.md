@@ -540,6 +540,56 @@ Set `"enabled": false` (or `"role": {"worker": false}`) and restart. Running
 containers are reclaimed as they hit their TTL, or immediately with a normal
 `docker stop`/`rm` — they are ordinary containers with DCS labels.
 
+### Deploy a container to the network
+
+The other side: as a user, run a container on *someone else's* worker and get
+back its private I2P address. This does not need a worker of your own — any node
+with I2P and the DHT can deploy. It is one command:
+
+```sh
+# Run a prebuilt image on a random worker:
+./syndichan-node -dcs-deploy -dcs-image nginx
+
+# Or ship a Dockerfile: the directory is packed, stored on the DHT as shards,
+# and built on the worker — no registry involved:
+./syndichan-node -dcs-deploy -dcs-build-context ./my-service
+
+# A deliberately-vulnerable lab box (reachable only by you):
+./syndichan-node -dcs-deploy -dcs-build-context ./attack-range -dcs-lab -dcs-port 8000
+```
+
+It opens an I2P node (the first connect takes a minute), finds workers, deploys
+to a random one, and prints:
+
+```text
+Container deployed.
+  worker:       12D3KooW…
+  container:    dcs-cli-…
+  I2P address:  <52-char>.b32.i2p
+  visibility:   PRIVATE — only you were told this address
+  auto-expires: 2026-07-30T…Z
+```
+
+Point your tools at that I2P address through your local I2P proxy. Because one
+destination carries every port, you can port-scan the box across all its ports
+on that single address. It spins down on its own at the expiry time — you do not
+have to stay online.
+
+**If the network is at capacity** you are queued instead, and the command shows
+your place in line and a countdown, retrying automatically until a slot frees:
+
+```text
+Queued on 12D3KooW… — position 2, about 3h12m0s until a slot frees.
+```
+
+You may run **one instance at a time**. Different people can run the same image
+as their own separate instances simultaneously.
+
+### Turn it off (deploy side)
+
+There is nothing to turn off — `-dcs-deploy` exits after printing the address,
+and the container reclaims itself at its TTL.
+
 The full architecture — scheduling, the RPC protocol, image distribution,
 failure recovery, the security model, and the roadmap — is in [`DCS.md`](DCS.md).
 

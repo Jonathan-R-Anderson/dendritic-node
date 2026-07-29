@@ -122,14 +122,21 @@ type DCSLimits struct {
 	LabMaxRuntimeSeconds int `json:"lab_max_runtime_seconds"`
 }
 
+// DCSPolicy is the worker operator's SAFETY policy. Note what is deliberately
+// absent: there is NO image allowlist. A worker does not decide which images it
+// runs -- that is the job of the site's challenge catalog (the admin registry),
+// not of every volunteer node. The worker's job is to run whatever build
+// context it is handed, SAFELY: the hardened sandbox, the lab opt-in, the
+// resource limits and the owner allowlist below are safety boundaries, not a
+// say over which challenges exist.
 type DCSPolicy struct {
 	AllowExec           bool     `json:"allow_exec"`
 	ExecRecording       bool     `json:"exec_recording"`
 	AllowClearnetEgress bool     `json:"allow_clearnet_egress"`
 	AllowGatewayPublish bool     `json:"allow_gateway_publish"`
-	ImageAllowlist      []string `json:"image_allowlist,omitempty"`
-	TrustedPublishers   []string `json:"trusted_publishers,omitempty"`
-	OwnerAllowlist      []string `json:"owner_allowlist,omitempty"`
+	// OwnerAllowlist restricts WHO may deploy, not WHAT they deploy. Empty means
+	// any authenticated owner.
+	OwnerAllowlist []string `json:"owner_allowlist,omitempty"`
 }
 
 type GatewayConfig struct {

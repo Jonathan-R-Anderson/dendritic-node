@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -157,6 +159,165 @@ func advertiseWorker(ctx context.Context, cfg config.Config, node *p2p.Node, adm
 			publish()
 		}
 	}
+}
+
+// ---- the deploy client (-dcs-deploy) ----
+
+type dcsDeployOptions struct {
+	image       string
+	buildDir    string
+	lab         bool
+	runtimeSecs int
+	primaryPort int
+}
+
+// runDCSDeploy is the client side end to end: open a node, discover workers,
+// deploy to a random one, poll while queued, and print the container's private
+// I2P address. It is what the README's "deploy a container" instructions call.
+func runDCSDeploy(cfg config.Config, opts dcsDeployOptions, logger *log.Logger) {
+	if opts.image == "" && opts.buildDir == "" {
+		logger.Fatal("dcs-deploy: pass -dcs-image or -dcs-build-context")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A deploy needs the full node substrate: I2P, DHT, the shard store (for a
+	// build context). Open it the same way the storage path does.
+	storage, err := store.Open(
+		filepath.Join(cfg.DataDir, "storage"),
+		cfg.DataShards, cfg.ParityShards, cfg.ChunkBytes, cfg.CapacityBytes,
+	)
+	if err != nil {
+		logger.Fatalf("dcs-deploy: open store: %v", err)
+	}
+	defer storage.Close()
+
+	logger.Printf("dcs-deploy: connecting to I2P and the DHT (this can take a minute)…")
+	node, err := p2p.Open(ctx, cfg.DataDir, cfg.I2PSAM, cfg.I2PHTTPProxy, storage, logger)
+	if err != nil {
+		logger.Fatalf("dcs-deploy: open node: %v", err)
+	}
+	defer node.Close()
+	if err := node.ConfigureDCSRecords(dcs.WorkerDHTValidator{}); err != nil {
+		logger.Fatalf("dcs-deploy: %v", err)
+	}
+
+	req := dcs.DeployRequest{
+		DeploymentID: "cli-" + short(node.ID()) + "-" + shortTime(),
+		Image:        opts.image, Lab: opts.lab,
+		RuntimeSecs: opts.runtimeSecs, PrimaryPort: opts.primaryPort,
+	}
+
+	// A build context: pack the directory, store it on the DHT as shards, and
+	// reference it by digest so the worker builds it.
+	if opts.buildDir != "" {
+		files, err := loadBuildDir(opts.buildDir)
+		if err != nil {
+			logger.Fatalf("dcs-deploy: build context: %v", err)
+		}
+		digest, err := dcs.StoreBuildContext(ctx, NewStoreBlobStore(storage), files)
+		if err != nil {
+			logger.Fatalf("dcs-deploy: store build context: %v", err)
+		}
+		req.BuildContextDigest = digest
+		logger.Printf("dcs-deploy: build context stored on the DHT (%s)", digest)
+	}
+
+	logger.Printf("dcs-deploy: discovering workers…")
+	workers, err := node.FindDCSWorkers(ctx, 32)
+	if err != nil || len(workers) == 0 {
+		logger.Fatalf("dcs-deploy: no container workers found on the network")
+	}
+	logger.Printf("dcs-deploy: %d worker(s) available", len(workers))
+
+	manager := dcs.NewManager(node, dcs.NewStreamTransport(node.Host()))
+
+	// Deploy, polling through any queue. The manager picks a random worker; a
+	// queued reply carries a countdown that we surface each poll.
+	deadline := time.Now().Add(30 * time.Minute)
+	var reply dcs.DeployReply
+	var worker dcs.WorkerRecord
+	for {
+		reply, worker, err = manager.DeployToRandom(ctx, workers, req)
+		if err != nil {
+			logger.Fatalf("dcs-deploy: %v", err)
+		}
+		if !reply.Queued {
+			break
+		}
+		fmt.Printf("Queued on %s — position %d, about %s until a slot frees.\n",
+			short(worker.NodeID), reply.Position, humaneDuration(reply.ETASeconds))
+		if time.Now().After(deadline) {
+			logger.Fatal("dcs-deploy: still queued after 30m; giving up")
+		}
+		req.Ticket = reply.Ticket
+		// Refresh the worker view and wait before retrying.
+		time.Sleep(15 * time.Second)
+		if refreshed, rerr := node.FindDCSWorkers(ctx, 32); rerr == nil && len(refreshed) > 0 {
+			workers = refreshed
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("Container deployed.")
+	fmt.Printf("  worker:       %s\n", worker.NodeID)
+	fmt.Printf("  container:    %s\n", reply.ContainerID)
+	fmt.Printf("  I2P address:  %s\n", reply.Destination)
+	if reply.Private {
+		fmt.Println("  visibility:   PRIVATE — only you were told this address")
+	}
+	if reply.ExpiresAt > 0 {
+		fmt.Printf("  auto-expires: %s\n", time.Unix(reply.ExpiresAt, 0).UTC().Format(time.RFC3339))
+	}
+	if reply.Note != "" {
+		fmt.Printf("  note:         %s\n", reply.Note)
+	}
+	fmt.Println()
+	fmt.Println("Reach it through your I2P proxy at the address above. It spins down on its own.")
+}
+
+func loadBuildDir(dir string) ([]dcs.BuildFile, error) {
+	var files []dcs.BuildFile
+	root := filepath.Clean(dir)
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		info, _ := d.Info()
+		mode := int64(0o644)
+		if info != nil {
+			mode = int64(info.Mode().Perm())
+		}
+		files = append(files, dcs.BuildFile{Path: filepath.ToSlash(rel), Mode: mode, Data: data})
+		return nil
+	})
+	return files, err
+}
+
+func humaneDuration(seconds int64) string {
+	if seconds <= 0 {
+		return "moments"
+	}
+	d := time.Duration(seconds) * time.Second
+	return d.Round(time.Second).String()
+}
+
+func shortTime() string {
+	// A short, monotone-ish suffix for a deployment id. time.Now is fine here:
+	// this is a CLI invocation, not one of the deterministic build paths.
+	return short(dcs.BlobDigest([]byte(time.Now().UTC().Format(time.RFC3339Nano))))
 }
 
 // ---- adapters between the node's primitives and the dcs interfaces ----
