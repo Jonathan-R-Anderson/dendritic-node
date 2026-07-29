@@ -26,6 +26,13 @@ type DeployRequest struct {
 	// PrimaryPort is where a portless inbound I2P stream is routed -- the
 	// container's main service. Defaults to DefaultLabPort when unset.
 	PrimaryPort int `json:"primary_port,omitempty"`
+	// Ticket carries a queue position across Launch retries. Empty on the first
+	// attempt; set to the previous reply's Ticket when polling a queued slot.
+	Ticket string `json:"ticket,omitempty"`
+	// BuildContextDigest references a Dockerfile+files blob in the shard store
+	// (StoreBuildContext). When set, the worker fetches and builds it rather
+	// than pulling a prebuilt image.
+	BuildContextDigest string `json:"build_context_digest,omitempty"`
 
 	// These say what the deployer wants the container REACHABLE as. For a lab
 	// workload every one of them is refused (see AdmitLab), so a researcher who
@@ -46,6 +53,14 @@ type DeployReply struct {
 	Private      bool   `json:"private"`     // true: never published anywhere else
 	ExpiresAt    int64  `json:"expires_at"`  // agent destroys it at this time
 	Note         string `json:"note,omitempty"`
+
+	// Queue fields, set instead of a container when the worker is full. The
+	// client re-sends Launch with Ticket until Queued is false.
+	Queued      bool   `json:"queued,omitempty"`
+	Ticket      string `json:"ticket,omitempty"`
+	Position    int    `json:"position,omitempty"`     // 1-based place in line
+	ETASeconds  int64  `json:"eta_seconds,omitempty"`  // countdown to a free slot
+	InstanceTTL int64  `json:"instance_ttl,omitempty"` // seconds before auto spin-down
 }
 
 // Runtime is the container backend the agent drives. *DockerClient satisfies
@@ -123,12 +138,14 @@ func (c AgentConfig) ownerAllowed(owner string) bool {
 // destination to the container's network namespace, and returns the address to
 // the owner alone.
 type Agent struct {
-	cfg     AgentConfig
-	runtime Runtime
-	alloc   Allocator
-	audit   AuditSink
-	network NetworkAttacher // optional; nil means "address allocated but not bridged"
-	now     func() time.Time
+	cfg         AgentConfig
+	runtime     Runtime
+	alloc       Allocator
+	audit       AuditSink
+	network     NetworkAttacher      // optional; nil means "address allocated but not bridged"
+	admission   *AdmissionController // optional; nil means unlimited (no cap, no queue)
+	instanceTTL time.Duration        // general auto-spin-down; 0 -> DefaultInstanceTTL
+	now         func() time.Time
 
 	mu       sync.Mutex
 	attached map[string]NetworkHandle // containerID → its network, for teardown
@@ -145,6 +162,13 @@ func NewAgent(cfg AgentConfig, runtime Runtime, alloc Allocator, audit AuditSink
 // still allocates and returns a destination, but the container is not reachable
 // at it -- useful for tests and for a dry run, honest about the difference.
 func (a *Agent) SetNetworkAttacher(n NetworkAttacher) { a.network = n }
+
+// SetAdmission wires the simultaneous-container cap, the one-instance-per-owner
+// rule and the queue. Without it the worker accepts unlimited containers.
+func (a *Agent) SetAdmission(admission *AdmissionController, instanceTTL time.Duration) {
+	a.admission = admission
+	a.instanceTTL = instanceTTL
+}
 
 // DefaultLabPort is where a portless inbound stream is routed when the deploy
 // request does not name a primary port. 80 is the common case for a web-facing
@@ -195,6 +219,38 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		containment = c
 	}
 
+	// Admission: the operator's simultaneous-container cap, one-instance-per-owner
+	// rule, and the queue. When admission is not wired (nil), the worker is
+	// unlimited -- the previous behaviour, kept for tests and dry runs.
+	var slotToken string
+	if a.admission != nil {
+		decision, admitErr := a.admission.Admit(owner, req.Ticket)
+		if admitErr != nil {
+			// One instance per owner: told plainly, not as a generic failure.
+			a.refuse(owner, req.DeploymentID, "admission", admitErr.Error())
+			return DeployReply{}, admitErr
+		}
+		if decision.Queued {
+			// The worker is full. Hand back a place in line and a countdown; the
+			// client re-sends Launch with this Ticket until a slot frees. No
+			// container is created for a queued request.
+			return DeployReply{
+				DeploymentID: req.DeploymentID, Queued: true,
+				Ticket: decision.Ticket, Position: decision.Position,
+				ETASeconds: decision.ETASeconds, InstanceTTL: decision.InstanceTTL,
+				Note: "queued: the worker is at capacity",
+			}, nil
+		}
+		slotToken = decision.SlotToken
+	}
+	// From here a failure must release the reserved slot, or the worker leaks
+	// capacity that no coordinator exists to reclaim.
+	releaseSlot := func() {
+		if a.admission != nil && slotToken != "" {
+			a.admission.Release(slotToken)
+		}
+	}
+
 	// A lab container's destination is private and never leaves the agent
 	// except to this owner; a normal one may later be advertised.
 	private := req.Lab
@@ -206,6 +262,7 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		Lab: req.Lab,
 	})
 	if err != nil {
+		releaseSlot()
 		a.refuse(owner, req.DeploymentID, "create", err.Error())
 		return DeployReply{}, fmt.Errorf("create container: %w", err)
 	}
@@ -214,12 +271,14 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 	// without its network identity in place.
 	address, err := a.alloc.Allocate(ctx, containerID, private)
 	if err != nil {
+		releaseSlot()
 		_ = a.runtime.Remove(ctx, containerID, true)
 		a.refuse(owner, req.DeploymentID, "allocate_address", err.Error())
 		return DeployReply{}, fmt.Errorf("allocate destination: %w", err)
 	}
 
 	if err := a.runtime.Start(ctx, containerID); err != nil {
+		releaseSlot()
 		_ = a.alloc.Release(containerID, true)
 		_ = a.runtime.Remove(ctx, containerID, true)
 		a.refuse(owner, req.DeploymentID, "start", err.Error())
@@ -262,9 +321,35 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		Destination:  destination,
 		Private:      private,
 	}
+	// The instance's auto-spin-down time. A lab ceiling (4h) is stricter than
+	// the general TTL and wins; otherwise the general TTL applies.
+	ttl := a.instanceTTL
+	if ttl <= 0 {
+		ttl = DefaultInstanceTTL
+	}
+	expiresAt := a.now().Add(ttl)
 	if req.Lab {
-		reply.ExpiresAt = containment.ExpiresAt(a.now()).Unix()
+		labStop := containment.ExpiresAt(a.now())
+		if labStop.Before(expiresAt) {
+			expiresAt = labStop
+		}
 		reply.Note = "lab workload: no egress, no gateway, destroyed at expiry"
+	}
+	reply.ExpiresAt = expiresAt.Unix()
+	reply.InstanceTTL = int64(ttl / time.Second)
+
+	// Register the running instance so the admission cap, the queue ETA and the
+	// reaper all see it. Do this AFTER a successful start so a failed launch
+	// never counts against capacity.
+	if a.admission != nil && slotToken != "" {
+		if err := a.admission.Started(slotToken, containerID, expiresAt); err != nil {
+			// The reservation expired mid-launch (very slow start). The container
+			// is up but unaccounted; destroy it rather than run something the cap
+			// does not know about.
+			_ = a.Destroy(ctx, containerID)
+			a.refuse(owner, req.DeploymentID, "slot_expired", err.Error())
+			return DeployReply{}, err
+		}
 	}
 	if !reachable {
 		reply.Note = strings.TrimSpace(reply.Note + " (address allocated but not yet bridged on this host)")
@@ -276,6 +361,22 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		ContainerID: containerID, Destination: destination,
 	})
 	return reply, nil
+}
+
+// HandleQueueStatus answers a queued client's poll for its place in line
+// without attempting a launch, so a UI can show a live countdown cheaply.
+func (a *Agent) HandleQueueStatus(ticket string) (DeployReply, bool) {
+	if a.admission == nil {
+		return DeployReply{}, false
+	}
+	decision, ok := a.admission.QueueStatus(ticket)
+	if !ok {
+		return DeployReply{}, false
+	}
+	return DeployReply{
+		Queued: true, Ticket: decision.Ticket, Position: decision.Position,
+		ETASeconds: decision.ETASeconds, InstanceTTL: decision.InstanceTTL,
+	}, true
 }
 
 func (a *Agent) refuse(owner, deployment, phase, reason string) {
@@ -298,6 +399,11 @@ func (a *Agent) Destroy(ctx context.Context, containerID string) error {
 
 	if handle != nil {
 		handle.Detach()
+	}
+	// Free the admission slot so the queue advances and the reaper stops
+	// tracking it.
+	if a.admission != nil {
+		a.admission.Release(containerID)
 	}
 	// purge=true: a destroyed container's address must not survive it, or a
 	// later container could inherit an address someone was told about.
