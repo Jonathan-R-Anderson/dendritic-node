@@ -505,7 +505,31 @@ func main() {
 	// gateway role is on. external_verification only decides HOW the address
 	// is proven: by a peer probe quorum, or by the controller's own
 	// independent connect-back alone.
-	if cfg.Gateway.Enabled {
+	// Registering puts this host's IP into the PUBLIC syndichan.org answer set.
+	// Without the SNI frontend this process serves only its own gw-<id>
+	// hostname, so a visitor whose DNS lands here gets a completed TCP connect
+	// and then a failed TLS handshake ("host not configured in HostWhitelist").
+	// Browsers do not fail over from a TLS error the way they do from a refused
+	// connection, so that visitor is simply broken -- an outage caused purely
+	// by joining the pool. Serve the site, or stay out of the pool.
+	if cfg.Gateway.Enabled && !cfg.Gateway.Frontend.Enabled {
+		logger.Printf("gateway.frontend is disabled: NOT registering with the controller.")
+		logger.Printf("  This node cannot serve %s, so publishing its IP in that DNS answer",
+			cfg.Gateway.Frontend.OriginServerName)
+		logger.Printf("  set would break every visitor routed to it. It still serves its own")
+		logger.Printf("  %s endpoints and sends the presence heartbeat.", cfg.Gateway.PublicHostname)
+		logger.Printf("  Set gateway.frontend.enabled=true (with a reachable origin_address) to join the pool.")
+	}
+	if cfg.Gateway.Enabled && cfg.Gateway.Frontend.Enabled {
+		// One definition, shared with validation: a quorum is only in play when
+		// the operator actually named a probe fleet.
+		quorumInPlay := cfg.Gateway.Verification.Enabled &&
+			config.ProbeQuorumConfigured(cfg.Gateway)
+		if cfg.Gateway.Verification.Enabled && !quorumInPlay {
+			logger.Printf("no probe_urls/trusted_probes configured: verifying through the " +
+				"controller alone. It still connect-backs to this host before publishing DNS, " +
+				"but this node will not report itself as independently verified.")
+		}
 		addresses := make([]gateway.Address, 0, len(cfg.Gateway.PublicAddresses))
 		for _, value := range cfg.Gateway.PublicAddresses {
 			ip := net.ParseIP(value)
@@ -545,7 +569,7 @@ func main() {
 			FailureThreshold:     cfg.Gateway.Health.FailureThreshold,
 			RecoveryThreshold:    cfg.Gateway.Health.RecoveryThreshold,
 			DrainDuration:        time.Duration(cfg.Gateway.Health.DrainSeconds) * time.Second,
-			RequireProbeQuorum:   cfg.Gateway.Verification.Enabled,
+			RequireProbeQuorum:   quorumInPlay,
 		}, logger, func(verified bool) {
 			gatewayVerified.Store(verified)
 			if node != nil {

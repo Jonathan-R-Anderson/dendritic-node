@@ -196,6 +196,68 @@ It does still send the five-minute presence heartbeat, reporting zero capacity.
 That is how the operator's map knows your gateway exists and separates it from
 a storage node.
 
+### ⚠️ Put your real email in the config first
+
+If `tls.mode` is `"acme"`, **you must replace the placeholder email**:
+
+```json
+"tls": {
+  "mode": "acme",
+  "acme_email": "you@your-real-domain.example",
+  "acme_http_address": "0.0.0.0:80"
+}
+```
+
+The example ships `operator@example.com`, and Let's Encrypt **refuses that
+domain outright**. The failure is indirect and easy to misread — you get no
+certificate, so the controller's connect-back to your port 443 fails TLS, and
+the only thing you see is:
+
+```text
+gateway registration publish failed: gateway registry returned HTTP 422
+```
+
+The real error is one line earlier in the log:
+
+```text
+400 urn:ietf:params:acme:error:invalidContact: contact email has forbidden domain "example.com"
+```
+
+The address is used only for Let's Encrypt expiry warnings. It is not published
+in DNS, not sent to the controller, and never appears in your certificate.
+
+### Wait — how can several gateways have certificates for `syndichan.org`?
+
+They don't, and this is the part worth understanding.
+
+**Your gateway never holds a certificate for `syndichan.org`.** It gets one for
+a hostname of its own, `gw-<your-node-id>.syndichan.org`, which the controller
+assigns from your node's identity. No two gateways ever request the same name,
+so there is nothing to collide.
+
+**It doesn't need one either.** When the frontend forwards site traffic it does
+*not* terminate TLS. It reads only the unencrypted SNI field from the opening
+ClientHello, decides where the connection belongs, and then splices raw bytes
+between the visitor and the origin. The TLS session is end-to-end between the
+visitor's browser and the origin server, which holds the real `syndichan.org`
+certificate. Your gateway carries ciphertext it cannot read. That is also why
+the origin listener is declared `listen 9443 ssl proxy_protocol` — the origin,
+not the gateway, does the SSL.
+
+So your `gw-…` certificate exists for one purpose: proving to probes and to the
+controller that the machine answering on that address really holds your node's
+private key.
+
+**And no, Let's Encrypt has no "one email per domain" rule.** The address is a
+property of an ACME *account*, not of a domain. Every gateway creates its own
+account with its own key and its own contact address, and any number of
+accounts may hold certificates for names under the same parent domain.
+
+The limit that *does* matter is different: Let's Encrypt allows roughly **50
+certificates per registered domain per week**. Each brand-new gateway spends
+one of those on its `gw-…` name (renewals are counted separately), so onboarding
+more than ~50 new gateways in a single week would hit the ceiling.
+
 ### About `probe_urls`
 
 Before a gateway is trusted, something has to prove it is genuinely reachable
@@ -231,6 +293,140 @@ Quick local controls:
 ./syndichan-node -gateway-enable     # turn gateway mode on
 ./syndichan-node -gateway-disable    # turn it off
 ```
+
+### Run it automatically on boot (Linux / systemd)
+
+This is the set-and-forget setup: start it once, and it comes back on reboot and
+after a crash without you touching it. Works on Ubuntu, Debian, Fedora, Arch,
+RHEL — anything with systemd.
+
+**1. Lay it out.** Keep the binary, the config and the data under one directory:
+
+```sh
+mkdir -p ~/syndichan-node/{bin,config,data}
+cp syndichan-node ~/syndichan-node/bin/
+cp gateway.json  ~/syndichan-node/config/config.json
+chmod 600 ~/syndichan-node/config/config.json
+```
+
+**2. Create the service.** Save it as
+`/etc/systemd/system/syndichan-node.service`.
+
+**Replace `EXAMPLE` with your own username everywhere it appears** — six places
+below. If your user is `alice`, every `/home/EXAMPLE/...` becomes
+`/home/alice/...`.
+
+```ini
+[Unit]
+Description=Syndichan Gateway Node
+Wants=network-online.target
+After=network-online.target
+# These two belong in [Unit], not [Service] -- systemd moved them, and it
+# silently ignores them if you put them under [Service].
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=EXAMPLE
+Group=EXAMPLE
+WorkingDirectory=/home/EXAMPLE/syndichan-node
+ExecStart=/home/EXAMPLE/syndichan-node/bin/syndichan-node \
+    -gateway-only \
+    -config /home/EXAMPLE/syndichan-node/config/config.json \
+    -data-dir /home/EXAMPLE/syndichan-node/data
+
+# Ports 80 and 443 are privileged. This is what lets an ordinary user bind
+# them; without it the service dies instantly with "permission denied".
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# on-failure, not always: a bad config should stop and tell you, not respawn
+# forever. The burst limit in [Unit] above gives up after 5 tries in 60s.
+Restart=on-failure
+RestartSec=5s
+
+# Let in-flight connections drain and the gateway publish its withdrawal.
+TimeoutStopSec=75s
+LimitNOFILE=65535
+
+# Sandboxing. The node needs to write only its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/EXAMPLE/syndichan-node
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**3. Enable and start it.** `--now` does both: starts it immediately *and*
+enables it at boot.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now syndichan-node
+```
+
+**4. Confirm, then forget about it:**
+
+```sh
+systemctl status syndichan-node
+journalctl -u syndichan-node -f          # live log; Ctrl-C to stop watching
+```
+
+You want to see `Active: active (running)` and a line like
+`volunteer gateway candidate listening on 0.0.0.0:443`. That's it — it now
+survives reboots and restarts itself if it ever exits.
+
+Three things people get wrong here:
+
+- **`-data-dir` is not optional.** It holds `p2p.key`, your node's permanent
+  identity. That identity determines your `gw-….syndichan.org` hostname and
+  your certificate. Omit the flag and the node falls back to the current user's
+  config directory — so running it once by hand with `sudo` and once as a
+  service creates *two different identities*, two hostnames and two
+  certificates.
+- **Don't run a second copy by hand while the service is up.** Only one process
+  can hold ports 80 and 443; the second exits with "address already in use".
+  Use `sudo systemctl stop syndichan-node` first.
+- **`ProtectHome=read-only` plus `ReadWritePaths`** is what keeps the node from
+  writing anywhere in your home directory except its own folder. If you move
+  the installation, update `ReadWritePaths` too or it will fail to write.
+
+Everyday commands:
+
+```sh
+sudo systemctl restart syndichan-node     # after editing the config
+sudo systemctl stop syndichan-node        # graceful, withdraws it from DNS
+sudo systemctl disable --now syndichan-node   # stop and remove from boot
+```
+
+To upgrade, replace the binary and restart:
+
+```sh
+sudo systemctl stop syndichan-node
+cp /path/to/new/syndichan-node ~/syndichan-node/bin/syndichan-node
+sudo systemctl start syndichan-node
+```
+
+A ready-made copy of this unit ships as
+[`packaging/systemd/syndichan-node-gateway-home.service`](packaging/systemd/syndichan-node-gateway-home.service),
+and [`GATEWAY.md`](GATEWAY.md) covers a timer that pulls and rebuilds from git
+automatically, with rollback if the new build fails to come up.
+
+**Non-systemd systems:** on Alpine (OpenRC) or a BSD, run the same command under
+your init's supervisor. The only requirements are that the process runs as a
+consistent user, is given the same `-data-dir` every time, and can bind ports 80
+and 443.
 
 Full setup — TLS modes, probe quorum, serving `syndichan.org` through your box,
 systemd units, and automatic updates — is in [`GATEWAY.md`](GATEWAY.md).

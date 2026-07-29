@@ -379,6 +379,19 @@ func (c Config) validateGateway() error {
 			if _, _, err := net.SplitHostPort(g.TLS.ACMEHTTPAddress); err != nil {
 				return errors.New("gateway ACME HTTP address must be host:port")
 			}
+			// Catch the shipped placeholder here rather than letting it surface
+			// four steps later as an opaque "registry returned HTTP 422". Let's
+			// Encrypt rejects reserved example domains, so no certificate is
+			// issued, so the controller's TLS connect-back fails, so
+			// registration is refused -- and none of those messages mention the
+			// email that actually caused it.
+			if reservedEmailDomain(g.TLS.ACMEEmail) {
+				return fmt.Errorf(
+					"gateway tls.acme_email is still the placeholder %q; Let's Encrypt "+
+						"refuses reserved example domains. Put a real address there -- it is "+
+						"used only for certificate expiry warnings and is never published",
+					g.TLS.ACMEEmail)
+			}
 		}
 		if g.Frontend.Enabled && g.TLS.Mode == "reverse_proxy" {
 			return errors.New("gateway frontend requires existing or ACME TLS for its local identity endpoint")
@@ -405,16 +418,27 @@ func (c Config) validateGateway() error {
 				"gateway public_addresses is empty: list this host's literal public IP, e.g. [\"203.0.113.10\"]")
 		}
 	}
-	if g.Enabled && g.Verification.Enabled {
-		// probe_urls are OTHER volunteers running -probe-only who connect back
-		// to this host and independently confirm it is reachable. If no such
-		// probe fleet is available, turn external_verification off: the
-		// controller still verifies reachability itself before publishing DNS.
+	// probe_urls are OTHER volunteers running -probe-only who connect back to
+	// this host and independently confirm it is reachable.
+	//
+	// NOT CONFIGURED is not the same as MISCONFIGURED. A stock config enables
+	// external_verification and lists no probes, because there may be no probe
+	// fleet to list yet -- the first gateway on a network cannot have one, and
+	// probes are themselves gateways someone has to stand up first. Refusing to
+	// start over that made the shipped example unbootable and the whole role
+	// unreachable to a new operator.
+	//
+	// So: no probes configured at all means "verify through the controller
+	// alone", which it does anyway before publishing DNS. Such a node never
+	// reports gateway_verified, so nothing overstates its trust. But a
+	// PARTIALLY configured quorum -- some probes, fewer than the threshold --
+	// is a genuine mistake and still refuses to start.
+	if g.Enabled && g.Verification.Enabled && ProbeQuorumConfigured(g) {
 		if len(g.ProbeURLs) < g.Verification.MinimumSuccessfulProbes {
 			return fmt.Errorf(
-				"gateway.external_verification needs %d probe_urls but %d are configured; "+
-					"set gateway.external_verification.enabled to false to rely on the "+
-					"controller's own reachability check instead",
+				"gateway.external_verification needs %d probe_urls but only %d are configured; "+
+					"add the missing probe origins, or clear probe_urls/trusted_probes to "+
+					"verify through the controller alone",
 				g.Verification.MinimumSuccessfulProbes, len(g.ProbeURLs))
 		}
 	}
@@ -431,6 +455,33 @@ func (c Config) validateGateway() error {
 		return err
 	}
 	return nil
+}
+
+// reservedEmailDomain reports whether an ACME contact address sits in a domain
+// RFC 2606/6761 reserves for documentation. An empty address is fine -- Let's
+// Encrypt allows an account with no contact, it just cannot warn you before a
+// certificate lapses.
+func reservedEmailDomain(email string) bool {
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return false
+	}
+	domain := strings.ToLower(strings.TrimSpace(email[at+1:]))
+	switch domain {
+	case "example.com", "example.org", "example.net", "example.edu":
+		return true
+	}
+	return domain == "example" || domain == "invalid" || domain == "test" ||
+		strings.HasSuffix(domain, ".example") || strings.HasSuffix(domain, ".invalid") ||
+		strings.HasSuffix(domain, ".test")
+}
+
+// ProbeQuorumConfigured reports whether the operator has actually named a peer
+// probe fleet. It is the single definition of "a quorum is in play", shared by
+// validation and by startup, so the checks and the runtime can never disagree
+// about which verification mode this node is in.
+func ProbeQuorumConfigured(g GatewayConfig) bool {
+	return len(g.ProbeURLs) > 0 || len(g.TrustedProbes) > 0
 }
 
 func validateGatewayFrontend(frontend GatewayFrontendConfig) error {
