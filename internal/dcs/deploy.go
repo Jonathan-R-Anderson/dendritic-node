@@ -33,6 +33,12 @@ type DeployRequest struct {
 	// (StoreBuildContext). When set, the worker fetches and builds it rather
 	// than pulling a prebuilt image.
 	BuildContextDigest string `json:"build_context_digest,omitempty"`
+	// OnBehalfOf lets a TRUSTED broker (a website's bridge node, in the worker's
+	// broker allowlist) deploy for many users through one node identity: the
+	// one-instance-per-user rule then keys on this sub-owner, not the shared
+	// broker identity, so the site is not capped to one container per worker.
+	// Ignored from untrusted owners.
+	OnBehalfOf string `json:"on_behalf_of,omitempty"`
 
 	// These say what the deployer wants the container REACHABLE as. For a lab
 	// workload every one of them is refused (see AdmitLab), so a researcher who
@@ -125,7 +131,19 @@ type AgentConfig struct {
 	AcceptsLab     bool
 	LabMaxRuntime  time.Duration
 	OwnerAllowlist []string // empty = any owner
-	NodeID         string   // this worker's identity, == envelope ToNode
+	// TrustedBrokers are node IDs allowed to deploy on behalf of sub-owners via
+	// DeployRequest.OnBehalfOf. A website's bridge node goes here.
+	TrustedBrokers []string
+	NodeID         string // this worker's identity, == envelope ToNode
+}
+
+func (c AgentConfig) trustsBroker(owner string) bool {
+	for _, b := range c.TrustedBrokers {
+		if b == owner {
+			return true
+		}
+	}
+	return false
 }
 
 func (c AgentConfig) ownerAllowed(owner string) bool {
@@ -158,12 +176,13 @@ type Agent struct {
 
 	mu       sync.Mutex
 	attached map[string]NetworkHandle // containerID → its network, for teardown
+	owners   map[string]string        // containerID → the envelope owner (for destroy auth)
 }
 
 func NewAgent(cfg AgentConfig, runtime Runtime, alloc Allocator, audit AuditSink) *Agent {
 	return &Agent{
 		cfg: cfg, runtime: runtime, alloc: alloc, audit: audit,
-		now: time.Now, attached: map[string]NetworkHandle{},
+		now: time.Now, attached: map[string]NetworkHandle{}, owners: map[string]string{},
 	}
 }
 
@@ -236,12 +255,19 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		containment = c
 	}
 
+	// The identity the one-instance-per-user rule keys on. For a trusted broker
+	// that names a sub-owner, it is that sub-owner; otherwise the envelope owner.
+	effectiveOwner := owner
+	if req.OnBehalfOf != "" && a.cfg.trustsBroker(owner) {
+		effectiveOwner = req.OnBehalfOf
+	}
+
 	// Admission: the operator's simultaneous-container cap, one-instance-per-owner
 	// rule, and the queue. When admission is not wired (nil), the worker is
 	// unlimited -- the previous behaviour, kept for tests and dry runs.
 	var slotToken string
 	if a.admission != nil {
-		decision, admitErr := a.admission.Admit(owner, req.Ticket)
+		decision, admitErr := a.admission.Admit(effectiveOwner, req.Ticket)
 		if admitErr != nil {
 			// One instance per owner: told plainly, not as a generic failure.
 			a.refuse(owner, req.DeploymentID, "admission", admitErr.Error())
@@ -403,12 +429,43 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		reply.Note = strings.TrimSpace(reply.Note + " (address allocated but not yet bridged on this host)")
 	}
 
+	a.mu.Lock()
+	a.owners[containerID] = owner
+	a.mu.Unlock()
 	a.audit.Record(AuditEntry{
 		At: a.now(), Requester: owner, DeploymentID: req.DeploymentID,
 		Method: MethodLaunch, Decision: "admitted",
 		ContainerID: containerID, Destination: destination,
 	})
 	return reply, nil
+}
+
+// HandleDestroy processes a verified Destroy envelope: only the node that
+// deployed a container may tear it down. The container id is in the payload.
+func (a *Agent) HandleDestroy(ctx context.Context, env Envelope) error {
+	owner := env.FromNode
+	var req struct {
+		ContainerID string `json:"container_id"`
+	}
+	if err := env.Bind(&req); err != nil || req.ContainerID == "" {
+		return ErrBadRequest
+	}
+	a.mu.Lock()
+	recordedOwner, known := a.owners[req.ContainerID]
+	a.mu.Unlock()
+	if !known || recordedOwner != owner {
+		// Either not ours, or a different node is trying to destroy it. Refuse
+		// rather than let one deployer kill another's container.
+		a.refuse(owner, "", "destroy", "not the owner of that container")
+		return errors.New("dcs: not authorized to destroy that container")
+	}
+	if err := a.Destroy(ctx, req.ContainerID); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	delete(a.owners, req.ContainerID)
+	a.mu.Unlock()
+	return nil
 }
 
 // HandleQueueStatus answers a queued client's poll for its place in line
@@ -461,6 +518,9 @@ func (a *Agent) Destroy(ctx context.Context, containerID string) error {
 	if a.admission != nil {
 		a.admission.Release(containerID)
 	}
+	a.mu.Lock()
+	delete(a.owners, containerID)
+	a.mu.Unlock()
 	// purge=true: a destroyed container's address must not survive it, or a
 	// later container could inherit an address someone was told about.
 	_ = a.alloc.Release(containerID, true)
@@ -520,21 +580,57 @@ func (m *Manager) DeployToRandom(ctx context.Context, records []WorkerRecord, re
 	if err != nil {
 		return DeployReply{}, WorkerRecord{}, err
 	}
+	reply, err := m.DeployTo(ctx, worker, req)
+	return reply, worker, err
+}
 
+// DeployTo sends a Launch to a SPECIFIC worker. It is how a queued deployment is
+// re-polled for promotion: the ticket reserves a place on one worker, so the
+// retry must return to that same worker rather than picking a new random one.
+// (A first deploy goes through DeployToRandom, which picks then calls this.)
+func (m *Manager) DeployTo(ctx context.Context, worker WorkerRecord, req DeployRequest) (DeployReply, error) {
 	env, err := NewEnvelope(m.signer, worker.NodeID, MethodLaunch, req, m.now())
 	if err != nil {
-		return DeployReply{}, worker, err
+		return DeployReply{}, err
 	}
 	raw, err := m.transport.RoundTrip(ctx, worker, env)
 	if err != nil {
-		return DeployReply{}, worker, fmt.Errorf("launch on %s: %w", worker.NodeID, err)
+		return DeployReply{}, fmt.Errorf("launch on %s: %w", worker.NodeID, err)
 	}
 	var reply DeployReply
 	if err := json.Unmarshal(raw, &reply); err != nil {
-		return DeployReply{}, worker, fmt.Errorf("decode reply: %w", err)
+		return DeployReply{}, fmt.Errorf("decode reply: %w", err)
 	}
-	if reply.Destination == "" {
-		return DeployReply{}, worker, errors.New("dcs: worker returned no destination")
+	if reply.Destination == "" && !reply.Queued {
+		return DeployReply{}, errors.New("dcs: worker returned no destination")
 	}
-	return reply, worker, nil
+	return reply, nil
+}
+
+// sendTo sends a signed method to a specific worker and returns the raw payload.
+func (m *Manager) sendTo(ctx context.Context, worker WorkerRecord, method string, payload any) ([]byte, error) {
+	env, err := NewEnvelope(m.signer, worker.NodeID, method, payload, m.now())
+	if err != nil {
+		return nil, err
+	}
+	return m.transport.RoundTrip(ctx, worker, env)
+}
+
+// Destroy spins down a container on the worker that runs it.
+func (m *Manager) Destroy(ctx context.Context, worker WorkerRecord, containerID string) error {
+	_, err := m.sendTo(ctx, worker, MethodDestroy, map[string]string{"container_id": containerID})
+	return err
+}
+
+// Status polls a queued deployment's place in line on its worker.
+func (m *Manager) Status(ctx context.Context, worker WorkerRecord, ticket string) (DeployReply, error) {
+	raw, err := m.sendTo(ctx, worker, MethodStatus, map[string]string{"ticket": ticket})
+	if err != nil {
+		return DeployReply{}, err
+	}
+	var reply DeployReply
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return DeployReply{}, err
+	}
+	return reply, nil
 }

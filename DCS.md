@@ -125,6 +125,29 @@ Role is *claimed* in the record and *proven* on use: a scheduler that needs GPU
 sends a probe RPC that runs `nvidia-smi -L` inside a throwaway container before
 committing a workload. Claims are cheap; proof happens at admission.
 
+### 2.1 The bridge role (deploying for many users)
+
+A **worker** runs containers; a **deployer** asks it to. The CLI (`-dcs-deploy`)
+is a deployer for one person. A **bridge** is a deployer for *many* — a website
+whose users cannot each run a node. It is a normal storage node with a loopback
+HTTP API (`dcs.api_listen`, see the README) that a co-located site backend calls
+to publish images, deploy, poll, and destroy.
+
+The bridge holds one node identity but deploys for thousands of users, so each
+deploy carries an opaque **`on_behalf_of`** sub-owner tag. The worker's
+one-container-per-owner admission rule (§4.4) keys on that tag rather than on the
+bridge's node id — otherwise a whole site collapses to one container per worker.
+A worker only honours sub-accounting from a node it lists in
+`policy.trusted_brokers`; from any other node, `on_behalf_of` is ignored and the
+deployer is accounted as a single owner. This is the same trust a company places
+in one service account that deploys for its employees: the *worker operator*
+chooses which brokers may name their own sub-owners, so a stranger cannot mint
+sub-owners to dodge the per-user cap.
+
+Destroy is owner-checked: only the node that deployed a container may tear it
+down (§7). A bridge that deployed on behalf of user A can destroy A's container;
+no other node can.
+
 ---
 
 ## 3. Capability advertisement

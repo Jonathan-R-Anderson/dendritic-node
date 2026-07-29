@@ -65,6 +65,7 @@ func startDCSWorker(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 		AcceptsLab:     cfg.DCS.Role.Lab,
 		LabMaxRuntime:  time.Duration(cfg.DCS.Limits.LabMaxRuntimeSeconds) * time.Second,
 		OwnerAllowlist: cfg.DCS.Policy.OwnerAllowlist,
+		TrustedBrokers: cfg.DCS.Policy.TrustedBrokers,
 		NodeID:         node.ID(),
 	}
 	agent := dcs.NewAgent(agentCfg, docker, allocator, &logAudit{logger: logger})

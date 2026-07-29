@@ -155,6 +155,21 @@ func (s *StreamServer) dispatch(stream network.Stream, env Envelope) (any, error
 		return map[string]string{"pong": s.self}, nil
 	case MethodLaunch:
 		return s.agent.HandleLaunch(ctx, env)
+	case MethodDestroy:
+		if err := s.agent.HandleDestroy(ctx, env); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	case MethodStatus:
+		var body struct {
+			Ticket string `json:"ticket"`
+		}
+		_ = env.Bind(&body)
+		reply, ok := s.agent.HandleQueueStatus(body.Ticket)
+		if !ok {
+			return nil, fmt.Errorf("dcs: no such ticket")
+		}
+		return reply, nil
 	default:
 		return nil, fmt.Errorf("dcs: unknown method %q", env.Method)
 	}

@@ -95,6 +95,11 @@ type DCSConfig struct {
 	DockerEndpoint           string            `json:"docker_endpoint"`
 	AdvertiseIntervalSeconds int               `json:"advertise_interval_seconds"`
 	RecordTTLSeconds         int               `json:"record_ttl_seconds"`
+	// APIListen, when set, runs a LOOPBACK/cluster-internal HTTP API the website
+	// bridge calls to publish challenge blobs, deploy on a user's behalf, and
+	// read back addresses/queue status. It lets a container run through the site
+	// can deploy them anywhere; keep it off a public interface.
+	APIListen string `json:"api_listen,omitempty"`
 }
 
 type DCSRoleConfig struct {
@@ -130,13 +135,20 @@ type DCSLimits struct {
 // resource limits and the owner allowlist below are safety boundaries, not a
 // say over which challenges exist.
 type DCSPolicy struct {
-	AllowExec           bool     `json:"allow_exec"`
-	ExecRecording       bool     `json:"exec_recording"`
-	AllowClearnetEgress bool     `json:"allow_clearnet_egress"`
-	AllowGatewayPublish bool     `json:"allow_gateway_publish"`
+	AllowExec           bool `json:"allow_exec"`
+	ExecRecording       bool `json:"exec_recording"`
+	AllowClearnetEgress bool `json:"allow_clearnet_egress"`
+	AllowGatewayPublish bool `json:"allow_gateway_publish"`
 	// OwnerAllowlist restricts WHO may deploy, not WHAT they deploy. Empty means
 	// any authenticated owner.
 	OwnerAllowlist []string `json:"owner_allowlist,omitempty"`
+	// TrustedBrokers are node IDs permitted to deploy on behalf of sub-owners
+	// (DeployRequest.OnBehalfOf). A website's bridge node deploys for thousands
+	// of users through one identity; listing it here lets the worker's
+	// one-container-per-user rule key on the real end user rather than capping
+	// the whole site to a single container. Empty means no broker is trusted and
+	// every deployer is accounted for by its own node id.
+	TrustedBrokers []string `json:"trusted_brokers,omitempty"`
 }
 
 type GatewayConfig struct {

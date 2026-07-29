@@ -659,6 +659,10 @@ func main() {
 	// storage node (host, DHT, I2P, store), so it is wired here in that path.
 	if !noStorage {
 		startDCSWorker(ctx, cfg, node, storageNode, logger)
+		// The bridge API lets a co-located website deploy on its users' behalf
+		// through this one node. Independent of the worker role: a node can be a
+		// bridge without running containers itself.
+		startDCSBridge(ctx, cfg, node, storageNode, logger)
 	}
 	// Tray icon when built with -tags tray; nil otherwise. It does not keep the
 	// node alive -- the node is a service and outlives any window -- it just

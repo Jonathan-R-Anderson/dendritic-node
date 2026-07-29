@@ -590,6 +590,75 @@ as their own separate instances simultaneously.
 There is nothing to turn off — `-dcs-deploy` exits after printing the address,
 and the container reclaims itself at its TTL.
 
+### Bridge a website to the container service
+
+`-dcs-deploy` is one person, one container, one command. A **website** has
+thousands of users and cannot ask each of them to run a node. The **bridge** is
+how a site deploys on its users' behalf through a single node: it runs a normal
+storage node with a small loopback HTTP API, and the site's backend calls that
+API to publish challenge images, spin instances up, poll the queue, and spin
+them down.
+
+This is exactly how Syndichan's own Attack Range page works
+(`backend/services/attack_range.py` → `NodeBridgeClient`).
+
+Turn it on by adding `api_listen` to the `dcs` block. The bridge needs no
+`role.worker` — a node can bridge without running containers itself — but it does
+need the full storage substrate (I2P, DHT, shard store):
+
+```json
+"dcs": {
+  "enabled": true,
+  "api_listen": "127.0.0.1:8760"
+}
+```
+
+You should see, after the node comes up:
+
+```text
+dcs-bridge: deploy API listening on 127.0.0.1:8760 (loopback/cluster-internal only)
+```
+
+Point the website at it with an environment variable:
+
+```sh
+export DCS_NODE_URL=http://127.0.0.1:8760   # or the cluster-internal address
+```
+
+The API is four endpoints, all JSON, all meant for a co-located caller only:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `PUT /dcs/blob` | Store a packed build context on the DHT; returns its `sha256:` digest. |
+| `POST /dcs/deploy` | Deploy for a user (`on_behalf_of`); returns which worker took it, the container id, and the private `.b32.i2p` — or a queue position + ticket. |
+| `POST /dcs/status` | Report a queued deploy's place in line. |
+| `POST /dcs/destroy` | Spin a container down before its TTL. |
+
+> ⚠️ **`api_listen` is unauthenticated by design** — the trust boundary is the
+> network, not a credential. Bind it to loopback or a cluster-internal address
+> the public cannot reach. Never expose it on a public interface.
+
+**Per-user accounting without a node per user.** The bridge deploys every user
+through one node identity but tags each request with an opaque `on_behalf_of`
+id. So the worker's "one container per user" rule keys on the *real* end user,
+not on the shared bridge — otherwise a whole site would be capped to a single
+container per worker. A worker only honours that sub-accounting from a node it
+trusts, so each **worker** that should accept a site's traffic lists the bridge
+node's id under `policy.trusted_brokers`:
+
+```json
+"dcs": {
+  "enabled": true,
+  "role": { "worker": true, "lab": true },
+  "policy": { "trusted_brokers": ["12D3KooW…the-bridge-node-id"] }
+}
+```
+
+Without that entry the worker still runs the container, but accounts the whole
+site as one owner — the safe default. `trusted_brokers` is the deliberate opt-in
+that says "let this node name its sub-owners honestly," the same trust a company
+places in one service account that deploys for its employees.
+
 The full architecture — scheduling, the RPC protocol, image distribution,
 failure recovery, the security model, and the roadmap — is in [`DCS.md`](DCS.md).
 
