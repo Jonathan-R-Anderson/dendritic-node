@@ -45,6 +45,12 @@ type DeployRequest struct {
 	// base64). The worker opens it to decrypt an encrypted build context. It is
 	// never the raw key -- only the named worker can open it.
 	GrantedContentKey string `json:"granted_content_key,omitempty"`
+	// BuildContext, when set, is the (encrypted) build-context blob inlined by the
+	// bridge, so the worker need not fetch it from the DHT. A worker's DHT
+	// connectivity over I2P is not guaranteed, and the context is small; the
+	// bridge already holds it. It is verified against BuildContextDigest and
+	// decrypted with GrantedContentKey exactly like a fetched blob.
+	BuildContext []byte `json:"build_context,omitempty"`
 	// OnBehalfOf lets a TRUSTED broker (a website's bridge node, in the worker's
 	// broker allowlist) deploy for many users through one node identity: the
 	// one-instance-per-user rule then keys on this sub-owner, not the shared
@@ -222,9 +228,20 @@ func (a *Agent) SetContentOpener(open func([]byte) ([]byte, error)) { a.openCont
 // (ciphertext) bytes -- exactly what the coordinator addressed -- before any
 // decryption, so a tampered blob is rejected first.
 func (a *Agent) fetchContext(ctx context.Context, req DeployRequest) ([]byte, error) {
-	blob, err := a.blobs.GetBlob(ctx, req.BuildContextDigest)
-	if err != nil {
-		return nil, err
+	var blob []byte
+	if len(req.BuildContext) > 0 {
+		// Inlined by the bridge -- no DHT fetch, so it works even if this worker's
+		// DHT connectivity over I2P is momentarily down.
+		blob = req.BuildContext
+	} else {
+		if a.blobs == nil {
+			return nil, errors.New("dcs: no build-context store on this worker")
+		}
+		var err error
+		blob, err = a.blobs.GetBlob(ctx, req.BuildContextDigest)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if got := BlobDigest(blob); got != req.BuildContextDigest {
 		return nil, fmt.Errorf("%w: got %s want %s", ErrDigestMismatch, got, req.BuildContextDigest)

@@ -209,6 +209,18 @@ func (api *bridgeAPI) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		contentKey = decoded
 	}
 
+	// Inline the (encrypted) build context so the worker need not fetch it from
+	// the DHT -- a remote worker's DHT connectivity over I2P is not guaranteed,
+	// and the context is small. The bridge already holds it (the site published
+	// it here first). The worker verifies its digest and decrypts it as usual.
+	if req.BuildContextDigest != "" {
+		if blob, berr := api.blobs.GetBlob(ctx, req.BuildContextDigest); berr == nil {
+			req.BuildContext = blob
+		} else {
+			api.logger.Printf("dcs-bridge: could not inline build context %s: %v", req.BuildContextDigest, berr)
+		}
+	}
+
 	// Re-poll of a queued deploy: go back to the exact worker holding the ticket.
 	if body.WorkerNode != "" && body.Ticket != "" {
 		worker := dcs.WorkerRecord{NodeID: body.WorkerNode, Destination: body.WorkerDestination}
