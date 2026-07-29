@@ -105,18 +105,19 @@ Open the dashboard to see what you're storing, change how much disk you donate,
 and reject anything you don't want to host. Both ports are loopback-only and
 should stay that way.
 
-Useful flags:
+**Everything is configured on the management page — there are no configuration
+flags.** Open `http://127.0.0.1:9090` and from there you can:
 
-```sh
-./syndichan-node -data-dir /mnt/bigdisk/syndichan   # put the bulk data elsewhere
-./syndichan-node -capacity-gib 200                  # donate 200 GiB
-./syndichan-node -show-credentials                  # print your S3 keys
-./syndichan-node -cache-only                        # keep only your own content
-```
+- donate more (or less) disk, and choose **where** the encrypted shards live;
+- switch to **cache-only** (keep only your own content, host nothing for peers);
+- read your **S3 credentials** (they stay in the mode-0600 config file and are
+  shown on the page rather than printed to your shell history);
+- turn the **volunteer gateway** and **Docker facilitation (DCS)** on or off;
+- set the node's **run mode** — storage, gateway-only, or probe-only.
 
-`-data-dir` is saved to the config, so you only pass it once. The S3 secret is
-not printed at startup on purpose (it would end up in your shell history and
-logs); ask for it with `-show-credentials` when you need it.
+Changes are written to the config file and most take effect the next time the
+node starts. The one and only command-line flag is `-config <path>`, which points
+at a config file other than the default location above.
 
 Back up `master.key` and `metadata.db` from your data directory. Without them
 your own uploaded files cannot be reassembled — no peer can do it for you,
@@ -180,17 +181,19 @@ answers on your LAN is never admitted.
 
 ## Run a dedicated gateway (no storage)
 
-For a VPS or spare box that should only forward HTTPS and store nothing:
+For a VPS or spare box that should only forward HTTPS and store nothing, set the
+run mode to **gateway-only** on the management page (or `"run_mode":
+"gateway-only"` in the config file), then start the node:
 
 ```sh
-./syndichan-node -gateway-only -config gateway.json -data-dir ./data
+./syndichan-node -config gateway.json
 ```
 
-`-gateway-only` starts the gateway and nothing else. No shard store, no S3, no
-dashboard, no I2P — and it asks you for none of that configuration, so a gateway
-config file contains gateway settings only. Copy
-[`gateway.example.json`](gateway.example.json) as a starting point and set at
-minimum `gateway.enabled`, your public address, and how TLS is handled.
+Gateway-only runs the gateway and nothing else: no shard store, no S3, no I2P.
+The management page still comes up (on loopback) so you can edit the gateway
+settings there. Copy [`gateway.example.json`](gateway.example.json) as a starting
+point and set at minimum `run_mode: "gateway-only"`, `gateway.enabled`, your
+public address, and how TLS is handled.
 
 It does still send the five-minute presence heartbeat, reporting zero capacity.
 That is how the operator's map knows your gateway exists and separates it from
@@ -264,8 +267,8 @@ Before a gateway is trusted, something has to prove it is genuinely reachable
 from the outside rather than just claiming to be. Two independent things can do
 that, and `gateway.external_verification` picks which you use:
 
-- **`enabled: true` (the default)** — your node asks other volunteers running
-  `-probe-only` to connect back to your public address and confirm it. Those
+- **`enabled: true` (the default)** — your node asks other volunteers running in
+  **probe-only** run mode to connect back to your public address and confirm it. Those
   volunteers' URLs go in `probe_urls`, and you need at least as many as
   `minimum_successful_probes` (3 by default), spread across at least two
   different networks. This is the stronger check, but it needs a probe fleet to
@@ -283,16 +286,13 @@ so use the second form:
 "external_verification": { "enabled": false }
 ```
 
-There is also `-probe-only`, which runs just the verification probe service —
-that is what other people would point their `probe_urls` at.
+There is also a **probe-only** run mode, which runs just the verification probe
+service — that is what other people would point their `probe_urls` at. Set it on
+the management page or with `"run_mode": "probe-only"`.
 
-Quick local controls:
-
-```sh
-./syndichan-node -gateway-status     # show the saved gateway settings
-./syndichan-node -gateway-enable     # turn gateway mode on
-./syndichan-node -gateway-disable    # turn it off
-```
+The gateway is turned on, off, and configured on the management page at
+`http://127.0.0.1:9090` (the "Volunteer gateway" panel), which writes those
+settings to the config file.
 
 ### Run it automatically on boot (Linux / systemd)
 
@@ -331,10 +331,11 @@ Type=simple
 User=EXAMPLE
 Group=EXAMPLE
 WorkingDirectory=/home/EXAMPLE/syndichan-node
+# No posture flags: run mode (gateway-only here), the data directory and
+# everything else come from the config file. Set "run_mode": "gateway-only" in
+# it, or switch it on the management page.
 ExecStart=/home/EXAMPLE/syndichan-node/bin/syndichan-node \
-    -gateway-only \
-    -config /home/EXAMPLE/syndichan-node/config/config.json \
-    -data-dir /home/EXAMPLE/syndichan-node/data
+    -config /home/EXAMPLE/syndichan-node/config/config.json
 
 # Ports 80 and 443 are privileged. This is what lets an ordinary user bind
 # them; without it the service dies instantly with "permission denied".
@@ -389,12 +390,13 @@ survives reboots and restarts itself if it ever exits.
 
 Three things people get wrong here:
 
-- **`-data-dir` is not optional.** It holds `p2p.key`, your node's permanent
-  identity. That identity determines your `gw-….syndichan.org` hostname and
-  your certificate. Omit the flag and the node falls back to the current user's
-  config directory — so running it once by hand with `sudo` and once as a
-  service creates *two different identities*, two hostnames and two
-  certificates.
+- **Keep the data directory stable.** It holds `p2p.key`, your node's permanent
+  identity, which determines your `gw-….syndichan.org` hostname and your
+  certificate. It defaults to the config file's own directory and can be moved on
+  the management page (`data_dir` in the config). What matters is that it does not
+  *change* between runs — running once by hand with `sudo` and once as a service
+  against different data directories creates *two different identities*, two
+  hostnames and two certificates.
 - **Don't run a second copy by hand while the service is up.** Only one process
   can hold ports 80 and 443; the second exits with "address already in use".
   Use `sudo systemctl stop syndichan-node` first.
@@ -425,7 +427,7 @@ automatically, with rollback if the new build fails to come up.
 
 **Non-systemd systems:** on Alpine (OpenRC) or a BSD, run the same command under
 your init's supervisor. The only requirements are that the process runs as a
-consistent user, is given the same `-data-dir` every time, and can bind ports 80
+consistent user, uses the same data directory every time, and can bind ports 80
 and 443.
 
 Full setup — TLS modes, probe quorum, serving `syndichan.org` through your box,
@@ -453,7 +455,10 @@ separate program.
 
 ### Turn it on
 
-Edit `config.json` and set at least `enabled` and `role.worker`:
+Open the **Docker facilitation (DCS)** panel on the management page
+(`http://127.0.0.1:9090`) and tick *Enable DCS* + *Run containers (worker)*, set
+the limits, and save — or edit `config.json` directly, setting at least `enabled`
+and `role.worker`:
 
 ```json
 "dcs": {
@@ -540,62 +545,33 @@ Set `"enabled": false` (or `"role": {"worker": false}`) and restart. Running
 containers are reclaimed as they hit their TTL, or immediately with a normal
 `docker stop`/`rm` — they are ordinary containers with DCS labels.
 
-### Deploy a container to the network
+### Deploying to the network
 
-The other side: as a user, run a container on *someone else's* worker and get
-back its private I2P address. This does not need a worker of your own — any node
-with I2P and the DHT can deploy. It is one command:
+Deploys happen through a **bridged website**, not a command-line flag. A person
+picks a challenge on the site (its Lab page); the site's bridge node — a normal
+node running the loopback deploy API described below — finds a worker over I2P,
+hands it the build context (a Dockerfile, or a `docker-compose` project, stored
+on the DHT), and returns the container's **private `.b32.i2p` address** to that
+one user. The images themselves are pulled from a registry; only the small build
+context rides on the DHT.
 
-```sh
-# Run a prebuilt image on a random worker:
-./syndichan-node -dcs-deploy -dcs-image nginx
+Everything the operator promised still holds:
 
-# Or ship a Dockerfile: the directory is packed, stored on the DHT as shards,
-# and built on the worker — no registry involved:
-./syndichan-node -dcs-deploy -dcs-build-context ./my-service
-
-# A deliberately-vulnerable lab box (reachable only by you):
-./syndichan-node -dcs-deploy -dcs-build-context ./attack-range -dcs-lab -dcs-port 8000
-```
-
-It opens an I2P node (the first connect takes a minute), finds workers, deploys
-to a random one, and prints:
-
-```text
-Container deployed.
-  worker:       12D3KooW…
-  container:    dcs-cli-…
-  I2P address:  <52-char>.b32.i2p
-  visibility:   PRIVATE — only you were told this address
-  auto-expires: 2026-07-30T…Z
-```
-
-Point your tools at that I2P address through your local I2P proxy. Because one
-destination carries every port, you can port-scan the box across all its ports
-on that single address. It spins down on its own at the expiry time — you do not
-have to stay online.
-
-**If the network is at capacity** you are queued instead, and the command shows
-your place in line and a countdown, retrying automatically until a slot frees:
-
-```text
-Queued on 12D3KooW… — position 2, about 3h12m0s until a slot frees.
-```
-
-You may run **one instance at a time**. Different people can run the same image
-as their own separate instances simultaneously.
-
-### Turn it off (deploy side)
-
-There is nothing to turn off — `-dcs-deploy` exits after printing the address,
-and the container reclaims itself at its TTL.
+- a container gets its own I2P destination and nothing else — one address carries
+  every port, so the deployer can port-scan the box across all of them;
+- a lab box's address is disclosed to its deployer alone;
+- each user may run **one instance at a time**; different users may run the same
+  image as separate instances;
+- when the network is at capacity the user is **queued**, with a live place in
+  line and a countdown, until a slot frees;
+- every instance **auto-spins-down at its TTL** whether or not anyone stays online.
 
 ### Bridge a website to the container service
 
-`-dcs-deploy` is one person, one container, one command. A **website** has
-thousands of users and cannot ask each of them to run a node. The **bridge** is
-how a site deploys on its users' behalf through a single node: it runs a normal
-storage node with a small loopback HTTP API, and the site's backend calls that
+A **website** has thousands of users and cannot ask each of them to run a node.
+The **bridge** is how a site deploys on its users' behalf through a single node:
+it runs a normal storage node with a small loopback HTTP API, and the site's
+backend calls that
 API to publish challenge images, spin instances up, poll the queue, and spin
 them down.
 
@@ -675,9 +651,10 @@ failure recovery, the security model, and the roadmap — is in [`DCS.md`](DCS.m
 - **The gateway works locally but never gets verified** — it's a reachability
   problem, not a config problem. Work through the ports section above and test
   from another network.
-- **`-gateway-only` won't start** — it needs `gateway.enabled` or
-  `gateway.probe_enabled` set to true in the config file you pointed it at.
-  The startup log prints the role and the exact config path it loaded.
+- **Gateway-only mode won't start** — it needs `gateway.enabled` or
+  `gateway.probe_enabled` set to true in the config file (the "Volunteer gateway"
+  panel on the management page). The startup log prints the role and the exact
+  config path it loaded.
 - **`gateway.external_verification needs 3 probe_urls`** — you have no probe
   fleet to verify against. Set `external_verification.enabled` to false and let
   the controller do the reachability check; see the section above.
@@ -688,8 +665,9 @@ failure recovery, the security model, and the roadmap — is in [`DCS.md`](DCS.m
   as a storage node, but the container worker needs Docker. Check the daemon is
   running and your user can reach `docker_endpoint` (`docker ps` should work).
 - **`dcs: worker role requires full storage mode; not started`** — a container
-  worker can't run in `-gateway-only`/`-probe-only`; it needs the storage node's
-  I2P, DHT and shard store. Run it as a normal storage node with the `dcs` block.
+  worker can't run in gateway-only/probe-only run mode; it needs the storage
+  node's I2P, DHT and shard store. Set the run mode back to storage and enable the
+  `dcs` panel.
 
 ## More detail
 

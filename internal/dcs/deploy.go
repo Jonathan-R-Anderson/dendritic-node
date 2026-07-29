@@ -29,10 +29,16 @@ type DeployRequest struct {
 	// Ticket carries a queue position across Launch retries. Empty on the first
 	// attempt; set to the previous reply's Ticket when polling a queued slot.
 	Ticket string `json:"ticket,omitempty"`
-	// BuildContextDigest references a Dockerfile+files blob in the shard store
-	// (StoreBuildContext). When set, the worker fetches and builds it rather
-	// than pulling a prebuilt image.
+	// BuildContextDigest references a build-context blob in the shard store. Its
+	// meaning depends on Kind: for "dockerfile" it is a Dockerfile+files context
+	// the worker builds; for "compose" it is a docker-compose project the worker
+	// runs, pulling the images from the registry.
 	BuildContextDigest string `json:"build_context_digest,omitempty"`
+	// Kind selects how the build context becomes a running service:
+	// "" or "dockerfile" -> build a Dockerfile and run one container;
+	// "compose"          -> `docker compose up` the project (vulhub-style),
+	//                        images pulled from the registry.
+	Kind string `json:"kind,omitempty"`
 	// OnBehalfOf lets a TRUSTED broker (a website's bridge node, in the worker's
 	// broker allowlist) deploy for many users through one node identity: the
 	// one-instance-per-user rule then keys on this sub-owner, not the shared
@@ -170,19 +176,40 @@ type Agent struct {
 	network     NetworkAttacher      // optional; nil means "address allocated but not bridged"
 	builder     Builder              // optional; required only for build-context deploys
 	blobs       BlobStore            // optional; the DHT-backed build-context store
+	compose     ComposeRunner        // optional; required only for kind=compose deploys
 	admission   *AdmissionController // optional; nil means unlimited (no cap, no queue)
 	instanceTTL time.Duration        // general auto-spin-down; 0 -> DefaultInstanceTTL
 	now         func() time.Time
 
-	mu       sync.Mutex
-	attached map[string]NetworkHandle // containerID → its network, for teardown
-	owners   map[string]string        // containerID → the envelope owner (for destroy auth)
+	mu        sync.Mutex
+	attached  map[string]NetworkHandle // containerID → its network, for teardown
+	owners    map[string]string        // containerID → the envelope owner (for destroy auth)
+	composeOf map[string]string        // primary containerID → compose project id, for teardown
 }
+
+// ComposeRunner runs a docker-compose project (a vulhub-style challenge). Unlike
+// the single-container path, the images are PULLED FROM THE REGISTRY at
+// `compose up`; only the small project text came off the DHT. It returns the id
+// of the PRIMARY service's container so the agent can give that container a
+// private I2P destination and attach it exactly like any other container.
+//
+// An implementation MUST run the project WITHOUT publishing ports to the host
+// (a lab must never be reachable on the worker's clearnet) -- the only path in
+// is the I2P destination the agent attaches to the primary container.
+type ComposeRunner interface {
+	Up(ctx context.Context, project string, files []BuildFile, primaryPort int) (primaryContainerID string, err error)
+	Down(ctx context.Context, project string) error
+}
+
+// SetComposeRunner wires docker-compose execution. Without it, a kind=compose
+// deploy is refused with a clear message rather than silently mis-run.
+func (a *Agent) SetComposeRunner(c ComposeRunner) { a.compose = c }
 
 func NewAgent(cfg AgentConfig, runtime Runtime, alloc Allocator, audit AuditSink) *Agent {
 	return &Agent{
 		cfg: cfg, runtime: runtime, alloc: alloc, audit: audit,
-		now: time.Now, attached: map[string]NetworkHandle{}, owners: map[string]string{},
+		now: time.Now, attached: map[string]NetworkHandle{},
+		owners: map[string]string{}, composeOf: map[string]string{},
 	}
 }
 
@@ -294,69 +321,84 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		}
 	}
 
-	// Build from a DHT-sharded build context when one is referenced: fetch the
-	// Dockerfile+files blob by digest, verify it, and build the image locally.
-	// This is the registry-free path -- the worker reproduces the image from
-	// source rather than pulling prebuilt layers.
-	image := req.Image
-	if req.BuildContextDigest != "" {
-		if a.builder == nil || a.blobs == nil {
-			releaseSlot()
-			a.refuse(owner, req.DeploymentID, "build", "this worker cannot build from a context")
-			return DeployReply{}, errors.New("dcs: build-context deploys are not enabled on this worker")
-		}
-		files, ferr := FetchBuildContext(ctx, a.blobs, req.BuildContextDigest)
-		if ferr != nil {
-			releaseSlot()
-			a.refuse(owner, req.DeploymentID, "fetch_build_context", ferr.Error())
-			return DeployReply{}, fmt.Errorf("fetch build context: %w", ferr)
-		}
-		blob, perr := PackBuildContext(files) // re-pack the VALIDATED files only
-		if perr != nil {
-			releaseSlot()
-			a.refuse(owner, req.DeploymentID, "pack_build_context", perr.Error())
-			return DeployReply{}, perr
-		}
-		image = "dcs-build-" + shortDigest(req.BuildContextDigest)
-		if berr := a.builder.BuildImage(ctx, blob, image); berr != nil {
-			releaseSlot()
-			a.refuse(owner, req.DeploymentID, "build", berr.Error())
-			return DeployReply{}, fmt.Errorf("build image: %w", berr)
-		}
-	}
-
 	// A lab container's destination is private and never leaves the agent
 	// except to this owner; a normal one may later be advertised.
 	private := req.Lab
 
-	containerID, err := a.runtime.Create(ctx, ContainerSpec{
-		Name:  "dcs-" + req.DeploymentID,
-		Image: image, Cmd: req.Cmd, Env: req.Env,
-		MemoryLimitBytes: req.MemoryLimitBytes, NanoCPUs: req.NanoCPUs,
-		Lab: req.Lab,
-	})
-	if err != nil {
-		releaseSlot()
-		a.refuse(owner, req.DeploymentID, "create", err.Error())
-		return DeployReply{}, fmt.Errorf("create container: %w", err)
-	}
+	// Turn the request into a RUNNING container with an allocated destination.
+	// Two shapes: a compose project (`compose up`, images from the registry), or
+	// a single container (build/pull -> create -> allocate-before-start -> start).
+	var containerID string
+	var address *ContainerAddress
+	if req.Kind == "compose" {
+		cid, addr, cerr := a.launchCompose(ctx, owner, req, private)
+		if cerr != nil {
+			releaseSlot()
+			return DeployReply{}, cerr // launchCompose audited the refusal
+		}
+		containerID, address = cid, addr
+	} else {
+		// Build from a DHT-sharded build context when one is referenced: fetch the
+		// Dockerfile+files blob by digest, verify it, and build the image locally.
+		// This is the registry-free path -- the worker reproduces the image from
+		// source rather than pulling prebuilt layers.
+		image := req.Image
+		if req.BuildContextDigest != "" {
+			if a.builder == nil || a.blobs == nil {
+				releaseSlot()
+				a.refuse(owner, req.DeploymentID, "build", "this worker cannot build from a context")
+				return DeployReply{}, errors.New("dcs: build-context deploys are not enabled on this worker")
+			}
+			files, ferr := FetchBuildContext(ctx, a.blobs, req.BuildContextDigest)
+			if ferr != nil {
+				releaseSlot()
+				a.refuse(owner, req.DeploymentID, "fetch_build_context", ferr.Error())
+				return DeployReply{}, fmt.Errorf("fetch build context: %w", ferr)
+			}
+			blob, perr := PackBuildContext(files) // re-pack the VALIDATED files only
+			if perr != nil {
+				releaseSlot()
+				a.refuse(owner, req.DeploymentID, "pack_build_context", perr.Error())
+				return DeployReply{}, perr
+			}
+			image = "dcs-build-" + shortDigest(req.BuildContextDigest)
+			if berr := a.builder.BuildImage(ctx, blob, image); berr != nil {
+				releaseSlot()
+				a.refuse(owner, req.DeploymentID, "build", berr.Error())
+				return DeployReply{}, fmt.Errorf("build image: %w", berr)
+			}
+		}
 
-	// Address BEFORE start: the container must not run for even an instant
-	// without its network identity in place.
-	address, err := a.alloc.Allocate(ctx, containerID, private)
-	if err != nil {
-		releaseSlot()
-		_ = a.runtime.Remove(ctx, containerID, true)
-		a.refuse(owner, req.DeploymentID, "allocate_address", err.Error())
-		return DeployReply{}, fmt.Errorf("allocate destination: %w", err)
-	}
+		cid, err := a.runtime.Create(ctx, ContainerSpec{
+			Name:  "dcs-" + req.DeploymentID,
+			Image: image, Cmd: req.Cmd, Env: req.Env,
+			MemoryLimitBytes: req.MemoryLimitBytes, NanoCPUs: req.NanoCPUs,
+			Lab: req.Lab,
+		})
+		if err != nil {
+			releaseSlot()
+			a.refuse(owner, req.DeploymentID, "create", err.Error())
+			return DeployReply{}, fmt.Errorf("create container: %w", err)
+		}
 
-	if err := a.runtime.Start(ctx, containerID); err != nil {
-		releaseSlot()
-		_ = a.alloc.Release(containerID, true)
-		_ = a.runtime.Remove(ctx, containerID, true)
-		a.refuse(owner, req.DeploymentID, "start", err.Error())
-		return DeployReply{}, fmt.Errorf("start container: %w", err)
+		// Address BEFORE start: the container must not run for even an instant
+		// without its network identity in place.
+		addr, err := a.alloc.Allocate(ctx, cid, private)
+		if err != nil {
+			releaseSlot()
+			_ = a.runtime.Remove(ctx, cid, true)
+			a.refuse(owner, req.DeploymentID, "allocate_address", err.Error())
+			return DeployReply{}, fmt.Errorf("allocate destination: %w", err)
+		}
+
+		if err := a.runtime.Start(ctx, cid); err != nil {
+			releaseSlot()
+			_ = a.alloc.Release(cid, true)
+			_ = a.runtime.Remove(ctx, cid, true)
+			a.refuse(owner, req.DeploymentID, "start", err.Error())
+			return DeployReply{}, fmt.Errorf("start container: %w", err)
+		}
+		containerID, address = cid, addr
 	}
 
 	// Attach the container's destination to its network namespace so the
@@ -373,7 +415,7 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		handle, attachErr := a.network.Attach(ctx, containerID, primary)
 		if attachErr != nil {
 			_ = a.alloc.Release(containerID, true)
-			_ = a.runtime.Remove(ctx, containerID, true)
+			a.teardownRuntime(ctx, containerID)
 			a.refuse(owner, req.DeploymentID, "attach_network", attachErr.Error())
 			return DeployReply{}, fmt.Errorf("attach network: %w", attachErr)
 		}
@@ -520,11 +562,23 @@ func (a *Agent) Destroy(ctx context.Context, containerID string) error {
 	}
 	a.mu.Lock()
 	delete(a.owners, containerID)
+	project, isCompose := a.composeOf[containerID]
+	if isCompose {
+		delete(a.composeOf, containerID)
+	}
 	a.mu.Unlock()
 	// purge=true: a destroyed container's address must not survive it, or a
 	// later container could inherit an address someone was told about.
 	_ = a.alloc.Release(containerID, true)
-	if err := a.runtime.Remove(ctx, containerID, true); err != nil {
+	if isCompose {
+		// The whole compose project comes down, not just the primary container --
+		// its backing services (a DB, a cache) must not outlive the challenge.
+		if a.compose != nil {
+			if err := a.compose.Down(ctx, project); err != nil {
+				return fmt.Errorf("compose down: %w", err)
+			}
+		}
+	} else if err := a.runtime.Remove(ctx, containerID, true); err != nil {
 		return fmt.Errorf("remove container: %w", err)
 	}
 	a.audit.Record(AuditEntry{
@@ -532,6 +586,83 @@ func (a *Agent) Destroy(ctx context.Context, containerID string) error {
 		ContainerID: containerID,
 	})
 	return nil
+}
+
+// teardownRuntime removes a running container mid-launch, routing a compose
+// project to `compose down` and a single container to runtime.Remove.
+func (a *Agent) teardownRuntime(ctx context.Context, containerID string) {
+	a.mu.Lock()
+	project, isCompose := a.composeOf[containerID]
+	if isCompose {
+		delete(a.composeOf, containerID)
+	}
+	a.mu.Unlock()
+	if isCompose {
+		if a.compose != nil {
+			_ = a.compose.Down(ctx, project)
+		}
+		return
+	}
+	_ = a.runtime.Remove(ctx, containerID, true)
+}
+
+// launchCompose fetches a compose project from the shard store, `compose up`s it
+// (images pulled from the registry), and allocates a private destination for the
+// PRIMARY service's container. On any failure it audits the refusal and tears
+// down whatever came up, so a partial project never lingers.
+func (a *Agent) launchCompose(ctx context.Context, owner string, req DeployRequest, private bool) (string, *ContainerAddress, error) {
+	if a.compose == nil || a.blobs == nil {
+		a.refuse(owner, req.DeploymentID, "compose", "this worker does not run compose projects")
+		return "", nil, errors.New("dcs: compose deploys are not enabled on this worker")
+	}
+	if req.BuildContextDigest == "" {
+		a.refuse(owner, req.DeploymentID, "compose", "compose deploy without a build context")
+		return "", nil, ErrBadRequest
+	}
+	files, ferr := FetchComposeContext(ctx, a.blobs, req.BuildContextDigest)
+	if ferr != nil {
+		a.refuse(owner, req.DeploymentID, "fetch_compose_context", ferr.Error())
+		return "", nil, fmt.Errorf("fetch compose context: %w", ferr)
+	}
+	primary := req.PrimaryPort
+	if primary <= 0 {
+		primary = DefaultLabPort
+	}
+	project := composeProjectName(req.DeploymentID)
+	containerID, uerr := a.compose.Up(ctx, project, files, primary)
+	if uerr != nil {
+		_ = a.compose.Down(ctx, project) // clean any partial bring-up
+		a.refuse(owner, req.DeploymentID, "compose_up", uerr.Error())
+		return "", nil, fmt.Errorf("compose up: %w", uerr)
+	}
+	address, aerr := a.alloc.Allocate(ctx, containerID, private)
+	if aerr != nil {
+		_ = a.compose.Down(ctx, project)
+		a.refuse(owner, req.DeploymentID, "allocate_address", aerr.Error())
+		return "", nil, fmt.Errorf("allocate destination: %w", aerr)
+	}
+	a.mu.Lock()
+	a.composeOf[containerID] = project
+	a.mu.Unlock()
+	return containerID, address, nil
+}
+
+// composeProjectName derives a docker-compose project name (lowercase, safe
+// charset) from a deployment id.
+func composeProjectName(deploymentID string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(deploymentID) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	name := strings.Trim(b.String(), "-_")
+	if name == "" {
+		name = "dcs"
+	}
+	return "dcs-" + name
 }
 
 // ---------------------------------------------------------------------------

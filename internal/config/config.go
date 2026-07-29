@@ -79,6 +79,25 @@ type Config struct {
 	TLSKey        string        `json:"tls_key,omitempty"`
 	Gateway       GatewayConfig `json:"gateway"`
 	DCS           DCSConfig     `json:"dcs"`
+	// RunMode selects what this node runs, IN THE CONFIG rather than on the
+	// command line: "storage" (default full node), "gateway-only", or
+	// "probe-only". It is edited on the management page, so the node launches
+	// with no flags -- only the config file decides its posture. An empty value
+	// means "storage" for backward compatibility with older config files.
+	RunMode string `json:"run_mode,omitempty"`
+}
+
+// ResolvedRole maps the config's RunMode to a runtime Role. An unset or unknown
+// value is the full storage node -- the safe default a fresh install starts as.
+func (c Config) ResolvedRole() Role {
+	switch c.RunMode {
+	case string(RoleGatewayOnly), "gateway":
+		return RoleGatewayOnly
+	case string(RoleProbeOnly), "probe":
+		return RoleProbeOnly
+	default:
+		return RoleStorage
+	}
 }
 
 // DCSConfig is the optional Distributed Container Service. Every default is the
@@ -245,6 +264,7 @@ func Default() (Config, error) {
 	}
 	return Config{
 		DataDir:  dir,
+		RunMode:  "storage",
 		S3Listen: "127.0.0.1:9000",
 		UIListen: "127.0.0.1:9090",
 		// P2PListen is retained only so old configuration files still parse. The

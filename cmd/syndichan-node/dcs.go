@@ -78,6 +78,20 @@ func startDCSWorker(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 		docker, dcs.NewNamespaceDialer,
 		func(format string, args ...any) { logger.Printf(format, args...) },
 	))
+	// Compose challenges (vulhub-style): run `docker compose up` for a project
+	// whose files came off the DHT, pulling the images from the registry. Needs
+	// the Compose CLI on the host; without it, compose deploys are refused with a
+	// clear message rather than mis-run.
+	composeRunner, cerr := newDockerComposeRunner(
+		filepath.Join(cfg.DataDir, "dcs", "compose"), cfg.DCS.DockerEndpoint,
+		func(format string, args ...any) { logger.Printf(format, args...) },
+	)
+	if cerr != nil {
+		logger.Printf("dcs: docker compose not available; compose challenges will be refused: %v", cerr)
+	} else {
+		agent.SetComposeRunner(composeRunner)
+		logger.Printf("dcs: docker compose runner ready")
+	}
 
 	// Register the DCS record validator and the RPC handler on the node's host.
 	if err := node.ConfigureDCSRecords(dcs.WorkerDHTValidator{}); err != nil {

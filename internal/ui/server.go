@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 )
 
@@ -42,6 +43,9 @@ type Server struct {
 	template *template.Template
 	dataDir  string
 	saveDir  func(string) error
+	// Config access (wired by main). Without it the config panels are absent.
+	cfgSnapshot func() config.Config
+	cfgApply    func(func(*config.Config) error) error
 }
 
 // SetStoragePaths tells the dashboard where shards live and how to persist a
@@ -90,6 +94,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.setCapacity(w, r)
 	case r.URL.Path == "/storage-dir" && r.Method == http.MethodPost:
 		s.setStorageDir(w, r)
+	case r.URL.Path == "/config/mode" && r.Method == http.MethodPost:
+		s.setRunMode(w, r)
+	case r.URL.Path == "/config/gateway" && r.Method == http.MethodPost:
+		s.setGateway(w, r)
+	case r.URL.Path == "/config/storage" && r.Method == http.MethodPost:
+		s.setStorageSettings(w, r)
+	case r.URL.Path == "/config/dcs" && r.Method == http.MethodPost:
+		s.setDCS(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -110,22 +122,60 @@ func validDashboardHost(value string) bool {
 
 func (s *Server) dashboard(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = s.template.Execute(w, map[string]string{"CSRF": s.csrf})
+	data := map[string]any{"CSRF": s.csrf, "HasConfig": s.hasConfig()}
+	if s.hasConfig() {
+		c := s.cfgSnapshot()
+		data["Cfg"] = c
+		data["Mode"] = c.ResolvedRole()
+		data["RAMGiB"] = strconv.FormatFloat(float64(c.DCS.Limits.RAMBytes)/(1<<30), 'f', -1, 64)
+		data["Brokers"] = strings.Join(c.DCS.Policy.TrustedBrokers, "\n")
+	}
+	_ = s.template.Execute(w, data)
 }
 
 func (s *Server) status(w http.ResponseWriter) {
-	used, _ := s.store.UsedBytes()
-	writeJSON(w, map[string]any{
-		"node_id": s.node.ID(), "addresses": s.node.Addresses(),
-		"used_bytes": used, "capacity_bytes": s.store.Capacity(),
-		"peers": s.node.PeerCount(), "i2p_address": i2pAddress(s.node.Addresses()),
-		"data_dir": s.dataDir,
-	})
+	// The store is absent in gateway-only / probe-only mode; report node-only
+	// stats then, so the management page still works for configuring those roles.
+	out := map[string]any{
+		"node_id": nodeID(s.node), "addresses": nodeAddrs(s.node),
+		"peers": nodePeers(s.node), "i2p_address": i2pAddress(nodeAddrs(s.node)),
+		"data_dir": s.dataDir, "has_store": s.store != nil,
+	}
+	if s.store != nil {
+		used, _ := s.store.UsedBytes()
+		out["used_bytes"] = used
+		out["capacity_bytes"] = s.store.Capacity()
+	}
+	writeJSON(w, out)
+}
+
+// The node is nil in no-storage-with-file-identity paths; keep the page alive.
+func nodeID(n NodeInfo) string {
+	if n == nil {
+		return ""
+	}
+	return n.ID()
+}
+func nodeAddrs(n NodeInfo) []string {
+	if n == nil {
+		return nil
+	}
+	return n.Addresses()
+}
+func nodePeers(n NodeInfo) int {
+	if n == nil {
+		return 0
+	}
+	return n.PeerCount()
 }
 
 func (s *Server) setCapacity(w http.ResponseWriter, r *http.Request) {
 	if subtle.ConstantTimeCompare([]byte(r.FormValue("csrf")), []byte(s.csrf)) != 1 {
 		http.Error(w, "invalid request token", http.StatusForbidden)
+		return
+	}
+	if s.store == nil {
+		http.Error(w, "no shard store in this run mode", http.StatusBadRequest)
 		return
 	}
 	gib, err := strconv.ParseFloat(r.FormValue("capacity_gib"), 64)
@@ -144,6 +194,10 @@ func (s *Server) setCapacity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) items(w http.ResponseWriter) {
+	if s.store == nil {
+		writeJSON(w, map[string]any{"items": []any{}})
+		return
+	}
 	items, err := s.store.ListStored()
 	if err != nil {
 		http.Error(w, "could not list stored data", http.StatusInternalServerError)
@@ -250,8 +304,14 @@ main{max-width:1060px;margin:auto;padding:20px}
   border-radius:6px;overflow:hidden;margin-top:8px}
 .bar span{display:block;height:100%;background:var(--sc-accent)}
 form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
-input{background:var(--sc-bg);color:var(--sc-fg);border:1px solid var(--sc-border);
+input,select,textarea{background:var(--sc-bg);color:var(--sc-fg);border:1px solid var(--sc-border);
   border-radius:5px;padding:7px 9px;font:inherit}
+textarea{width:100%;min-height:4.5rem;font-family:var(--sc-mono);font-size:.85rem}
+.cfg label{display:flex;flex-direction:column;gap:4px;font-size:.82rem;color:var(--sc-muted)}
+.cfg .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;width:100%}
+.cfg .chk{flex-direction:row;align-items:center;gap:8px;color:var(--sc-fg)}
+.cfg .chk input{width:auto}
+.eff{color:var(--sc-warn);font-size:.8rem;margin-top:6px}
 input[type=number]{width:9rem}input[name=data_dir]{flex:1;min-width:16rem;font-family:var(--sc-mono);font-size:.9rem}
 button{border:0;border-radius:5px;padding:8px 12px;cursor:pointer;font:inherit;color:#fff;
   background:var(--sc-accent-dim)}
@@ -310,6 +370,103 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
     <button type="submit">Save allocation</button>
   </form>
 </section>
+
+{{if .HasConfig}}
+<section class="panel cfg">
+  <h2>Run mode</h2>
+  <p class="muted">What this node runs. Everything below is configured here &mdash; there are no launch flags.</p>
+  <form method="post" action="/config/mode">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Mode
+      <select name="run_mode">
+        <option value="storage"{{if eq (printf "%s" .Mode) "storage"}} selected{{end}}>Storage node (full: shards, S3, I2P, dashboard)</option>
+        <option value="gateway-only"{{if eq (printf "%s" .Mode) "gateway-only"}} selected{{end}}>Gateway only (no storage/S3/I2P)</option>
+        <option value="probe-only"{{if eq (printf "%s" .Mode) "probe-only"}} selected{{end}}>Probe only (verification probe)</option>
+      </select>
+    </label>
+    <button type="submit">Save run mode</button>
+    <div class="eff">Takes effect the next time the node starts.</div>
+  </form>
+</section>
+
+<section class="panel cfg">
+  <h2>Storage &amp; S3</h2>
+  <form method="post" action="/config/storage">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <label>S3 gateway listen address
+        <input name="s3_listen" value="{{.Cfg.S3Listen}}" placeholder="127.0.0.1:9000">
+      </label>
+      <label class="chk"><input type="checkbox" name="cache_only" value="1"{{if .Cfg.CacheOnly}} checked{{end}}> Cache-only (host no other peers' shards)</label>
+    </div>
+    <div class="row">
+      <label>TLS certificate (for a non-loopback S3 listen)
+        <input name="tls_cert" value="{{.Cfg.TLSCert}}" placeholder="/path/fullchain.pem">
+      </label>
+      <label>TLS private key
+        <input name="tls_key" value="{{.Cfg.TLSKey}}" placeholder="/path/privkey.pem">
+      </label>
+    </div>
+    <button type="submit">Save storage settings</button>
+    <div class="eff">A non-loopback S3 listen requires both TLS fields. Effective next start.</div>
+  </form>
+</section>
+
+<section class="panel cfg">
+  <h2>Volunteer gateway</h2>
+  <form method="post" action="/config/gateway">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <label class="chk"><input type="checkbox" name="gateway_enabled" value="1"{{if .Cfg.Gateway.Enabled}} checked{{end}}> Run the volunteer gateway</label>
+      <label class="chk"><input type="checkbox" name="gateway_probe" value="1"{{if .Cfg.Gateway.ProbeEnabled}} checked{{end}}> Also run the verification probe</label>
+    </div>
+    <div class="row">
+      <label>Listen address <input name="gateway_listen" value="{{.Cfg.Gateway.ListenAddress}}" placeholder="0.0.0.0"></label>
+      <label>Listen port <input name="gateway_port" type="number" min="1" max="65535" value="{{.Cfg.Gateway.ListenPort}}"></label>
+    </div>
+    <div class="row">
+      <label>Public hostname <input name="gateway_hostname" value="{{.Cfg.Gateway.PublicHostname}}" placeholder="assigned by the controller for ACME"></label>
+      <label>TLS mode
+        <select name="gateway_tls_mode">
+          <option value="existing"{{if eq .Cfg.Gateway.TLS.Mode "existing"}} selected{{end}}>existing (you provide the cert)</option>
+          <option value="acme"{{if eq .Cfg.Gateway.TLS.Mode "acme"}} selected{{end}}>acme (controller-assigned hostname)</option>
+          <option value="reverse_proxy"{{if eq .Cfg.Gateway.TLS.Mode "reverse_proxy"}} selected{{end}}>reverse_proxy</option>
+        </select>
+      </label>
+    </div>
+    <label>Registration API <input name="gateway_registration" value="{{.Cfg.Gateway.RegistrationAPI}}"></label>
+    <button type="submit">Save gateway settings</button>
+    <div class="eff">Effective next start.</div>
+  </form>
+</section>
+
+<section class="panel cfg">
+  <h2>Docker facilitation (DCS)</h2>
+  <p class="muted">Run deployable containers for the network, and/or bridge a website's deploys through this node.</p>
+  <form method="post" action="/config/dcs">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <label class="chk"><input type="checkbox" name="dcs_enabled" value="1"{{if .Cfg.DCS.Enabled}} checked{{end}}> Enable DCS</label>
+      <label class="chk"><input type="checkbox" name="dcs_worker" value="1"{{if .Cfg.DCS.Role.Worker}} checked{{end}}> Run containers (worker)</label>
+      <label class="chk"><input type="checkbox" name="dcs_lab" value="1"{{if .Cfg.DCS.Role.Lab}} checked{{end}}> Accept vulnerable labs</label>
+    </div>
+    <div class="row">
+      <label>Max simultaneous containers <input name="dcs_max_containers" type="number" min="0" value="{{.Cfg.DCS.Limits.MaxContainers}}"></label>
+      <label>RAM ceiling (GiB) <input name="dcs_ram_gib" value="{{.RAMGiB}}"></label>
+      <label>Auto spin-down (seconds, 0 = 24h) <input name="dcs_max_runtime" type="number" min="0" value="{{.Cfg.DCS.Limits.MaxRuntimeSeconds}}"></label>
+    </div>
+    <div class="row">
+      <label>Docker endpoint <input name="dcs_docker_endpoint" value="{{.Cfg.DCS.DockerEndpoint}}" placeholder="unix:///var/run/docker.sock"></label>
+      <label>Website bridge API listen (loopback only; blank = off) <input name="dcs_api_listen" value="{{.Cfg.DCS.APIListen}}" placeholder="127.0.0.1:8760"></label>
+    </div>
+    <label>Trusted broker node IDs (one per line &mdash; sites that may deploy on their users' behalf)
+      <textarea name="dcs_trusted_brokers" placeholder="12D3KooW...">{{.Brokers}}</textarea>
+    </label>
+    <button type="submit">Save Docker settings</button>
+    <div class="eff">Effective next start.</div>
+  </form>
+</section>
+{{end}}
 
 <section class="panel">
   <h2>Stored shards</h2>

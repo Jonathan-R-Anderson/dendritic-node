@@ -139,6 +139,7 @@ type deployBody struct {
 	Image              string `json:"image,omitempty"`
 	BuildContextDigest string `json:"build_context_digest,omitempty"`
 	Lab                bool   `json:"lab,omitempty"`
+	Kind               string `json:"kind,omitempty"` // "" | "dockerfile" | "compose"
 	PrimaryPort        int    `json:"primary_port,omitempty"`
 	RuntimeSecs        int    `json:"runtime_secs,omitempty"`
 	OnBehalfOf         string `json:"on_behalf_of"`
@@ -181,6 +182,7 @@ func (api *bridgeAPI) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		Image:              body.Image,
 		BuildContextDigest: body.BuildContextDigest,
 		Lab:                body.Lab,
+		Kind:               body.Kind,
 		PrimaryPort:        body.PrimaryPort,
 		RuntimeSecs:        body.RuntimeSecs,
 		OnBehalfOf:         body.OnBehalfOf,

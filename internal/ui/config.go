@@ -1,0 +1,169 @@
+package ui
+
+import (
+	"crypto/subtle"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/syndichan/maniwani/storage-client/internal/config"
+)
+
+// This file makes the management page the single place a node is configured:
+// storage, the volunteer gateway, and Docker facilitation (DCS) are all edited
+// here and persisted to config.json. The node launches with no posture flags --
+// the config file, edited from this page, decides everything.
+
+// SetConfigAccess wires the dashboard to the live configuration. snapshot returns
+// a copy of the current config; apply loads the current config, runs the mutator,
+// validates for the resolved role, persists it, and updates the in-memory copy.
+// Kept off New() so existing callers/tests are unaffected.
+func (s *Server) SetConfigAccess(snapshot func() config.Config, apply func(func(*config.Config) error) error) {
+	s.cfgSnapshot = snapshot
+	s.cfgApply = apply
+}
+
+func (s *Server) hasConfig() bool { return s.cfgSnapshot != nil && s.cfgApply != nil }
+
+// checkCSRF guards every mutating handler; a mismatch is a hard 403.
+func (s *Server) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+	if subtle.ConstantTimeCompare([]byte(r.FormValue("csrf")), []byte(s.csrf)) != 1 {
+		http.Error(w, "invalid request token", http.StatusForbidden)
+		return false
+	}
+	if !s.hasConfig() {
+		http.Error(w, "configuration is not editable here", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func formBool(r *http.Request, name string) bool {
+	switch strings.ToLower(strings.TrimSpace(r.FormValue(name))) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
+func formInt(r *http.Request, name string, fallback int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(r.FormValue(name)))
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+// setRunMode changes what the node runs (storage | gateway-only | probe-only).
+// It takes effect on the next start, because switching modes opens or closes the
+// shard store, I2P and the S3 gateway -- not something to do under a live process.
+func (s *Server) setRunMode(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	mode := strings.TrimSpace(r.FormValue("run_mode"))
+	switch mode {
+	case "storage", string(config.RoleGatewayOnly), string(config.RoleProbeOnly):
+	default:
+		http.Error(w, "unknown run mode", http.StatusBadRequest)
+		return
+	}
+	if err := s.cfgApply(func(c *config.Config) error {
+		c.RunMode = mode
+		return nil
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.logger.Printf("run mode set to %q (effective next start)", mode)
+	http.Redirect(w, r, "/?saved=mode", http.StatusSeeOther)
+}
+
+// setGateway edits the volunteer-gateway configuration.
+func (s *Server) setGateway(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	err := s.cfgApply(func(c *config.Config) error {
+		c.Gateway.Enabled = formBool(r, "gateway_enabled")
+		c.Gateway.ProbeEnabled = formBool(r, "gateway_probe")
+		if v := strings.TrimSpace(r.FormValue("gateway_listen")); v != "" {
+			c.Gateway.ListenAddress = v
+		}
+		c.Gateway.ListenPort = formInt(r, "gateway_port", c.Gateway.ListenPort)
+		c.Gateway.PublicHostname = strings.TrimSpace(r.FormValue("gateway_hostname"))
+		if v := strings.TrimSpace(r.FormValue("gateway_registration")); v != "" {
+			c.Gateway.RegistrationAPI = v
+		}
+		if v := strings.TrimSpace(r.FormValue("gateway_tls_mode")); v != "" {
+			c.Gateway.TLS.Mode = v
+		}
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.logger.Printf("gateway configuration updated (effective next start)")
+	http.Redirect(w, r, "/?saved=gateway", http.StatusSeeOther)
+}
+
+// setStorageSettings edits the storage/S3 posture that used to be flags
+// (-s3-listen, -cache-only, -tls-cert/-tls-key).
+func (s *Server) setStorageSettings(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	err := s.cfgApply(func(c *config.Config) error {
+		c.CacheOnly = formBool(r, "cache_only")
+		c.S3Listen = strings.TrimSpace(r.FormValue("s3_listen"))
+		c.TLSCert = strings.TrimSpace(r.FormValue("tls_cert"))
+		c.TLSKey = strings.TrimSpace(r.FormValue("tls_key"))
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.logger.Printf("storage/S3 settings updated (effective next start)")
+	http.Redirect(w, r, "/?saved=storage", http.StatusSeeOther)
+}
+
+// setDCS edits Docker facilitation: whether this node runs containers for the
+// network, its limits, and (for a website's bridge) the loopback deploy API.
+func (s *Server) setDCS(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	err := s.cfgApply(func(c *config.Config) error {
+		c.DCS.Enabled = formBool(r, "dcs_enabled")
+		c.DCS.Role.Worker = formBool(r, "dcs_worker")
+		c.DCS.Role.Lab = formBool(r, "dcs_lab")
+		c.DCS.Limits.MaxContainers = formInt(r, "dcs_max_containers", c.DCS.Limits.MaxContainers)
+		if gib := strings.TrimSpace(r.FormValue("dcs_ram_gib")); gib != "" {
+			if f, e := strconv.ParseFloat(gib, 64); e == nil && f > 0 {
+				c.DCS.Limits.RAMBytes = int64(f * (1 << 30))
+			}
+		}
+		c.DCS.Limits.MaxRuntimeSeconds = formInt(r, "dcs_max_runtime", c.DCS.Limits.MaxRuntimeSeconds)
+		if v := strings.TrimSpace(r.FormValue("dcs_docker_endpoint")); v != "" {
+			c.DCS.DockerEndpoint = v
+		}
+		c.DCS.APIListen = strings.TrimSpace(r.FormValue("dcs_api_listen"))
+		// Trusted brokers: one node id per line.
+		var brokers []string
+		for _, line := range strings.Split(r.FormValue("dcs_trusted_brokers"), "\n") {
+			if b := strings.TrimSpace(line); b != "" {
+				brokers = append(brokers, b)
+			}
+		}
+		c.DCS.Policy.TrustedBrokers = brokers
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.logger.Printf("Docker (DCS) configuration updated (effective next start)")
+	http.Redirect(w, r, "/?saved=dcs", http.StatusSeeOther)
+}

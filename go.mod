@@ -3,6 +3,7 @@ module github.com/syndichan/maniwani/storage-client
 go 1.25.12
 
 require (
+	fyne.io/systray v1.12.2
 	github.com/aws/aws-sdk-go-v2 v1.25.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.51.4
@@ -10,16 +11,18 @@ require (
 	github.com/klauspost/reedsolomon v1.14.1
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-kad-dht v0.42.1
+	github.com/libp2p/go-libp2p-record v0.3.1
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/multiformats/go-multihash v0.2.3
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/crypto v0.54.0
+	golang.org/x/sys v0.47.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	filippo.io/bigmod v0.1.1-0.20260103110540-f8a47775ebe5 // indirect
 	filippo.io/keygen v0.0.0-20260114151900-8e2790ea4c5b // indirect
-	fyne.io/systray v1.12.2 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.1 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.3 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.6.3 // indirect
@@ -58,7 +61,6 @@ require (
 	github.com/libp2p/go-flow-metrics v0.3.0 // indirect
 	github.com/libp2p/go-libp2p-asn-util v0.4.1 // indirect
 	github.com/libp2p/go-libp2p-kbucket v0.9.0 // indirect
-	github.com/libp2p/go-libp2p-record v0.3.1 // indirect
 	github.com/libp2p/go-libp2p-routing-helpers v0.7.5 // indirect
 	github.com/libp2p/go-msgio v0.3.0 // indirect
 	github.com/libp2p/go-netroute v0.4.0 // indirect
@@ -122,7 +124,6 @@ require (
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.12.0 // indirect

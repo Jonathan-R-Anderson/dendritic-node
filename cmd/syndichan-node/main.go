@@ -7,13 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -31,242 +30,53 @@ import (
 var runTray func(context.Context, string, *log.Logger, func())
 
 func main() {
+	// The node launches with NO posture flags: gateway, storage and Docker
+	// settings all live in the config file and are edited on the management page
+	// at UIListen. The only flag is where that file lives.
 	var configFile string
-	var dataDir string
-	var showCredentials bool
-	var s3Listen string
-	var cacheOnly bool
-	var tlsCert string
-	var tlsKey string
-	var s3AccessKeyFile string
-	var s3SecretKeyFile string
-	var capacityGiB float64
-	var gatewayStatus bool
-	var gatewayEnable bool
-	var gatewayDisable bool
-	var gatewayOnly bool
-	var probeOnly bool
-	flag.StringVar(&configFile, "config", "", "path to config.json")
-	// Data location is deliberately separate from config location. Previously
-	// DataDir was always the config file's own directory, so putting shards on
-	// a big secondary drive meant relocating the config (and its keys) too.
-	// This lets the small, secret config stay in the OS config dir while the
-	// bulk shard store lives wherever there is room.
-	flag.BoolVar(&showCredentials, "show-credentials", false,
-		"print this node's local S3 endpoint and credentials, then exit")
-	flag.StringVar(&dataDir, "data-dir", "",
-		"directory for shard/object storage (default: the config file's directory)")
-	// Serving the S3 gateway off loopback is a deliberate, TLS-gated act:
-	// Validate() refuses a non-loopback S3Listen unless both cert and key are
-	// set. These flags exist so a container deployment can express that without
-	// hand-editing config.json, and they persist like -data-dir.
-	flag.BoolVar(&cacheOnly, "cache-only", false,
-		"serve only our own cached content; refuse to host other peers' shards")
-	flag.StringVar(&s3Listen, "s3-listen", "",
-		"address for the S3 gateway (non-loopback requires -tls-cert/-tls-key)")
-	flag.StringVar(&tlsCert, "tls-cert", "", "TLS certificate for a non-loopback S3 gateway")
-	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key for a non-loopback S3 gateway")
-	flag.StringVar(&s3AccessKeyFile, "s3-access-key-file", "",
-		"read the S3 access key from this file and persist it in the secure config")
-	flag.StringVar(&s3SecretKeyFile, "s3-secret-key-file", "",
-		"read the S3 secret key from this file and persist it in the secure config")
-	flag.Float64Var(&capacityGiB, "capacity-gib", 0,
-		"initial local shard allocation in GiB when the store has no saved choice")
-	flag.BoolVar(&gatewayStatus, "gateway-status", false, "show persisted gateway configuration, then exit")
-	flag.BoolVar(&gatewayEnable, "gateway-enable", false, "enable configured volunteer gateway mode")
-	flag.BoolVar(&gatewayDisable, "gateway-disable", false, "disable volunteer gateway mode")
-	flag.BoolVar(&gatewayOnly, "gateway-only", false,
-		"run gateway/probe services without storage sharing, S3, dashboard, or I2P")
-	flag.BoolVar(&probeOnly, "probe-only", false,
-		"run only a signed verification probe; no storage, I2P, S3, or dashboard")
-	var dcsDeploy bool
-	var dcsImage string
-	var dcsBuildDir string
-	var dcsLab bool
-	var dcsRuntime int
-	var dcsPrimaryPort int
-	flag.BoolVar(&dcsDeploy, "dcs-deploy", false,
-		"deploy a container to a random DCS worker over I2P, print its I2P address, then exit")
-	flag.StringVar(&dcsImage, "dcs-image", "",
-		"image reference to deploy (with -dcs-deploy); or use -dcs-build-context")
-	flag.StringVar(&dcsBuildDir, "dcs-build-context", "",
-		"directory with a Dockerfile to pack, store on the DHT, and build on the worker")
-	flag.BoolVar(&dcsLab, "dcs-lab", false,
-		"deploy as a lab (deliberately-vulnerable) workload; reachable only at its private I2P address")
-	flag.IntVar(&dcsRuntime, "dcs-runtime", 0,
-		"requested runtime in seconds before auto spin-down (0 = worker default)")
-	flag.IntVar(&dcsPrimaryPort, "dcs-port", 0,
-		"the container's primary service port (default 80)")
+	flag.StringVar(&configFile, "config", "",
+		"path to config.json (default: the OS config location)")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
 
-	// The runtime role is resolved from the command line FIRST, before the
-	// configuration is read or validated. Everything downstream -- which
-	// settings are required, which subsystems are constructed -- is derived
-	// from it, so a dedicated gateway is never asked for storage settings it
-	// will not use.
-	role, err := runtimeRole(gatewayOnly, probeOnly)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	// These four flags read or edit config.json and then return -- they never
-	// reach subsystem startup below. Holding them to a runtime role would mean
-	// a dedicated gateway could not inspect its own storage-free config file.
-	if gatewayStatus || gatewayEnable || gatewayDisable || showCredentials {
-		role = config.RoleManagement
-	}
 	path, err := config.ConfigPath(configFile)
 	if err != nil {
 		logger.Fatal(err)
 	}
-	logger.Printf("runtime role: %s (%s)", role, role.Description())
 	logger.Printf("loading configuration: %s", path)
-	cfg, created, err := config.LoadOrCreate(path, role)
+	// Load the file (creating a default one if absent), then resolve the run mode
+	// FROM the config -- storage, gateway-only or probe-only -- and validate for
+	// exactly that role. LoadOrCreate returns the parsed config even when the
+	// provisional-role validation fails, so RunMode is readable first.
+	cfg, created, err := config.LoadOrCreate(path, config.RoleStorage)
+	role := cfg.ResolvedRole()
+	if role != config.RoleStorage {
+		// The file asks for a storage-free role; hold it to that role's
+		// requirements, not storage's.
+		err = cfg.ValidateForRole(role)
+	}
 	if err != nil {
 		logger.Fatalf("configuration %s: %v", path, err)
 	}
-	logger.Printf("configuration accepted for the %s role", role)
-	if gatewayEnable && gatewayDisable {
-		logger.Fatal("-gateway-enable and -gateway-disable are mutually exclusive")
-	}
-	if gatewayEnable || gatewayDisable {
-		cfg.Gateway.Enabled = gatewayEnable
-		if err := config.Save(path, cfg, role); err != nil {
-			logger.Fatalf("persist gateway mode: %v", err)
-		}
-		fmt.Printf("Gateway mode enabled: %t\n", cfg.Gateway.Enabled)
-		return
-	}
-	if gatewayStatus {
-		fmt.Printf("Enabled: %t\nListen: %s:%d\nPublic hostname: %s\nProbe role: %t\nRegistration API: %s\n",
-			cfg.Gateway.Enabled, cfg.Gateway.ListenAddress, cfg.Gateway.ListenPort,
-			cfg.Gateway.PublicHostname, cfg.Gateway.ProbeEnabled, cfg.Gateway.RegistrationAPI)
-		return
-	}
-	// Apply the listen/TLS overrides BEFORE anything validates or binds, and
-	// persist them so a restart without the flags keeps the same posture rather
-	// than silently reverting to loopback and going unreachable.
-	if s3Listen != "" || tlsCert != "" || tlsKey != "" ||
-		s3AccessKeyFile != "" || s3SecretKeyFile != "" {
-		changed := false
-		if s3Listen != "" && cfg.S3Listen != s3Listen {
-			cfg.S3Listen = s3Listen
-			changed = true
-		}
-		if tlsCert != "" && cfg.TLSCert != tlsCert {
-			cfg.TLSCert = tlsCert
-			changed = true
-		}
-		if tlsKey != "" && cfg.TLSKey != tlsKey {
-			cfg.TLSKey = tlsKey
-			changed = true
-		}
-		if s3AccessKeyFile != "" {
-			value, err := readSecretFile(s3AccessKeyFile)
-			if err != nil {
-				logger.Fatalf("-s3-access-key-file: %v", err)
-			}
-			if cfg.AccessKey != value {
-				cfg.AccessKey = value
-				changed = true
-			}
-		}
-		if s3SecretKeyFile != "" {
-			value, err := readSecretFile(s3SecretKeyFile)
-			if err != nil {
-				logger.Fatalf("-s3-secret-key-file: %v", err)
-			}
-			if cfg.SecretKey != value {
-				cfg.SecretKey = value
-				changed = true
-			}
-		}
-		if changed {
-			if err := cfg.ValidateForRole(role); err != nil {
-				logger.Fatalf("listen/TLS flags: %v", err)
-			}
-			if err := config.Save(path, cfg, role); err != nil {
-				logger.Fatalf("persist listen/TLS flags: %v", err)
-			}
-			fmt.Fprintf(os.Stderr, "S3 gateway configured on %s\n", cfg.S3Listen)
-		}
-	}
-
-	if dataDir != "" {
-		resolved, err := filepath.Abs(dataDir)
-		if err != nil {
-			logger.Fatalf("-data-dir: %v", err)
-		}
-		// 0700: the store holds encrypted shards and local object manifests.
-		if err := os.MkdirAll(resolved, 0700); err != nil {
-			logger.Fatalf("-data-dir %s: %v", resolved, err)
-		}
-		if cfg.DataDir != resolved {
-			cfg.DataDir = resolved
-			// Persist it so restarts (and the systemd/LaunchAgent/Task
-			// Scheduler entries in the README) do not need the flag repeated,
-			// and so a forgotten flag cannot silently start a second, empty
-			// store in the default location.
-			if err := config.Save(path, cfg, role); err != nil {
-				logger.Fatalf("persist -data-dir: %v", err)
-			}
-			fmt.Fprintf(os.Stderr, "Storage directory set to %s\n", resolved)
-		}
-	}
-	if capacityGiB != 0 {
-		if math.IsNaN(capacityGiB) || math.IsInf(capacityGiB, 0) || capacityGiB <= 0 {
-			logger.Fatal("-capacity-gib must be a positive finite number")
-		}
-		cfg.CapacityBytes = int64(math.Round(capacityGiB * (1 << 30)))
-		if err := cfg.ValidateForRole(role); err != nil {
-			logger.Fatalf("-capacity-gib: %v", err)
-		}
-	}
-	// -dcs-deploy is a one-shot client: it opens an I2P node, finds a worker,
-	// deploys, prints the container's I2P address (or a queue countdown), then
-	// exits. The container's 24h TTL means fire-and-forget is safe -- the worker
-	// reclaims it whether or not the deployer stays online.
-	if dcsDeploy {
-		runDCSDeploy(cfg, dcsDeployOptions{
-			image: dcsImage, buildDir: dcsBuildDir, lab: dcsLab,
-			runtimeSecs: dcsRuntime, primaryPort: dcsPrimaryPort,
-		}, logger)
-		return
-	}
+	logger.Printf("runtime role: %s (%s)", role, role.Description())
+	logger.Printf("configure gateway, storage and Docker at the management page: http://%s/", cfg.UIListen)
 
 	noStorage := !role.NeedsStorage()
-	if showCredentials {
-		// Deliberate, explicit retrieval. The operator owns this machine and
-		// this mode-0600 file, so this reveals nothing they cannot already
-		// read -- it just saves them grepping JSON. It is opt-in so the secret
-		// never lands somewhere it was not asked for.
-		fmt.Printf("S3 endpoint:   %s\n", cfg.S3Listen)
-		fmt.Printf("S3 access key: %s\n", cfg.AccessKey)
-		fmt.Printf("S3 secret key: %s\n", cfg.SecretKey)
-		return
-	}
 	if created {
-		// Deliberately NOT printing the secret key.
-		//
-		// These credentials authenticate the LOOPBACK S3 gateway only. They are
-		// never sent to the coordinator, never appear in a heartbeat or lease,
-		// and the server does not need them -- peers exchange shards over I2P
-		// under coordinator-signed leases, not S3.
-		//
-		// Echoing a secret to stderr puts it in shell scrollback, the systemd
-		// journal, screen shares and screenshots -- exposure well beyond the
-		// 0600 file it already lives in, for no benefit. Point at the file
-		// instead, and let the operator ask for it explicitly.
+		// The credentials authenticate the LOOPBACK S3 gateway only; they never
+		// leave this machine. The secret stays in the mode-0600 file and is shown
+		// on the management page, not echoed into shell scrollback or journals.
 		fmt.Fprintf(os.Stderr, "Created secure configuration: %s\n", path)
 		fmt.Fprintf(os.Stderr, "S3 access key: %s\n", cfg.AccessKey)
-		fmt.Fprintln(os.Stderr, "The secret key is in that mode-0600 file; it is not printed here.")
-		fmt.Fprintln(os.Stderr, "Retrieve it deliberately with:  syndichan-node -show-credentials")
+		fmt.Fprintln(os.Stderr, "The secret key is in that mode-0600 file; view it on the management page.")
 	}
 
+	// Guards cfg against concurrent edits from the management page's handlers.
+	var cfgMu sync.Mutex
 	var storageNode *store.Store
 	if noStorage {
-		logger.Printf("storage subsystems skipped: shard store, S3, dashboard, I2P")
+		logger.Printf("storage subsystems skipped: shard store, S3, I2P (management page stays up)")
 	}
 	if !noStorage {
 		logger.Printf("opening encrypted shard store: %s", filepath.Join(cfg.DataDir, "storage"))
@@ -372,7 +182,7 @@ func main() {
 			logger.Printf("controller reserved %s for ACME", reservation.Hostname)
 		}
 	}
-	if !noStorage && (cacheOnly || cfg.CacheOnly) {
+	if !noStorage && cfg.CacheOnly {
 		// Contribute no storage to the network: this node keeps only what it
 		// caches of its own content, so its disk grows with the site rather
 		// than with the number of peers.
@@ -402,13 +212,43 @@ func main() {
 			WriteTimeout: 10 * time.Minute, IdleTimeout: 90 * time.Second,
 			MaxHeaderBytes: 64 << 10,
 		}
-		uiServer = &http.Server{
-			Addr: cfg.UIListen, Handler: ui.New(storageNode, node, logger),
-			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
-			WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second,
-			MaxHeaderBytes: 32 << 10,
-		}
 	}
+	// The management page runs in EVERY mode: it is where gateway, storage and
+	// Docker settings are edited, and a fresh install starts as storage but can be
+	// switched to gateway-only/probe-only right here. NodeInfo is nil for a
+	// storage-free role (no p2p node); the page degrades to node-less stats and
+	// still edits the config.
+	var nodeInfo ui.NodeInfo
+	if node != nil {
+		nodeInfo = node
+	}
+	uiServer = &http.Server{
+		Addr: cfg.UIListen, Handler: ui.New(storageNode, nodeInfo, logger),
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+		WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second,
+		MaxHeaderBytes: 32 << 10,
+	}
+	uiServer.Handler.(*ui.Server).SetConfigAccess(
+		func() config.Config { cfgMu.Lock(); defer cfgMu.Unlock(); return cfg },
+		func(mutate func(*config.Config) error) error {
+			cfgMu.Lock()
+			defer cfgMu.Unlock()
+			next := cfg
+			if err := mutate(&next); err != nil {
+				return err
+			}
+			// Validate for the role the config now asks for (a run-mode change
+			// switches which requirements apply), then persist.
+			if err := next.ValidateForRole(next.ResolvedRole()); err != nil {
+				return err
+			}
+			if err := config.Save(path, next, role); err != nil {
+				return err
+			}
+			cfg = next
+			return nil
+		},
+	)
 	var gatewayServer *http.Server
 	var gatewayACMEHTTPServer *http.Server
 	var gatewayListener net.Listener
@@ -645,15 +485,22 @@ func main() {
 		uiServer.Handler.(*ui.Server).SetStoragePaths(cfg.DataDir, func(target string) error {
 			// Persist only; the store is open and moving it live would risk
 			// corrupting it. Takes effect on the next start (see ui.setStorageDir).
+			cfgMu.Lock()
+			defer cfgMu.Unlock()
 			next := cfg
 			next.DataDir = target
-			return config.Save(path, next, role)
+			if err := config.Save(path, next, role); err != nil {
+				return err
+			}
+			cfg = next
+			return nil
 		})
 		logger.Printf("starting S3 gateway on %s", cfg.S3Listen)
 		go serve(s3Server, cfg, logger, "S3 gateway")
-		logger.Printf("starting storage dashboard on %s", cfg.UIListen)
-		go serve(uiServer, cfg, logger, "dashboard")
 	}
+	// The management page starts in every mode.
+	logger.Printf("starting management page on http://%s/", cfg.UIListen)
+	go serve(uiServer, cfg, logger, "management page")
 	// Distributed Container Service. Off unless dcs.enabled + role.worker; a
 	// no-op otherwise, and non-fatal if Docker is unreachable. Needs the full
 	// storage node (host, DHT, I2P, store), so it is wired here in that path.
@@ -710,34 +557,6 @@ func main() {
 		_ = uiServer.Shutdown(shutdownCtx)
 	}
 	logger.Printf("shutdown complete")
-}
-
-// runtimeRole maps the mutually exclusive role flags onto a config.Role. It
-// touches no configuration, so the role is known before the config file is
-// even opened.
-func runtimeRole(gatewayOnly, probeOnly bool) (config.Role, error) {
-	switch {
-	case gatewayOnly && probeOnly:
-		return "", errors.New("-gateway-only and -probe-only are mutually exclusive")
-	case gatewayOnly:
-		return config.RoleGatewayOnly, nil
-	case probeOnly:
-		return config.RoleProbeOnly, nil
-	default:
-		return config.RoleStorage, nil
-	}
-}
-
-func readSecretFile(path string) (string, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	value := strings.TrimSpace(string(raw))
-	if value == "" {
-		return "", fmt.Errorf("%s is empty", path)
-	}
-	return value, nil
 }
 
 func serve(server *http.Server, cfg config.Config, logger *log.Logger, label string) {

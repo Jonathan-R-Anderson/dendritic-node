@@ -120,49 +120,100 @@ func PackBuildContext(files []BuildFile) ([]byte, error) {
 // safety on the way OUT -- because the blob may have arrived from an untrusted
 // peer, and a malicious archive is the classic way to escape a build directory.
 func UnpackBuildContext(blob []byte) ([]BuildFile, error) {
-	gz, err := gzip.NewReader(bytes.NewReader(blob))
+	files, roots, err := unpackContextFiles(blob)
 	if err != nil {
 		return nil, err
+	}
+	if !roots["Dockerfile"] {
+		return nil, ErrNoDockerfile
+	}
+	return files, nil
+}
+
+// ComposeFileNames are the compose project filenames a compose context may use,
+// matching the site's importer (services/lab_registry.COMPOSE_FILENAMES).
+var ComposeFileNames = []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+
+// ErrNoComposeFile is returned when a compose context has no compose file at its
+// root.
+var ErrNoComposeFile = errors.New("dcs: build context has no docker-compose file at its root")
+
+// UnpackComposeContext unpacks a docker-compose project (vulhub-style). It runs
+// the same safety checks as UnpackBuildContext -- regular files only, safe
+// relative paths, size bound -- but requires a compose file at the root rather
+// than a Dockerfile. The IMAGES are not here: the worker pulls them from the
+// registry at `compose up`; only the small project text rides on the DHT.
+func UnpackComposeContext(blob []byte) ([]BuildFile, error) {
+	files, roots, err := unpackContextFiles(blob)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range ComposeFileNames {
+		if roots[name] {
+			return files, nil
+		}
+	}
+	return nil, ErrNoComposeFile
+}
+
+// unpackContextFiles is the shared, safety-checked tar.gz reader. It returns the
+// files and the set of ROOT-level filenames present, so each caller can enforce
+// its own required marker (Dockerfile or a compose file).
+func unpackContextFiles(blob []byte) ([]BuildFile, map[string]bool, error) {
+	gz, err := gzip.NewReader(bytes.NewReader(blob))
+	if err != nil {
+		return nil, nil, err
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 
 	var files []BuildFile
+	roots := map[string]bool{}
 	total := 0
-	hasDockerfile := false
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if header.Typeflag != tar.TypeReg {
 			// Only regular files. No symlinks (a symlink to /etc/shadow in a
 			// build context is a known escape), no devices, no hardlinks.
-			return nil, fmt.Errorf("%w: non-regular entry %q", ErrUnsafePath, header.Name)
+			return nil, nil, fmt.Errorf("%w: non-regular entry %q", ErrUnsafePath, header.Name)
 		}
 		if !safeRelPath(header.Name) {
-			return nil, fmt.Errorf("%w: %q", ErrUnsafePath, header.Name)
+			return nil, nil, fmt.Errorf("%w: %q", ErrUnsafePath, header.Name)
 		}
 		total += int(header.Size)
 		if total > MaxBuildContextBytes {
-			return nil, ErrContextTooLarge
+			return nil, nil, ErrContextTooLarge
 		}
 		data := make([]byte, header.Size)
 		if _, err := io.ReadFull(tr, data); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if path.Clean("/"+header.Name) == "/Dockerfile" {
-			hasDockerfile = true
+		clean := path.Clean("/" + header.Name)
+		if !strings.Contains(clean[1:], "/") { // a root-level file
+			roots[clean[1:]] = true
 		}
 		files = append(files, BuildFile{Path: header.Name, Mode: header.Mode, Data: data})
 	}
-	if !hasDockerfile {
-		return nil, ErrNoDockerfile
+	return files, roots, nil
+}
+
+// FetchComposeContext retrieves a compose project by digest and unpacks it,
+// verifying the digest end to end -- the compose analogue of FetchBuildContext.
+func FetchComposeContext(ctx context.Context, blobs BlobStore, digest string) ([]BuildFile, error) {
+	blob, err := blobs.GetBlob(ctx, digest)
+	if err != nil {
+		return nil, err
 	}
-	return files, nil
+	if got := BlobDigest(blob); got != digest {
+		return nil, fmt.Errorf("%w: got %s want %s", ErrDigestMismatch, got, digest)
+	}
+	return UnpackComposeContext(blob)
 }
 
 // StoreBuildContext packs the files and stores the blob in the DHT-backed shard
