@@ -59,6 +59,10 @@ type State struct {
 	// + role.worker). It is what makes the node draw its yellow role on the
 	// operator's map and marks it as a container host on the network.
 	DCSWorker bool
+	// I2PDestination is the node's own base32 garlic destination. Reported so the
+	// coordinator can hand this node out to others as a LIVE bootstrap peer,
+	// instead of the network relying on a single hardcoded one.
+	I2PDestination string
 }
 
 type request struct {
@@ -72,6 +76,7 @@ type request struct {
 	GatewayVerified     bool                  `json:"gateway_verified"`
 	GatewayRegistration *gateway.Registration `json:"gateway_registration,omitempty"`
 	DCSWorker           bool                  `json:"dcs_worker"`
+	I2PDestination      string                `json:"i2p_destination,omitempty"`
 }
 
 // Client posts the signed beacon. Endpoint and HTTP are injected so tests can
@@ -84,6 +89,11 @@ type Client struct {
 	Logger   logf
 	// Snapshot reports the current state at send time.
 	Snapshot func() State
+	// OnPeers, if set, receives the bootstrap peer multiaddrs the coordinator
+	// returns in the heartbeat response. This is the live bootstrap service: the
+	// node reports its own destination and is handed a few reachable peers back,
+	// so it can keep heartbeating until it joins the DHT and stay joined after.
+	OnPeers func([]string)
 }
 
 // DirectHTTPClient is the transport a heartbeat must use: no proxy, so neither
@@ -141,6 +151,7 @@ func (c *Client) Send(ctx context.Context) {
 		GatewayVerified:     state.GatewayVerified,
 		GatewayRegistration: state.Registration,
 		DCSWorker:           state.DCSWorker,
+		I2PDestination:      state.I2PDestination,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -174,9 +185,21 @@ func (c *Client) Send(ctx context.Context) {
 		return
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode != http.StatusOK {
 		c.logf("heartbeat returned HTTP %d", resp.StatusCode)
+		return
+	}
+	// The response carries the bootstrap peers the coordinator picked for us.
+	// It is fine for this list to be short or empty -- the coordinator returns
+	// whatever live peers it can find, and we simply try again next interval.
+	if c.OnPeers != nil {
+		var reply struct {
+			BootstrapPeers []string `json:"bootstrap_peers"`
+		}
+		if err := json.Unmarshal(respBody, &reply); err == nil && len(reply.BootstrapPeers) > 0 {
+			c.OnPeers(reply.BootstrapPeers)
+		}
 	}
 }
 

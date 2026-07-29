@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -494,6 +495,31 @@ func (n *Node) Addresses() []string {
 	return result
 }
 
+// I2PDestination returns this node's own base32 garlic destination -- the <b32>
+// in its /garlic32/<b32> address -- or "" before the I2P session is up. It is
+// what another peer dials to reach this node. The node reports it in its
+// heartbeat so the coordinator can hand it out as a live bootstrap peer.
+func (n *Node) I2PDestination() string {
+	for _, addr := range n.host.Addrs() {
+		for _, part := range strings.Split(addr.String(), "/") {
+			// a garlic32 host is 52 base32 chars; the multiaddr is /garlic32/<b32>.
+			if len(part) == 52 && isBase32Lower(part) {
+				return part
+			}
+		}
+	}
+	return ""
+}
+
+func isBase32Lower(s string) bool {
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7')) {
+			return false
+		}
+	}
+	return true
+}
+
 func loadOrCreateIdentity(path string) (crypto.PrivKey, error) {
 	raw, err := os.ReadFile(path)
 	if err == nil {
@@ -586,7 +612,15 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 				GatewayVerified: n.gatewayVerified.Load(),
 				Registration:    registration,
 				DCSWorker:       n.dcsWorker.Load(),
+				I2PDestination:  n.I2PDestination(),
 			}
+		},
+		// The heartbeat doubles as the live bootstrap exchange: we report our
+		// destination and the coordinator answers with a few reachable peers to
+		// dial into the DHT. Dialling can block on I2P tunnel build, so run it
+		// off the heartbeat goroutine.
+		OnPeers: func(peers []string) {
+			go n.connectBootstrapPeers(ctx, peers)
 		},
 	}
 	client.Send(ctx)
@@ -629,13 +663,27 @@ func (n *Node) refreshBootstrap(ctx context.Context) {
 	n.keyMu.Lock()
 	n.coordKey = append(ed25519.PublicKey(nil), publicKey...)
 	n.keyMu.Unlock()
-	for _, value := range document.Peers {
+	n.connectBootstrapPeers(ctx, document.Peers)
+}
+
+// connectBootstrapPeers dials each multiaddr and records the ones that stick as
+// protected bootstrap peers. It is the shared sink for both bootstrap sources:
+// the well-known document (refreshBootstrap) and the peers returned in each
+// heartbeat response (the live bootstrap service). A short or empty list is
+// normal -- a young network may only know one other node, or none.
+func (n *Node) connectBootstrapPeers(ctx context.Context, peers []string) {
+	for _, value := range peers {
 		address, err := multiaddr.NewMultiaddr(value)
 		if err != nil || n.i2pOnly && !syndii2p.IsI2PAddr(address) {
 			continue
 		}
 		info, err := peer.AddrInfoFromP2pAddr(address)
 		if err != nil || info.ID == n.host.ID() {
+			continue
+		}
+		// Skip peers already connected: heartbeats fire every few minutes and
+		// would otherwise re-dial the same handful of nodes on every beat.
+		if n.host.Network().Connectedness(info.ID) == network.Connected {
 			continue
 		}
 		info.Addrs = n.acceptablePeerAddrs(info.Addrs)
