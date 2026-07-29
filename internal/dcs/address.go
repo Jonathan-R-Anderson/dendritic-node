@@ -79,7 +79,13 @@ func (a *AddressAllocator) Allocate(ctx context.Context, containerID string, pri
 	if err != nil {
 		return nil, fmt.Errorf("dcs: i2p session for %s: %w", containerID, err)
 	}
+	// session.Base32() returns the bare 52-char destination hash; the dialable
+	// address -- and what base32Address validates and the owner reaches the
+	// container at -- includes the .b32.i2p suffix.
 	address := session.Base32()
+	if !strings.HasSuffix(address, ".b32.i2p") {
+		address += ".b32.i2p"
+	}
 	if !base32Address.MatchString(address) {
 		session.Close()
 		return nil, fmt.Errorf("dcs: implausible i2p address %q", address)
