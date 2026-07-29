@@ -395,7 +395,14 @@ type storeBlobStore struct{ store *store.Store }
 // NewStoreBlobStore adapts the shard store to dcs.BlobStore. Build contexts land
 // in a dedicated bucket keyed by their digest, so the store's chunking,
 // Reed-Solomon coding and DHT provider announcements carry them like any object.
-func NewStoreBlobStore(s *store.Store) dcs.BlobStore { return &storeBlobStore{store: s} }
+//
+// The bucket is (idempotently) created here: putObject refuses to write to a
+// bucket that does not exist, so on a fresh or wiped store a PutBlob would fail
+// with "file does not exist" until something created it.
+func NewStoreBlobStore(s *store.Store) dcs.BlobStore {
+	_ = s.CreateBucket(buildContextBucket)
+	return &storeBlobStore{store: s}
+}
 
 const buildContextBucket = "dcs-buildctx"
 
