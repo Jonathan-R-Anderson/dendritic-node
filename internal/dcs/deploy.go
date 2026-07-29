@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -774,16 +775,43 @@ func (m *Manager) DeployToRandom(ctx context.Context, records []WorkerRecord, re
 		// hosting; a plain worker never sees it.
 		capabilities = []string{"worker", "lab"}
 	}
-	worker, err := PickRandom(records, Requirement{
+	candidates := FilterWorkers(records, Requirement{
 		Capabilities: capabilities,
 		MinRAMBytes:  req.MemoryLimitBytes,
-	}, m.now(), m.rand)
-	if err != nil {
-		return DeployReply{}, WorkerRecord{}, err
+	}, m.now())
+	if len(candidates) == 0 {
+		// Distinguish "nobody offered" from "nobody qualified".
+		if len(records) == 0 {
+			return DeployReply{}, WorkerRecord{}, ErrEmptyCandidate
+		}
+		return DeployReply{}, WorkerRecord{}, ErrNoWorkerMatched
 	}
-	reply, err := m.DeployTo(ctx, worker, req, contentKey)
-	return reply, worker, err
+	// Stable order, then shuffle with the caller's source. Try a few in turn: a
+	// single unreachable/flaky worker (e.g. an I2P dial timeout) must not fail the
+	// whole launch when another worker could run it.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].NodeID < candidates[j].NodeID })
+	for i := len(candidates) - 1; i > 0; i-- {
+		j := int(m.rand() % uint64(i+1))
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	}
+	attempts := len(candidates)
+	if attempts > maxDeployAttempts {
+		attempts = maxDeployAttempts // don't hammer the whole fleet on a bad request
+	}
+	var lastErr error
+	for _, worker := range candidates[:attempts] {
+		reply, err := m.DeployTo(ctx, worker, req, contentKey)
+		if err == nil {
+			return reply, worker, nil
+		}
+		lastErr = err
+	}
+	return DeployReply{}, WorkerRecord{}, lastErr
 }
+
+// maxDeployAttempts caps how many workers a single launch tries before giving up,
+// so a genuinely bad request does not stampede the fleet.
+const maxDeployAttempts = 3
 
 // DeployTo sends a Launch to a SPECIFIC worker. It is how a queued deployment is
 // re-polled for promotion: the ticket reserves a place on one worker, so the
