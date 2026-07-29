@@ -286,6 +286,32 @@ func (a *Agent) refuse(owner, deployment, phase, reason string) {
 	})
 }
 
+// Destroy tears a container down completely: detach its network (so it is
+// reachable by nothing), release its I2P destination and purge its key (so its
+// address can never be reused), then remove the container. Order matters -- the
+// network comes down first so no new connection can land mid-teardown.
+func (a *Agent) Destroy(ctx context.Context, containerID string) error {
+	a.mu.Lock()
+	handle := a.attached[containerID]
+	delete(a.attached, containerID)
+	a.mu.Unlock()
+
+	if handle != nil {
+		handle.Detach()
+	}
+	// purge=true: a destroyed container's address must not survive it, or a
+	// later container could inherit an address someone was told about.
+	_ = a.alloc.Release(containerID, true)
+	if err := a.runtime.Remove(ctx, containerID, true); err != nil {
+		return fmt.Errorf("remove container: %w", err)
+	}
+	a.audit.Record(AuditEntry{
+		At: a.now(), Method: MethodDestroy, Decision: "admitted",
+		ContainerID: containerID,
+	})
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Manager (deployer side)
 // ---------------------------------------------------------------------------

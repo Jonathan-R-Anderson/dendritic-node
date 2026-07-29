@@ -11,24 +11,26 @@ import (
 // "the container has an address" and "the address reaches the container".
 
 // SessionAccepter is the subset of internal/i2p.Session the proxy needs: accept
-// inbound streams on the container's destination, and close. The i2p Session
-// satisfies it. Kept as an interface so this package does not hard-depend on
-// the SAM client for the parts that are pure plumbing.
+// inbound streams on the container's destination -- WITH the port the caller
+// dialed -- and close. *i2p.Session satisfies it via AcceptStreamPort. Kept as
+// an interface so this package does not hard-depend on the SAM client.
 type SessionAccepter interface {
-	Accept() (net.Conn, error)
+	// AcceptStreamPort returns an inbound stream and the TO_PORT the remote peer
+	// dialed on this destination (0 when the router does not report one).
+	AcceptStreamPort() (net.Conn, int, error)
 	Close() error
 }
 
 // sessionListener adapts a SAM session to I2PListener.
 //
-// PORT CAVEAT, stated honestly: the current SAM client's STREAM ACCEPT does not
-// surface the caller's TO_PORT, so every inbound stream reports TargetPort 0
-// and is routed to the proxy's DefaultPort -- the container's single primary
-// service. Multi-port scanning over ONE destination needs SAMv3.2
-// FROM_PORT/TO_PORT parsing in internal/i2p, which is a follow-up there; until
-// then, a lab that must expose several ports for scanning should map each to
-// its own destination, or the SAM client should be extended. The proxy already
-// carries TargetPort end to end, so that extension needs no change here.
+// MULTI-PORT: yes, one I2P destination carries many ports. A destination is not
+// "one port"; SAM v3.2+ multiplexes up to 65536 ports over it via TO_PORT, and
+// internal/i2p.AcceptStreamPort surfaces the port each inbound stream targeted.
+// So a port scan of the container's single destination arrives here as separate
+// accepts, each carrying the probed port, and the proxy dials that exact port
+// inside the container's netns. A router that negotiated a pre-3.2 version
+// reports port 0, and those streams fall through to the proxy's DefaultPort --
+// the graceful degradation, not the design.
 type sessionListener struct {
 	session SessionAccepter
 }
@@ -39,11 +41,11 @@ func NewSessionListener(session SessionAccepter) I2PListener {
 }
 
 func (l *sessionListener) Accept() (InboundStream, error) {
-	conn, err := l.session.Accept()
+	conn, toPort, err := l.session.AcceptStreamPort()
 	if err != nil {
 		return InboundStream{}, err
 	}
-	return InboundStream{Conn: conn, TargetPort: 0}, nil
+	return InboundStream{Conn: conn, TargetPort: toPort}, nil
 }
 
 func (l *sessionListener) Close() error { return l.session.Close() }

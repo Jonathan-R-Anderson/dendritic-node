@@ -265,6 +265,11 @@ func connectSAM(ctx context.Context, samAddr string) (net.Conn, *bufio.Reader, e
 
 // Dial opens a virtual stream to a base32 I2P destination.
 func (s *Session) Dial(ctx context.Context, base32Host string) (net.Conn, error) {
+	return s.dial(ctx, base32Host, 0)
+}
+
+// dial opens a stream, optionally to a specific TO_PORT (0 = unspecified).
+func (s *Session) dial(ctx context.Context, base32Host string, toPort int) (net.Conn, error) {
 	base32Host = normalizeBase32Host(base32Host)
 	if !validBase32Host(base32Host) {
 		return nil, errors.New("invalid I2P base32 destination")
@@ -284,9 +289,14 @@ func (s *Session) Dial(ctx context.Context, base32Host string) (net.Conn, error)
 			conn.Close()
 		}
 	}()
-	if _, err := io.WriteString(conn, fmt.Sprintf(
-		"STREAM CONNECT ID=%s DESTINATION=%s.b32.i2p SILENT=false\n", s.id, base32Host,
-	)); err != nil {
+	connect := fmt.Sprintf("STREAM CONNECT ID=%s DESTINATION=%s.b32.i2p SILENT=false", s.id, base32Host)
+	if toPort > 0 {
+		// TO_PORT reaches a specific port on a single-destination service. The
+		// router silently ignores it when it negotiated a pre-3.2 version, so a
+		// caller on an old router simply lands on the default port.
+		connect += fmt.Sprintf(" TO_PORT=%d", toPort)
+	}
+	if _, err := io.WriteString(conn, connect+"\n"); err != nil {
 		return nil, err
 	}
 	line, err := readSAMLine(reader)
@@ -363,10 +373,59 @@ func (s *Session) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	ok = true
+	// SAM v3.2+ appends FROM_PORT/TO_PORT to the accept notification. TO_PORT is
+	// the port the remote peer dialed ON US -- which is what lets a SINGLE I2P
+	// destination carry up to 65536 distinct ports. We negotiate MAX=3.3, so a
+	// modern router supplies it; an older router omits it and toPort stays 0.
+	toPort := parsePort(field(line, "TO_PORT"))
+	fromPort := parsePort(field(line, "FROM_PORT"))
 	return &trackedConn{
 		Conn: conn, local: addr(s.base32Host + ".b32.i2p"),
 		remote: addr(remoteB32 + ".b32.i2p"), release: s.untrack,
+		toPort: toPort, fromPort: fromPort,
 	}, nil
+}
+
+// AcceptStreamPort is Accept, plus the port the remote peer dialed on this
+// destination (SAM v3.2+ TO_PORT). It is how one destination multiplexes many
+// ports: a port scan of the destination arrives here as separate accepts, each
+// reporting the probed port. Returns 0 when the router does not report a port.
+func (s *Session) AcceptStreamPort() (net.Conn, int, error) {
+	conn, err := s.Accept()
+	if err != nil {
+		return nil, 0, err
+	}
+	if tc, ok := conn.(*trackedConn); ok {
+		return conn, tc.toPort, nil
+	}
+	return conn, 0, nil
+}
+
+func parsePort(value string) int {
+	if value == "" {
+		return 0
+	}
+	n := 0
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int(r-'0')
+		if n > 65535 {
+			return 0
+		}
+	}
+	return n
+}
+
+// DialPort is Dial with an explicit destination port (SAM v3.2+ TO_PORT), so a
+// caller can reach a specific port on a single-destination service -- the dial
+// side of the multi-port capability. toPort 0 means "unspecified" (port 0).
+func (s *Session) DialPort(ctx context.Context, base32Host string, toPort int) (net.Conn, error) {
+	if toPort < 0 || toPort > 65535 {
+		return nil, errors.New("i2p: TO_PORT out of range")
+	}
+	return s.dial(ctx, base32Host, toPort)
 }
 
 func (s *Session) Base32() string { return s.base32Host }
@@ -412,9 +471,10 @@ func (s *Session) untrack(conn net.Conn) {
 
 type trackedConn struct {
 	net.Conn
-	local, remote net.Addr
-	release       func(net.Conn)
-	once          sync.Once
+	local, remote    net.Addr
+	release          func(net.Conn)
+	once             sync.Once
+	toPort, fromPort int // SAM v3.2+ per-stream ports; 0 when unreported
 }
 
 func (c *trackedConn) LocalAddr() net.Addr  { return c.local }

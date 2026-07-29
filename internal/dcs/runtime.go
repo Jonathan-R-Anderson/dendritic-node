@@ -241,6 +241,25 @@ type InspectState struct {
 	Health    string `json:"health,omitempty"`
 }
 
+// ContainerPID returns the container's main process PID, needed to enter its
+// network namespace (netns_linux.go). A PID of 0 means the container is not
+// running, so there is no namespace to join.
+func (c *DockerClient) ContainerPID(ctx context.Context, id string) (int, error) {
+	var raw struct {
+		State struct {
+			Pid     int  `json:"Pid"`
+			Running bool `json:"Running"`
+		} `json:"State"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/containers/"+id+"/json", nil, &raw); err != nil {
+		return 0, err
+	}
+	if !raw.State.Running || raw.State.Pid <= 0 {
+		return 0, fmt.Errorf("dcs: container %s is not running", id)
+	}
+	return raw.State.Pid, nil
+}
+
 func (c *DockerClient) Inspect(ctx context.Context, id string) (InspectState, error) {
 	var raw struct {
 		ID    string `json:"Id"`
