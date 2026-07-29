@@ -292,6 +292,12 @@ main{max-width:1060px;margin:auto;padding:20px}
 .panel{background:var(--sc-panel);border:1px solid var(--sc-border);border-radius:8px;
   padding:16px 18px;margin:0 0 16px}
 .panel h2{margin:0 0 4px;font-size:1rem;color:var(--sc-fg)}
+/* Collapsible panel (a <details>): the shard list can grow long, so it folds. */
+details.panel>summary.panel-summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;user-select:none}
+details.panel>summary.panel-summary::-webkit-details-marker{display:none}
+details.panel>summary.panel-summary::before{content:"\25be";color:var(--sc-muted)}
+details.panel:not([open])>summary.panel-summary::before{content:"\25b8"}
+details.panel>summary.panel-summary h2{margin:0}
 .muted{color:var(--sc-muted);font-size:.9rem}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-top:12px}
 .stat{background:var(--sc-panel-2);border:1px solid var(--sc-border);border-radius:6px;padding:12px}
@@ -468,10 +474,10 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
 </section>
 {{end}}
 
-<section class="panel">
-  <h2>Stored shards</h2>
-  <div id="items" class="muted">Loading&hellip;</div>
-</section>
+<details class="panel" id="shards-panel" open>
+  <summary class="panel-summary"><h2>Stored shards</h2></summary>
+  <div id="items" class="muted" style="margin-top:12px">Loading&hellip;</div>
+</details>
 </main>
 <script>
 const csrf={{printf "%q" .CSRF}};

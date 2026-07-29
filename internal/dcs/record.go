@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -70,6 +71,13 @@ type Requirement struct {
 
 func (r WorkerRecord) satisfies(req Requirement, now time.Time) bool {
 	if r.expired(now) || r.RecordType != "dcs_worker" {
+		return false
+	}
+	// A worker with no I2P destination cannot be dialed -- an older agent that
+	// advertised itself without one. Never pick it: doing so fails the whole
+	// deploy with "invalid I2P base32 destination" instead of trying a worker
+	// that actually has an address.
+	if strings.TrimSpace(r.Destination) == "" {
 		return false
 	}
 	if r.Slots <= 0 {
