@@ -78,6 +78,58 @@ type Config struct {
 	TLSCert       string        `json:"tls_cert,omitempty"`
 	TLSKey        string        `json:"tls_key,omitempty"`
 	Gateway       GatewayConfig `json:"gateway"`
+	DCS           DCSConfig     `json:"dcs"`
+}
+
+// DCSConfig is the optional Distributed Container Service. Every default is the
+// refusing one: a node that merely sets enabled=true advertises nothing and
+// accepts nothing until an operator also picks a role. See DCS.md.
+type DCSConfig struct {
+	Enabled bool          `json:"enabled"`
+	Role    DCSRoleConfig `json:"role"`
+	Limits  DCSLimits     `json:"limits"`
+	Policy  DCSPolicy     `json:"policy"`
+
+	Labels                   map[string]string `json:"labels,omitempty"`
+	Region                   string            `json:"region,omitempty"`
+	DockerEndpoint           string            `json:"docker_endpoint"`
+	AdvertiseIntervalSeconds int               `json:"advertise_interval_seconds"`
+	RecordTTLSeconds         int               `json:"record_ttl_seconds"`
+}
+
+type DCSRoleConfig struct {
+	Worker  bool `json:"worker"`
+	GPU     bool `json:"gpu"`
+	Volumes bool `json:"volumes"`
+	// Lab accepts DELIBERATELY VULNERABLE workloads (Attack Range and similar).
+	// Separate from Worker on purpose: a plain worker must never be handed one.
+	// A lab container is unreachable except through an I2P destination that is
+	// never published anywhere -- see dcs.LabContainment.
+	Lab bool `json:"lab"`
+}
+
+type DCSLimits struct {
+	MaxContainers     int   `json:"max_containers"`
+	CPUSharePct       int   `json:"cpu_share_pct"`
+	RAMBytes          int64 `json:"ram_bytes"`
+	DiskBytes         int64 `json:"disk_bytes"`
+	ImageCacheBytes   int64 `json:"image_cache_bytes"`
+	BandwidthKbps     int   `json:"bandwidth_kbps"`
+	MaxRuntimeSeconds int   `json:"max_runtime_seconds"`
+	// LabMaxRuntimeSeconds is a hard ceiling the agent enforces for lab
+	// workloads whatever the deployer asked for. A forgotten vulnerable
+	// container is the failure mode this exists to prevent.
+	LabMaxRuntimeSeconds int `json:"lab_max_runtime_seconds"`
+}
+
+type DCSPolicy struct {
+	AllowExec           bool     `json:"allow_exec"`
+	ExecRecording       bool     `json:"exec_recording"`
+	AllowClearnetEgress bool     `json:"allow_clearnet_egress"`
+	AllowGatewayPublish bool     `json:"allow_gateway_publish"`
+	ImageAllowlist      []string `json:"image_allowlist,omitempty"`
+	TrustedPublishers   []string `json:"trusted_publishers,omitempty"`
+	OwnerAllowlist      []string `json:"owner_allowlist,omitempty"`
 }
 
 type GatewayConfig struct {
@@ -216,6 +268,24 @@ func Default() (Config, error) {
 				DialTimeoutSeconds:      10, IdleTimeoutSeconds: 300,
 				DrainSeconds: 60, ProxyProtocol: true,
 			},
+		},
+		DCS: DCSConfig{
+			Enabled:                  false,
+			DockerEndpoint:           "unix:///var/run/docker.sock",
+			AdvertiseIntervalSeconds: 300,
+			RecordTTLSeconds:         900,
+			Limits: DCSLimits{
+				MaxContainers: 8, CPUSharePct: 50,
+				RAMBytes: 4 << 30, DiskBytes: 50 << 30,
+				ImageCacheBytes: 20 << 30,
+				// 4 hours. A vulnerable container that outlives its operator's
+				// attention is the failure mode this ceiling exists to kill.
+				LabMaxRuntimeSeconds: 4 * 60 * 60,
+			},
+			// Every policy default is a refusal. Turning DCS on must not
+			// silently hand a stranger a shell, an exit node, or a public
+			// address on the operator's machine.
+			Policy: DCSPolicy{},
 		},
 	}, nil
 }
