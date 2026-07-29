@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +21,13 @@ type SessionOpener interface {
 
 type Session interface {
 	Base32() string
+	// AcceptStreamPort accepts an inbound stream on this destination and reports
+	// the port the caller dialed. It is here so ONE session serves BOTH the
+	// container's address (Base32) and its inbound proxy: opening a second SAM
+	// session on the same destination is rejected by I2P (DUPLICATED_DEST), so the
+	// address the deployer is handed and the destination the proxy accepts on must
+	// be the very same session -- otherwise every port reads closed.
+	AcceptStreamPort() (net.Conn, int, error)
 	Close() error
 }
 
@@ -54,6 +62,20 @@ func NewAddressAllocator(opener SessionOpener, dataDir string) *AddressAllocator
 // address and silently break whoever was told the old one.
 func (a *AddressAllocator) keyPath(containerID string) string {
 	return filepath.Join(a.dataDir, "containers", containerID, "i2p.destination")
+}
+
+// AcceptSession returns the container's already-open session as a stream accepter
+// so the inbound proxy reuses the SAME destination the address came from, instead
+// of opening a second session on it (which I2P rejects as a duplicate, leaving the
+// address the deployer holds with nothing behind it).
+func (a *AddressAllocator) AcceptSession(containerID string) (SessionAccepter, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s, ok := a.sessions[containerID]
+	if !ok {
+		return nil, false
+	}
+	return s, true
 }
 
 // Allocate creates (or reopens) the container's destination.

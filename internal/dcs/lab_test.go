@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -121,6 +122,9 @@ type fakeSession struct {
 
 func (f *fakeSession) Base32() string { return f.addr }
 func (f *fakeSession) Close() error   { f.closed = true; return nil }
+func (f *fakeSession) AcceptStreamPort() (net.Conn, int, error) {
+	return nil, 0, errors.New("fake session does not accept streams")
+}
 
 type fakeOpener struct {
 	n     int
@@ -252,6 +256,9 @@ type closerSession struct{ onClose func() }
 
 func (c *closerSession) Base32() string { return "192.0.2.1" } // not an I2P address
 func (c *closerSession) Close() error   { c.onClose(); return nil }
+func (c *closerSession) AcceptStreamPort() (net.Conn, int, error) {
+	return nil, 0, errors.New("fake session does not accept streams")
+}
 
 // ---------------------------------------------------------------------------
 // Docker profile

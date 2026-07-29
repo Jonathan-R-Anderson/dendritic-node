@@ -78,7 +78,7 @@ func startDCSWorker(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 	// an encrypted build context can be decrypted before it is run.
 	agent.SetContentOpener(node.OpenSealedContentKey)
 	agent.SetNetworkAttacher(dcs.NewNetworkAttacher(
-		&containerSessions{sam: sam, dataDir: filepath.Join(cfg.DataDir, "dcs")},
+		&containerSessions{alloc: allocator},
 		docker, dcs.NewNamespaceDialer,
 		func(format string, args ...any) { logger.Printf(format, args...) },
 	))
@@ -378,15 +378,29 @@ func (o *samOpener) Open(ctx context.Context, keyPath string) (dcs.Session, erro
 	return syndii2p.Open(ctx, o.sam, keyPath)
 }
 
-// containerSessions opens the accepting session a container's inbound proxy runs on.
+// containerSessions supplies the accepting session a container's inbound proxy
+// runs on. It REUSES the session the address allocator already opened for the
+// container rather than opening a second one: a container has a single I2P
+// destination, and I2P rejects a second session on the same destination
+// (DUPLICATED_DEST). Reusing it also guarantees the proxy accepts on the very
+// destination the deployer was handed -- otherwise every port reads closed.
 type containerSessions struct {
-	sam     string
-	dataDir string
+	alloc *dcs.AddressAllocator
 }
 
-func (c *containerSessions) OpenForContainer(ctx context.Context, containerID string) (dcs.SessionAccepter, error) {
-	keyPath := filepath.Join(c.dataDir, "containers", containerID, "i2p.destination")
-	return syndii2p.Open(ctx, c.sam, keyPath)
+// sharedAccepter hands the proxy the allocator-owned session but neutralises
+// Close: the allocator's Release owns the session's lifecycle (it must outlive a
+// proxy restart), so the proxy tearing down must not close the address's session.
+type sharedAccepter struct{ dcs.SessionAccepter }
+
+func (sharedAccepter) Close() error { return nil }
+
+func (c *containerSessions) OpenForContainer(_ context.Context, containerID string) (dcs.SessionAccepter, error) {
+	sess, ok := c.alloc.AcceptSession(containerID)
+	if !ok {
+		return nil, fmt.Errorf("dcs: no allocated i2p session for container %s", containerID)
+	}
+	return sharedAccepter{sess}, nil
 }
 
 // storeBlobStore stores build-context blobs in the shard store, content-addressed.
