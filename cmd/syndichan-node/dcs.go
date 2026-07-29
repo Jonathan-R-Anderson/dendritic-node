@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/syndichan/maniwani/storage-client/internal/config"
@@ -118,6 +119,21 @@ func startDCSWorker(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 		cfg.DCS.Limits.MaxContainers, cfg.DCS.Role.Lab, instanceTTL(cfg))
 }
 
+// nodeI2PDestination returns this node's own base32 I2P destination, taken from
+// its /garlic32/<b32>/p2p/<id> address. That base32 host is exactly what a
+// deployer passes to i2p.Multiaddr to dial the worker.
+func nodeI2PDestination(node *p2p.Node) string {
+	for _, addr := range node.Addresses() {
+		parts := strings.Split(addr, "/")
+		for i, part := range parts {
+			if part == "garlic32" && i+1 < len(parts) && parts[i+1] != "" {
+				return parts[i+1]
+			}
+		}
+	}
+	return ""
+}
+
 func instanceTTL(cfg config.Config) time.Duration {
 	if cfg.DCS.Limits.MaxRuntimeSeconds > 0 {
 		return time.Duration(cfg.DCS.Limits.MaxRuntimeSeconds) * time.Second
@@ -148,10 +164,21 @@ func advertiseWorker(ctx context.Context, cfg config.Config, node *p2p.Node, adm
 		if cfg.DCS.Role.Lab {
 			caps = append(caps, "lab")
 		}
+		// The record MUST carry the node's own I2P destination -- it is the only
+		// address a deployer can dial the worker at. Without it the bridge finds
+		// the worker but has nothing to connect to ("invalid I2P base32
+		// destination"). It comes from the node's /garlic32/<b32> address, which
+		// exists once the I2P session is up (well before this runs).
+		destination := nodeI2PDestination(node)
+		if destination == "" {
+			logger.Printf("dcs: worker not advertised yet -- I2P destination not ready")
+			return
+		}
 		now := time.Now()
 		rec := dcs.WorkerRecord{
 			RecordType: "dcs_worker", ProtocolVer: 1, AgentVersion: "1.0.0",
-			Arch: config.PlatformLabel(), Capabilities: caps,
+			Destination: destination,
+			Arch:        config.PlatformLabel(), Capabilities: caps,
 			CPUCores: cfg.DCS.Limits.MaxContainers, RAMBytes: cfg.DCS.Limits.RAMBytes,
 			Slots: cfg.DCS.Limits.MaxContainers, Region: cfg.DCS.Region,
 			Sequence: sequence, IssuedAt: now.Unix(), ExpiresAt: now.Unix() + ttl,
