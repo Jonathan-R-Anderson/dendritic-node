@@ -2,6 +2,7 @@ package dcs
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +40,11 @@ type DeployRequest struct {
 	// "compose"          -> `docker compose up` the project (vulhub-style),
 	//                        images pulled from the registry.
 	Kind string `json:"kind,omitempty"`
+	// GrantedContentKey, when set, is the coordinator's per-object content key
+	// SEALED to THIS worker's Curve25519 content key (libsodium sealed box,
+	// base64). The worker opens it to decrypt an encrypted build context. It is
+	// never the raw key -- only the named worker can open it.
+	GrantedContentKey string `json:"granted_content_key,omitempty"`
 	// OnBehalfOf lets a TRUSTED broker (a website's bridge node, in the worker's
 	// broker allowlist) deploy for many users through one node identity: the
 	// one-instance-per-user rule then keys on this sub-owner, not the shared
@@ -173,12 +179,13 @@ type Agent struct {
 	runtime     Runtime
 	alloc       Allocator
 	audit       AuditSink
-	network     NetworkAttacher      // optional; nil means "address allocated but not bridged"
-	builder     Builder              // optional; required only for build-context deploys
-	blobs       BlobStore            // optional; the DHT-backed build-context store
-	compose     ComposeRunner        // optional; required only for kind=compose deploys
-	admission   *AdmissionController // optional; nil means unlimited (no cap, no queue)
-	instanceTTL time.Duration        // general auto-spin-down; 0 -> DefaultInstanceTTL
+	network     NetworkAttacher              // optional; nil means "address allocated but not bridged"
+	builder     Builder                      // optional; required only for build-context deploys
+	blobs       BlobStore                    // optional; the DHT-backed build-context store
+	compose     ComposeRunner                // optional; required only for kind=compose deploys
+	openContent func([]byte) ([]byte, error) // optional; opens a sealed content-key grant
+	admission   *AdmissionController         // optional; nil means unlimited (no cap, no queue)
+	instanceTTL time.Duration                // general auto-spin-down; 0 -> DefaultInstanceTTL
 	now         func() time.Time
 
 	mu        sync.Mutex
@@ -204,6 +211,44 @@ type ComposeRunner interface {
 // SetComposeRunner wires docker-compose execution. Without it, a kind=compose
 // deploy is refused with a clear message rather than silently mis-run.
 func (a *Agent) SetComposeRunner(c ComposeRunner) { a.compose = c }
+
+// SetContentOpener wires the node's ability to open a sealed content-key grant
+// (its Curve25519 content key). Without it, a worker can still run unencrypted
+// build contexts but refuses encrypted ones.
+func (a *Agent) SetContentOpener(open func([]byte) ([]byte, error)) { a.openContent = open }
+
+// fetchContext retrieves the build context for a deploy and decrypts it when the
+// deployer granted a content key. The digest is verified on the fetched
+// (ciphertext) bytes -- exactly what the coordinator addressed -- before any
+// decryption, so a tampered blob is rejected first.
+func (a *Agent) fetchContext(ctx context.Context, req DeployRequest) ([]byte, error) {
+	blob, err := a.blobs.GetBlob(ctx, req.BuildContextDigest)
+	if err != nil {
+		return nil, err
+	}
+	if got := BlobDigest(blob); got != req.BuildContextDigest {
+		return nil, fmt.Errorf("%w: got %s want %s", ErrDigestMismatch, got, req.BuildContextDigest)
+	}
+	if req.GrantedContentKey == "" {
+		return blob, nil // unencrypted context (no grant issued)
+	}
+	if a.openContent == nil {
+		return nil, errors.New("dcs: this worker cannot open content grants")
+	}
+	sealed, err := base64.StdEncoding.DecodeString(req.GrantedContentKey)
+	if err != nil {
+		return nil, fmt.Errorf("dcs: invalid content grant: %w", err)
+	}
+	contentKey, err := a.openContent(sealed)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := DecryptContent(blob, contentKey)
+	if err != nil {
+		return nil, fmt.Errorf("dcs: decrypt build context: %w", err)
+	}
+	return plaintext, nil
+}
 
 func NewAgent(cfg AgentConfig, runtime Runtime, alloc Allocator, audit AuditSink) *Agent {
 	return &Agent{
@@ -349,7 +394,11 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 				a.refuse(owner, req.DeploymentID, "build", "this worker cannot build from a context")
 				return DeployReply{}, errors.New("dcs: build-context deploys are not enabled on this worker")
 			}
-			files, ferr := FetchBuildContext(ctx, a.blobs, req.BuildContextDigest)
+			raw, ferr := a.fetchContext(ctx, req)
+			var files []BuildFile
+			if ferr == nil {
+				files, ferr = UnpackBuildContext(raw)
+			}
 			if ferr != nil {
 				releaseSlot()
 				a.refuse(owner, req.DeploymentID, "fetch_build_context", ferr.Error())
@@ -619,7 +668,11 @@ func (a *Agent) launchCompose(ctx context.Context, owner string, req DeployReque
 		a.refuse(owner, req.DeploymentID, "compose", "compose deploy without a build context")
 		return "", nil, ErrBadRequest
 	}
-	files, ferr := FetchComposeContext(ctx, a.blobs, req.BuildContextDigest)
+	raw, ferr := a.fetchContext(ctx, req)
+	var files []BuildFile
+	if ferr == nil {
+		files, ferr = UnpackComposeContext(raw)
+	}
 	if ferr != nil {
 		a.refuse(owner, req.DeploymentID, "fetch_compose_context", ferr.Error())
 		return "", nil, fmt.Errorf("fetch compose context: %w", ferr)
@@ -697,7 +750,7 @@ func NewManager(signer EnvelopeSigner, transport Transport) *Manager {
 // stays at the edges and this core is pure. For a lab deployment the returned
 // DeployReply.Destination is the private address the caller wanted -- the thing
 // to point a port scanner at.
-func (m *Manager) DeployToRandom(ctx context.Context, records []WorkerRecord, req DeployRequest) (DeployReply, WorkerRecord, error) {
+func (m *Manager) DeployToRandom(ctx context.Context, records []WorkerRecord, req DeployRequest, contentKey []byte) (DeployReply, WorkerRecord, error) {
 	capabilities := []string{"worker"}
 	if req.Lab {
 		// A lab workload must land on a worker whose operator opted into lab
@@ -711,7 +764,7 @@ func (m *Manager) DeployToRandom(ctx context.Context, records []WorkerRecord, re
 	if err != nil {
 		return DeployReply{}, WorkerRecord{}, err
 	}
-	reply, err := m.DeployTo(ctx, worker, req)
+	reply, err := m.DeployTo(ctx, worker, req, contentKey)
 	return reply, worker, err
 }
 
@@ -719,7 +772,16 @@ func (m *Manager) DeployToRandom(ctx context.Context, records []WorkerRecord, re
 // re-polled for promotion: the ticket reserves a place on one worker, so the
 // retry must return to that same worker rather than picking a new random one.
 // (A first deploy goes through DeployToRandom, which picks then calls this.)
-func (m *Manager) DeployTo(ctx context.Context, worker WorkerRecord, req DeployRequest) (DeployReply, error) {
+func (m *Manager) DeployTo(ctx context.Context, worker WorkerRecord, req DeployRequest, contentKey []byte) (DeployReply, error) {
+	// Seal the per-object content key to THIS worker before the envelope is
+	// built, so the raw key never travels and only this worker can decrypt.
+	if len(contentKey) > 0 {
+		sealed, err := SealContentKey(contentKey, worker.ContentPubKey)
+		if err != nil {
+			return DeployReply{}, fmt.Errorf("grant content key to %s: %w", worker.NodeID, err)
+		}
+		req.GrantedContentKey = sealed
+	}
 	env, err := NewEnvelope(m.signer, worker.NodeID, MethodLaunch, req, m.now())
 	if err != nil {
 		return DeployReply{}, err

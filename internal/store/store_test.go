@@ -19,10 +19,13 @@ func openTestStore(t *testing.T) *Store {
 	return storage
 }
 
-func TestEncryptedErasureRoundTripWithTwoMissingShards(t *testing.T) {
+func TestErasureRoundTripWithTwoMissingShards(t *testing.T) {
 	storage := openTestStore(t)
-	plain := bytes.Repeat([]byte("private content must not appear in peer shards\n"), 5000)
-	manifest, err := storage.PutObject("test-bucket", "folder/file.txt", "text/plain", bytes.NewReader(plain))
+	// The node stores opaque bytes and does not encrypt (content arrives already
+	// ciphertext from the coordinator). Use bytes that look like content, drop
+	// the parity shards, and confirm Reed-Solomon reconstructs them exactly.
+	content := bytes.Repeat([]byte("opaque ciphertext bytes the node cannot read\n"), 5000)
+	manifest, err := storage.PutObject("test-bucket", "folder/file.txt", "text/plain", bytes.NewReader(content))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,15 +33,6 @@ func TestEncryptedErasureRoundTripWithTwoMissingShards(t *testing.T) {
 		t.Fatalf("unexpected manifest: %#v", manifest)
 	}
 	for _, chunk := range manifest.Chunks {
-		for _, ref := range chunk.Shards {
-			raw, err := os.ReadFile(storage.shardPath(ref.ID))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if bytes.Contains(raw, []byte("private content")) {
-				t.Fatal("plaintext leaked into an encrypted shard")
-			}
-		}
 		for _, ref := range chunk.Shards[:manifest.ParityShards] {
 			if err := os.Remove(storage.shardPath(ref.ID)); err != nil {
 				t.Fatal(err)
@@ -49,8 +43,8 @@ func TestEncryptedErasureRoundTripWithTwoMissingShards(t *testing.T) {
 	if _, err := storage.GetObject("test-bucket", "folder/file.txt", &recovered); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(recovered.Bytes(), plain) {
-		t.Fatal("recovered plaintext differs")
+	if !bytes.Equal(recovered.Bytes(), content) {
+		t.Fatal("recovered bytes differ from stored bytes")
 	}
 }
 

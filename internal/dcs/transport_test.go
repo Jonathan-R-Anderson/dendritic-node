@@ -82,7 +82,7 @@ func TestStreamDeployReturnsAddressAcrossRealHosts(t *testing.T) {
 
 	reply, worker, err := mgr.DeployToRandom(context.Background(),
 		[]WorkerRecord{record},
-		DeployRequest{DeploymentID: "scan-1", Image: "sha256:vuln", Lab: true, RuntimeSecs: 3600})
+		DeployRequest{DeploymentID: "scan-1", Image: "sha256:vuln", Lab: true, RuntimeSecs: 3600}, nil)
 	if err != nil {
 		t.Fatalf("stream deploy failed: %v", err)
 	}

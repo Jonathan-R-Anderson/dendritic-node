@@ -25,6 +25,10 @@ type WorkerRecord struct {
 	Destination  string `json:"destination"` // <b32>.i2p of the agent itself
 	ProtocolVer  int    `json:"protocol_version"`
 	AgentVersion string `json:"agent_version"`
+	// ContentPubKey is the worker's base64 Curve25519 content key. The coordinator
+	// seals a per-object content key to it so only this worker can decrypt the one
+	// build context it was granted. Covered by Signature, so it cannot be swapped.
+	ContentPubKey string `json:"content_pubkey,omitempty"`
 
 	Arch         string   `json:"arch"`
 	Capabilities []string `json:"capabilities"` // worker,gpu,volumes,gateway,lab

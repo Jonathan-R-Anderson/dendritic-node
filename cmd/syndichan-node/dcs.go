@@ -74,6 +74,9 @@ func startDCSWorker(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 	// Build-context deploys: fetch the Dockerfile+files from the shard store and
 	// build locally, registry-free.
 	agent.SetBuilder(docker, NewStoreBlobStore(storage))
+	// Open per-object content-key grants the coordinator sealed to this node, so
+	// an encrypted build context can be decrypted before it is run.
+	agent.SetContentOpener(node.OpenSealedContentKey)
 	agent.SetNetworkAttacher(dcs.NewNetworkAttacher(
 		&containerSessions{sam: sam, dataDir: filepath.Join(cfg.DataDir, "dcs")},
 		docker, dcs.NewNamespaceDialer,
@@ -177,8 +180,8 @@ func advertiseWorker(ctx context.Context, cfg config.Config, node *p2p.Node, adm
 		now := time.Now()
 		rec := dcs.WorkerRecord{
 			RecordType: "dcs_worker", ProtocolVer: 1, AgentVersion: "1.0.0",
-			Destination: destination,
-			Arch:        config.PlatformLabel(), Capabilities: caps,
+			Destination: destination, ContentPubKey: node.ContentPublicKey(),
+			Arch: config.PlatformLabel(), Capabilities: caps,
 			CPUCores: cfg.DCS.Limits.MaxContainers, RAMBytes: cfg.DCS.Limits.RAMBytes,
 			Slots: cfg.DCS.Limits.MaxContainers, Region: cfg.DCS.Region,
 			Sequence: sequence, IssuedAt: now.Unix(), ExpiresAt: now.Unix() + ttl,
@@ -285,7 +288,7 @@ func runDCSDeploy(cfg config.Config, opts dcsDeployOptions, logger *log.Logger) 
 	var reply dcs.DeployReply
 	var worker dcs.WorkerRecord
 	for {
-		reply, worker, err = manager.DeployToRandom(ctx, workers, req)
+		reply, worker, err = manager.DeployToRandom(ctx, workers, req, nil)
 		if err != nil {
 			logger.Fatalf("dcs-deploy: %v", err)
 		}

@@ -146,7 +146,7 @@ func TestDeployLabToRandomPeerReturnsPrivateAddress(t *testing.T) {
 		Image:        "sha256:deadbeef",
 		Lab:          true,
 		RuntimeSecs:  3600,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("deploy failed: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestLabDeployRefusedWithNoLabWorker(t *testing.T) {
 	mgr.rand = func() uint64 { return 0 }
 	_, _, err := mgr.DeployToRandom(context.Background(), records, DeployRequest{
 		DeploymentID: "x", Image: "sha256:a", Lab: true,
-	})
+	}, nil)
 	if !errors.Is(err, ErrNoWorkerMatched) {
 		t.Fatalf("lab workload matched a non-lab worker: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestLabDeployWithEgressIsRefused(t *testing.T) {
 
 	_, _, err := mgr.DeployToRandom(context.Background(),
 		[]WorkerRecord{workerRecord(t, worker, "worker", "lab")},
-		DeployRequest{DeploymentID: "x", Image: "sha256:a", Lab: true, RequestEgress: true})
+		DeployRequest{DeploymentID: "x", Image: "sha256:a", Lab: true, RequestEgress: true}, nil)
 	if !errors.Is(err, ErrLabEgressRefused) {
 		t.Fatalf("egress on a lab box was not refused: %v", err)
 	}

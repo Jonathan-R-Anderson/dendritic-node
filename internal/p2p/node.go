@@ -150,6 +150,11 @@ type Node struct {
 	dcsWorker           atomic.Bool
 	gatewayMu           sync.RWMutex
 	gatewayRegistration *gateway.Registration
+	// Curve25519 keypair for receiving sealed per-object content keys from the
+	// coordinator. Separate from the ed25519 libp2p identity, which cannot do
+	// ECDH. Zero on nodes that never load one (they simply cannot open a grant).
+	contentPriv [32]byte
+	contentPub  [32]byte
 }
 
 // SetCacheOnly makes this node refuse to host other peers' shards. Set once at
@@ -249,7 +254,7 @@ func openI2PNode(
 			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 		},
 	}
-	return finishNode(ctx, h, storage, logger, httpClient, directHTTP, true, true, storageEnabled)
+	return finishNode(ctx, h, dataDir, storage, logger, httpClient, directHTTP, true, true, storageEnabled)
 }
 
 func openNode(ctx context.Context, dataDir string, listen []string, storage *store.Store, logger *log.Logger, useCoordinatorBootstrap bool) (*Node, error) {
@@ -270,12 +275,13 @@ func openNode(ctx context.Context, dataDir string, listen []string, storage *sto
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
 	}
-	return finishNode(ctx, h, storage, logger, httpClient, httpClient, useCoordinatorBootstrap, false, true)
+	return finishNode(ctx, h, dataDir, storage, logger, httpClient, httpClient, useCoordinatorBootstrap, false, true)
 }
 
 func finishNode(
 	ctx context.Context,
 	h host.Host,
+	dataDir string,
 	storage *store.Store,
 	logger *log.Logger,
 	httpClient *http.Client,
@@ -295,8 +301,22 @@ func finishNode(
 		directHTTP: directHTTP, i2pOnly: i2pOnly,
 		replicated: make(map[string]struct{}),
 	}
+	// The content key persists beside the identity so the same node keeps the
+	// same address workers' grants are sealed to across restarts.
+	contentPriv, contentPub, err := loadOrCreateContentKey(filepath.Join(dataDir, "content.key"))
+	if err != nil {
+		h.Close()
+		return nil, err
+	}
+	n.contentPriv, n.contentPub = contentPriv, contentPub
 	if storageEnabled {
 		h.SetStreamHandler(ProtocolID, n.handleStream)
+	}
+	// Object manifests are how one node reassembles another's object by content;
+	// register their validator before any put/get can occur.
+	if err := n.configureObjectManifestRecords(); err != nil {
+		h.Close()
+		return nil, err
 	}
 	if err := kad.Bootstrap(ctx); err != nil {
 		h.Close()
@@ -447,6 +467,25 @@ func (n *Node) FindDCSWorkers(ctx context.Context, limit int) ([]dcs.WorkerRecor
 		}
 	}
 	return workers, nil
+}
+
+// LookupDCSWorker fetches and validates one worker's record by node id. Used to
+// recover a worker's content key on a re-poll, where the caller knows only the
+// worker id it was queued on.
+func (n *Node) LookupDCSWorker(ctx context.Context, nodeID string) (dcs.WorkerRecord, error) {
+	key := dcs.WorkerDHTKey(nodeID)
+	value, err := n.dht.GetValue(ctx, key)
+	if err != nil {
+		return dcs.WorkerRecord{}, err
+	}
+	if err := (dcs.WorkerDHTValidator{}).Validate(key, value); err != nil {
+		return dcs.WorkerRecord{}, err
+	}
+	var rec dcs.WorkerRecord
+	if err := json.Unmarshal(value, &rec); err != nil {
+		return dcs.WorkerRecord{}, err
+	}
+	return rec, nil
 }
 
 // dcsRendezvousCID is the well-known content id every DCS worker provides. It is
@@ -957,6 +996,12 @@ func (n *Node) replicateOnce(ctx context.Context) {
 }
 
 func (n *Node) DistributeManifest(ctx context.Context, manifest store.Manifest) {
+	// Publish the chunk->shard map to the DHT first, so a DIFFERENT node (a DCS
+	// worker fetching the build context) can locate and reassemble this object by
+	// bucket+key. Best-effort: a young network may have nowhere to put it yet.
+	if err := n.PublishManifest(ctx, manifest); err != nil {
+		n.logger.Printf("could not publish manifest for %s: %v", manifest.ObjectID[:12], err)
+	}
 	peers := n.host.Network().Peers()
 	if len(peers) == 0 {
 		n.logger.Printf("object %s retained locally; no storage peers are connected", manifest.ObjectID[:12])
@@ -1170,7 +1215,14 @@ func (n *Node) fetchFromPeer(ctx context.Context, candidate peer.ID, shardID str
 		return nil, err
 	}
 	defer stream.Close()
-	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
+	// Honour the caller's budget: over I2P even a small shard's round trip
+	// exceeds a few seconds, and the old fixed 5s deadline aborted the read
+	// mid-transfer. Fall back to a generous ceiling only when unbounded.
+	deadline := time.Now().Add(2 * time.Minute)
+	if dl, ok := ctx.Deadline(); ok {
+		deadline = dl
+	}
+	_ = stream.SetDeadline(deadline)
 	if err := writeJSONFrame(stream, requestHeader{Operation: "get", ShardID: shardID}); err != nil {
 		return nil, err
 	}

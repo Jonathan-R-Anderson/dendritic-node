@@ -192,6 +192,9 @@ func main() {
 	var s3Server, uiServer *http.Server
 	if !noStorage {
 		storageNode.SetShardFetcher(node.FetchShard)
+		// So GetObject can reassemble an object this node never stored (the DCS
+		// worker reading a build context the bridge published to the DHT).
+		storageNode.SetManifestFetcher(node.FetchManifest)
 		storageNode.SetShardAdvertiser(func(shardID string) {
 			provideCtx, provideCancel := context.WithTimeout(ctx, 30*time.Second)
 			defer provideCancel()

@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -20,7 +19,6 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 	bolt "go.etcd.io/bbolt"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 var (
@@ -39,27 +37,29 @@ const (
 	MaxCapacityBytes int64 = 8 << 50
 )
 
+// shardFetchTimeout budgets a single missing-shard fetch. It must exceed a cold
+// I2P dial (p2p.i2pDialTimeout, 2m): a miss triggers provider discovery and a
+// fresh dial over I2P, and the previous 20s ceiling expired mid-dial, which is
+// why cross-node object reads failed with "context deadline exceeded".
+const shardFetchTimeout = 3 * time.Minute
+
 type Store struct {
-	dir          string
-	db           *bolt.DB
-	masterKey    []byte
-	dataShards   int
-	parityShards int
-	chunkBytes   int
-	capacity     int64
-	mu           sync.RWMutex
-	allocationMu sync.Mutex
-	fetchShard   func(context.Context, string) ([]byte, error)
-	advertise    func(string)
-	distribute   func(Manifest)
+	dir           string
+	db            *bolt.DB
+	dataShards    int
+	parityShards  int
+	chunkBytes    int
+	capacity      int64
+	mu            sync.RWMutex
+	allocationMu  sync.Mutex
+	fetchShard    func(context.Context, string) ([]byte, error)
+	fetchManifest func(bucket, key string) (*Manifest, error)
+	advertise     func(string)
+	distribute    func(Manifest)
 }
 
 func Open(dir string, dataShards, parityShards, chunkBytes int, capacity int64) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "shards"), 0700); err != nil {
-		return nil, err
-	}
-	masterKey, err := loadOrCreateSecret(filepath.Join(dir, "master.key"), chacha20poly1305.KeySize)
-	if err != nil {
 		return nil, err
 	}
 	db, err := bolt.Open(filepath.Join(dir, "metadata.db"), 0600, &bolt.Options{Timeout: time.Second})
@@ -67,7 +67,7 @@ func Open(dir string, dataShards, parityShards, chunkBytes int, capacity int64) 
 		return nil, err
 	}
 	s := &Store{
-		dir: dir, db: db, masterKey: masterKey, dataShards: dataShards,
+		dir: dir, db: db, dataShards: dataShards,
 		parityShards: parityShards, chunkBytes: chunkBytes, capacity: capacity,
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
@@ -104,6 +104,16 @@ func (s *Store) SetShardFetcher(fetcher func(context.Context, string) ([]byte, e
 	s.fetchShard = fetcher
 }
 
+// SetManifestFetcher supplies the fallback used when an object's manifest is not
+// held locally: it fetches the chunk->shard map from the DHT so GetObject can
+// reassemble an object this node never stored (a DCS worker reading a build
+// context the bridge published).
+func (s *Store) SetManifestFetcher(fetcher func(bucket, key string) (*Manifest, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fetchManifest = fetcher
+}
+
 func (s *Store) SetShardAdvertiser(advertiser func(string)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -114,27 +124,6 @@ func (s *Store) SetObjectDistributor(distributor func(Manifest)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.distribute = distributor
-}
-
-func loadOrCreateSecret(path string, size int) ([]byte, error) {
-	value, err := os.ReadFile(path)
-	if err == nil {
-		if len(value) != size {
-			return nil, fmt.Errorf("%s has invalid key length", path)
-		}
-		return value, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	value = make([]byte, size)
-	if _, err := rand.Read(value); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(path, value, 0600); err != nil {
-		return nil, err
-	}
-	return value, nil
 }
 
 func objectKey(bucket, key string) []byte { return []byte(bucket + "\x00" + key) }
@@ -242,14 +231,6 @@ func (s *Store) putObject(bucket, key, contentType string, r io.Reader, expected
 	if key == "" || strings.ContainsRune(key, '\x00') {
 		return nil, errors.New("invalid object key")
 	}
-	objectKeyBytes := make([]byte, chacha20poly1305.KeySize)
-	if _, err := rand.Read(objectKeyBytes); err != nil {
-		return nil, err
-	}
-	aead, err := chacha20poly1305.NewX(objectKeyBytes)
-	if err != nil {
-		return nil, err
-	}
 	encoder, err := reedsolomon.New(s.dataShards, s.parityShards)
 	if err != nil {
 		return nil, err
@@ -269,16 +250,13 @@ func (s *Store) putObject(bucket, key, contentType string, r io.Reader, expected
 		if readErr != nil && readErr != io.ErrUnexpectedEOF {
 			return nil, readErr
 		}
-		plain := buffer[:n]
-		plainHash.Write(plain)
+		// The node stores bytes it cannot read -- content is already ciphertext
+		// from the coordinator. Copy the chunk before splitting: the read buffer
+		// is reused on the next iteration and Split may alias it.
+		stored := append([]byte(nil), buffer[:n]...)
+		plainHash.Write(stored)
 		manifest.PlainSize += int64(n)
-		nonce := make([]byte, chacha20poly1305.NonceSizeX)
-		if _, err := rand.Read(nonce); err != nil {
-			return nil, err
-		}
-		aad := chunkAAD(bucket, key, index)
-		ciphertext := aead.Seal(nil, nonce, plain, aad)
-		shards, err := encoder.Split(ciphertext)
+		shards, err := encoder.Split(stored)
 		if err != nil {
 			return nil, err
 		}
@@ -286,7 +264,7 @@ func (s *Store) putObject(bucket, key, contentType string, r io.Reader, expected
 			return nil, err
 		}
 		chunk := ChunkManifest{
-			Index: index, Nonce: nonce, CipherLength: len(ciphertext),
+			Index: index, CipherLength: len(stored),
 			ShardSize: len(shards[0]),
 		}
 		for shardIndex, shard := range shards {
@@ -306,15 +284,6 @@ func (s *Store) putObject(bucket, key, contentType string, r io.Reader, expected
 		s.removeUnreferenced(manifestShardIDs(*manifest))
 		return nil, ErrDigestMismatch
 	}
-	wrap, err := chacha20poly1305.NewX(s.masterKey)
-	if err != nil {
-		return nil, err
-	}
-	manifest.WrapNonce = make([]byte, chacha20poly1305.NonceSizeX)
-	if _, err := rand.Read(manifest.WrapNonce); err != nil {
-		return nil, err
-	}
-	manifest.WrappedKey = wrap.Seal(nil, manifest.WrapNonce, objectKeyBytes, []byte(bucket+"\x00"+key))
 	idBytes, err := canonicalManifest(manifest)
 	if err != nil {
 		return nil, err
@@ -354,10 +323,6 @@ func canonicalManifest(manifest *Manifest) ([]byte, error) {
 	copyValue := *manifest
 	copyValue.ObjectID = ""
 	return json.Marshal(copyValue)
-}
-
-func chunkAAD(bucket, key string, index int) []byte {
-	return []byte(fmt.Sprintf("syndichan-object-v1\x00%s\x00%s\x00%d", bucket, key, index))
 }
 
 func digest(value []byte) string {
@@ -493,6 +458,19 @@ func (s *Store) getManifest(bucket, key string) (*Manifest, error) {
 		encoded = append([]byte(nil), value...)
 		return nil
 	})
+	if errors.Is(err, os.ErrNotExist) {
+		// Not stored here: try to pull the manifest from the DHT so an object
+		// this node never held can still be reassembled by content.
+		s.mu.RLock()
+		fetcher := s.fetchManifest
+		s.mu.RUnlock()
+		if fetcher != nil {
+			if manifest, ferr := fetcher(bucket, key); ferr == nil && manifest != nil {
+				return manifest, nil
+			}
+		}
+		return nil, err
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -512,18 +490,6 @@ func (s *Store) GetObject(bucket, key string, w io.Writer) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	wrap, err := chacha20poly1305.NewX(s.masterKey)
-	if err != nil {
-		return nil, err
-	}
-	objectKeyBytes, err := wrap.Open(nil, manifest.WrapNonce, manifest.WrappedKey, []byte(bucket+"\x00"+key))
-	if err != nil {
-		return nil, errors.New("object key authentication failed")
-	}
-	aead, err := chacha20poly1305.NewX(objectKeyBytes)
-	if err != nil {
-		return nil, err
-	}
 	encoder, err := reedsolomon.New(manifest.DataShards, manifest.ParityShards)
 	if err != nil {
 		return nil, err
@@ -538,7 +504,10 @@ func (s *Store) GetObject(bucket, key string, w io.Writer) (*Manifest, error) {
 				fetcher := s.fetchShard
 				s.mu.RUnlock()
 				if fetcher != nil {
-					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					// Budget above a cold I2P dial (i2pDialTimeout, 2m): a
+					// missing shard means discovering and dialling a provider
+					// over I2P, and a 20s ceiling expired mid-dial.
+					ctx, cancel := context.WithTimeout(context.Background(), shardFetchTimeout)
 					value, err = fetcher(ctx, ref.ID)
 					cancel()
 					if err == nil && digest(value) == ref.ID {
@@ -553,22 +522,20 @@ func (s *Store) GetObject(bucket, key string, w io.Writer) (*Manifest, error) {
 		if err := encoder.Reconstruct(shards); err != nil {
 			return nil, fmt.Errorf("reconstruct chunk %d: %w", chunk.Index, err)
 		}
-		var ciphertext []byte
+		// The reassembled bytes are the coordinator's ciphertext; the node emits
+		// them as-is (it holds no key to decrypt).
+		var data []byte
 		for i := 0; i < manifest.DataShards; i++ {
-			ciphertext = append(ciphertext, shards[i]...)
+			data = append(data, shards[i]...)
 		}
-		ciphertext = ciphertext[:chunk.CipherLength]
-		plain, err := aead.Open(nil, chunk.Nonce, ciphertext, chunkAAD(bucket, key, chunk.Index))
-		if err != nil {
-			return nil, fmt.Errorf("authenticate chunk %d: %w", chunk.Index, err)
-		}
-		verifyHash.Write(plain)
-		if _, err := w.Write(plain); err != nil {
+		data = data[:chunk.CipherLength]
+		verifyHash.Write(data)
+		if _, err := w.Write(data); err != nil {
 			return nil, err
 		}
 	}
 	if hex.EncodeToString(verifyHash.Sum(nil)) != manifest.PlainSHA256 {
-		return nil, errors.New("plaintext object digest mismatch")
+		return nil, errors.New("stored object digest mismatch")
 	}
 	return manifest, nil
 }

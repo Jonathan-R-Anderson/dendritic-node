@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log"
@@ -150,6 +151,10 @@ type deployBody struct {
 	// the bridge picks a random worker.
 	WorkerNode        string `json:"worker_node,omitempty"`
 	WorkerDestination string `json:"worker_destination,omitempty"`
+	// ContentKey is the base64 per-object content key for an encrypted build
+	// context. Only the coordinator (site) can produce it; the bridge seals it to
+	// the chosen worker's content key so the raw key never leaves this host.
+	ContentKey string `json:"content_key,omitempty"`
 }
 
 // deployResult is DeployReply plus which worker handled it, so the site can
@@ -192,10 +197,32 @@ func (api *bridgeAPI) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		req.DeploymentID = "bridge-" + short(api.node.ID()) + "-" + shortTime()
 	}
 
+	// The per-object content key, if this is an encrypted build context. It never
+	// reaches a worker raw -- DeployTo seals it to the chosen worker.
+	var contentKey []byte
+	if body.ContentKey != "" {
+		decoded, derr := base64.StdEncoding.DecodeString(body.ContentKey)
+		if derr != nil {
+			writeErr(w, http.StatusBadRequest, "content_key is not valid base64")
+			return
+		}
+		contentKey = decoded
+	}
+
 	// Re-poll of a queued deploy: go back to the exact worker holding the ticket.
 	if body.WorkerNode != "" && body.Ticket != "" {
 		worker := dcs.WorkerRecord{NodeID: body.WorkerNode, Destination: body.WorkerDestination}
-		reply, err := api.manager.DeployTo(ctx, worker, req)
+		// Sealing the grant needs the worker's content key, which the minimal
+		// re-poll record lacks -- fetch the full record for it.
+		if len(contentKey) > 0 {
+			if full, lerr := api.node.LookupDCSWorker(ctx, body.WorkerNode); lerr == nil {
+				worker = full
+			} else {
+				writeErr(w, http.StatusBadGateway, "deploy: could not recover worker content key: "+lerr.Error())
+				return
+			}
+		}
+		reply, err := api.manager.DeployTo(ctx, worker, req, contentKey)
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, "deploy: "+err.Error())
 			return
@@ -214,7 +241,7 @@ func (api *bridgeAPI) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "no container workers on the network")
 		return
 	}
-	reply, worker, err := api.manager.DeployToRandom(ctx, workers, req)
+	reply, worker, err := api.manager.DeployToRandom(ctx, workers, req, contentKey)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "deploy: "+err.Error())
 		return
