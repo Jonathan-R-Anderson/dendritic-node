@@ -155,6 +155,9 @@ type deployBody struct {
 	// context. Only the coordinator (site) can produce it; the bridge seals it to
 	// the chosen worker's content key so the raw key never leaves this host.
 	ContentKey string `json:"content_key,omitempty"`
+	// Env is per-boot environment injected into the container (e.g. a random
+	// LAB_SECRET the researcher must retrieve). Each entry is "KEY=value".
+	Env []string `json:"env,omitempty"`
 }
 
 // deployResult is DeployReply plus which worker handled it, so the site can
@@ -192,6 +195,7 @@ func (api *bridgeAPI) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		RuntimeSecs:        body.RuntimeSecs,
 		OnBehalfOf:         body.OnBehalfOf,
 		Ticket:             body.Ticket,
+		Env:                body.Env,
 	}
 	if req.DeploymentID == "" {
 		req.DeploymentID = "bridge-" + short(api.node.ID()) + "-" + shortTime()

@@ -70,7 +70,7 @@ func (r *dockerComposeRunner) projectDir(project string) string {
 
 // Up writes the project, strips host ports, brings it up (pulling images from the
 // registry), and returns the primary service's container id.
-func (r *dockerComposeRunner) Up(ctx context.Context, project string, files []dcs.BuildFile, primaryPort int) (string, error) {
+func (r *dockerComposeRunner) Up(ctx context.Context, project string, files []dcs.BuildFile, primaryPort int, env []string) (string, error) {
 	dir := r.projectDir(project)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
@@ -107,12 +107,26 @@ func (r *dockerComposeRunner) Up(ctx context.Context, project string, files []dc
 		return "", err
 	}
 
-	if out, err := r.compose(ctx, dir, project, composeName, "up", "-d", "--remove-orphans"); err != nil {
+	// Inject per-boot env (e.g. a random LAB_SECRET) into the primary service via
+	// a compose override that MERGES onto whatever the project already defines.
+	// This gives every launch a unique secret inside the box without editing the
+	// upstream compose file, so answers derived from it can't be shared.
+	composeFiles := []string{composeName}
+	if len(env) > 0 && primarySvc != "" {
+		overrideName := "docker-compose.syndichan-env.yml"
+		if werr := os.WriteFile(filepath.Join(dir, overrideName),
+			[]byte(composeOverrideYAML(primarySvc, env)), 0o600); werr != nil {
+			return "", werr
+		}
+		composeFiles = append(composeFiles, overrideName)
+	}
+
+	if out, err := r.compose(ctx, dir, project, composeFiles, "up", "-d", "--remove-orphans"); err != nil {
 		// Roll back a partial bring-up so nothing lingers.
-		_, _ = r.compose(ctx, dir, project, composeName, "down", "-v", "--remove-orphans")
+		_, _ = r.compose(ctx, dir, project, composeFiles, "down", "-v", "--remove-orphans")
 		return "", fmt.Errorf("up failed: %w: %s", err, strings.TrimSpace(out))
 	}
-	out, err := r.compose(ctx, dir, project, composeName, "ps", "-q", primarySvc)
+	out, err := r.compose(ctx, dir, project, composeFiles, "ps", "-q", primarySvc)
 	if err != nil {
 		return "", fmt.Errorf("locate primary service %q: %w: %s", primarySvc, err, strings.TrimSpace(out))
 	}
@@ -138,7 +152,7 @@ func (r *dockerComposeRunner) Down(ctx context.Context, project string) error {
 	dir := r.projectDir(project)
 	composeName := findComposeFileOnDisk(dir)
 	if composeName != "" {
-		_, _ = r.compose(ctx, dir, project, composeName, "down", "-v", "--remove-orphans")
+		_, _ = r.compose(ctx, dir, project, []string{composeName}, "down", "-v", "--remove-orphans")
 	} else {
 		// The working dir is gone (e.g. after a restart); tear down by the label
 		// docker-compose stamps on every container of the project.
@@ -148,10 +162,15 @@ func (r *dockerComposeRunner) Down(ctx context.Context, project string) error {
 	return nil
 }
 
-// compose runs `<bin...> -p <project> -f <file> <args...>` in dir.
-func (r *dockerComposeRunner) compose(ctx context.Context, dir, project, composeFile string, args ...string) (string, error) {
+// compose runs `<bin...> -p <project> -f <file>... <args...>` in dir. Multiple
+// compose files are passed in order so later ones (e.g. the env override) merge
+// over earlier ones, matching docker-compose's own override semantics.
+func (r *dockerComposeRunner) compose(ctx context.Context, dir, project string, composeFiles []string, args ...string) (string, error) {
 	argv := append([]string{}, r.bin[1:]...)
-	argv = append(argv, "-p", project, "-f", composeFile)
+	argv = append(argv, "-p", project)
+	for _, f := range composeFiles {
+		argv = append(argv, "-f", f)
+	}
 	argv = append(argv, args...)
 	cmd := exec.CommandContext(ctx, r.bin[0], argv...)
 	cmd.Dir = dir
@@ -161,6 +180,32 @@ func (r *dockerComposeRunner) compose(ctx context.Context, dir, project, compose
 	cmd.Stderr = &buf
 	err := cmd.Run()
 	return buf.String(), err
+}
+
+// composeOverrideYAML builds a minimal compose override that adds env vars to one
+// service's environment. docker-compose deep-merges this onto the project, so the
+// service's existing config is preserved and these keys are added/overridden.
+func composeOverrideYAML(service string, env []string) string {
+	var b strings.Builder
+	b.WriteString("services:\n")
+	b.WriteString("  " + yamlDoubleQuote(service) + ":\n")
+	b.WriteString("    environment:\n")
+	for _, entry := range env {
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			continue
+		}
+		b.WriteString("      " + yamlDoubleQuote(parts[0]) + ": " + yamlDoubleQuote(parts[1]) + "\n")
+	}
+	return b.String()
+}
+
+// yamlDoubleQuote renders a value as a YAML double-quoted scalar, escaping the
+// two characters that matter inside one (backslash and double-quote).
+func yamlDoubleQuote(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	return "\"" + s + "\""
 }
 
 // labelTeardown is the fallback when the compose file is gone: remove every

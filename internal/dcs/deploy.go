@@ -211,7 +211,7 @@ type Agent struct {
 // (a lab must never be reachable on the worker's clearnet) -- the only path in
 // is the I2P destination the agent attaches to the primary container.
 type ComposeRunner interface {
-	Up(ctx context.Context, project string, files []BuildFile, primaryPort int) (primaryContainerID string, err error)
+	Up(ctx context.Context, project string, files []BuildFile, primaryPort int, env []string) (primaryContainerID string, err error)
 	Down(ctx context.Context, project string) error
 }
 
@@ -700,7 +700,7 @@ func (a *Agent) launchCompose(ctx context.Context, owner string, req DeployReque
 		primary = DefaultLabPort
 	}
 	project := composeProjectName(req.DeploymentID)
-	containerID, uerr := a.compose.Up(ctx, project, files, primary)
+	containerID, uerr := a.compose.Up(ctx, project, files, primary, req.Env)
 	if uerr != nil {
 		_ = a.compose.Down(ctx, project) // clean any partial bring-up
 		a.refuse(owner, req.DeploymentID, "compose_up", uerr.Error())

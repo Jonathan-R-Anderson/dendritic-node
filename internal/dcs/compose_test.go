@@ -80,12 +80,14 @@ type fakeCompose struct {
 	upCalls  int
 	downProj []string
 	primary  string
+	lastEnv  []string
 }
 
-func (f *fakeCompose) Up(_ context.Context, project string, files []BuildFile, _ int) (string, error) {
+func (f *fakeCompose) Up(_ context.Context, project string, files []BuildFile, _ int, env []string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.upCalls++
+	f.lastEnv = env
 	// a plausible primary container id derived from the project
 	f.primary = "cid-" + project
 	return f.primary, nil
