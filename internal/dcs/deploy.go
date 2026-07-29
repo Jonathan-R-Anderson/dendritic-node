@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +23,9 @@ type DeployRequest struct {
 
 	MemoryLimitBytes int64 `json:"memory_limit_bytes,omitempty"`
 	NanoCPUs         int64 `json:"nano_cpus,omitempty"`
+	// PrimaryPort is where a portless inbound I2P stream is routed -- the
+	// container's main service. Defaults to DefaultLabPort when unset.
+	PrimaryPort int `json:"primary_port,omitempty"`
 
 	// These say what the deployer wants the container REACHABLE as. For a lab
 	// workload every one of them is refused (see AdmitLab), so a researcher who
@@ -56,6 +61,22 @@ type Runtime interface {
 type Allocator interface {
 	Allocate(ctx context.Context, containerID string, private bool) (*ContainerAddress, error)
 	Release(containerID string, purge bool) error
+}
+
+// NetworkAttacher bridges a started container's I2P destination to its network
+// namespace, so the returned address actually reaches the container. It is
+// injected so the agent stays testable without root, docker or a SAM bridge;
+// the production wiring is BuildContainerNetwork (network_attach.go).
+//
+// primaryPort is the container's main service port -- where a portless inbound
+// stream is routed. The attacher returns a handle the agent keeps for teardown.
+type NetworkAttacher interface {
+	Attach(ctx context.Context, containerID string, primaryPort int) (NetworkHandle, error)
+}
+
+// NetworkHandle detaches a container's network on stop/destroy.
+type NetworkHandle interface {
+	Detach()
 }
 
 // AuditSink records what strangers did with the worker's hardware. The agent
@@ -98,19 +119,37 @@ func (c AgentConfig) ownerAllowed(owner string) bool {
 }
 
 // Agent is the worker side. It admits a deploy request, creates the container
-// with a hardened profile, gives it a private I2P destination, and returns that
-// destination to the owner alone.
+// with a hardened profile, gives it a private I2P destination, attaches that
+// destination to the container's network namespace, and returns the address to
+// the owner alone.
 type Agent struct {
 	cfg     AgentConfig
 	runtime Runtime
 	alloc   Allocator
 	audit   AuditSink
+	network NetworkAttacher // optional; nil means "address allocated but not bridged"
 	now     func() time.Time
+
+	mu       sync.Mutex
+	attached map[string]NetworkHandle // containerID → its network, for teardown
 }
 
 func NewAgent(cfg AgentConfig, runtime Runtime, alloc Allocator, audit AuditSink) *Agent {
-	return &Agent{cfg: cfg, runtime: runtime, alloc: alloc, audit: audit, now: time.Now}
+	return &Agent{
+		cfg: cfg, runtime: runtime, alloc: alloc, audit: audit,
+		now: time.Now, attached: map[string]NetworkHandle{},
+	}
 }
+
+// SetNetworkAttacher wires the container-netns bridge. Without it the agent
+// still allocates and returns a destination, but the container is not reachable
+// at it -- useful for tests and for a dry run, honest about the difference.
+func (a *Agent) SetNetworkAttacher(n NetworkAttacher) { a.network = n }
+
+// DefaultLabPort is where a portless inbound stream is routed when the deploy
+// request does not name a primary port. 80 is the common case for a web-facing
+// vulnerable box; a request can override it via DeployRequest.PrimaryPort.
+const DefaultLabPort = 80
 
 var (
 	ErrOwnerNotAllowed = errors.New("dcs: this worker does not accept deployments from that owner")
@@ -187,6 +226,30 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		return DeployReply{}, fmt.Errorf("start container: %w", err)
 	}
 
+	// Attach the container's destination to its network namespace so the
+	// address we are about to hand back actually reaches the container. If no
+	// attacher is wired (a dry run, or a non-Linux host), the address is still
+	// returned but the note says it is not yet reachable, rather than implying
+	// a connection that will not work.
+	reachable := false
+	if a.network != nil {
+		primary := req.PrimaryPort
+		if primary <= 0 {
+			primary = DefaultLabPort
+		}
+		handle, attachErr := a.network.Attach(ctx, containerID, primary)
+		if attachErr != nil {
+			_ = a.alloc.Release(containerID, true)
+			_ = a.runtime.Remove(ctx, containerID, true)
+			a.refuse(owner, req.DeploymentID, "attach_network", attachErr.Error())
+			return DeployReply{}, fmt.Errorf("attach network: %w", attachErr)
+		}
+		a.mu.Lock()
+		a.attached[containerID] = handle
+		a.mu.Unlock()
+		reachable = true
+	}
+
 	// Disclose the destination to the owner -- the single, audited revelation.
 	destination, err := address.Disclose(owner, "launch result", a.now())
 	if err != nil {
@@ -202,6 +265,9 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 	if req.Lab {
 		reply.ExpiresAt = containment.ExpiresAt(a.now()).Unix()
 		reply.Note = "lab workload: no egress, no gateway, destroyed at expiry"
+	}
+	if !reachable {
+		reply.Note = strings.TrimSpace(reply.Note + " (address allocated but not yet bridged on this host)")
 	}
 
 	a.audit.Record(AuditEntry{
