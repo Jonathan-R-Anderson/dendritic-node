@@ -64,14 +64,19 @@ type Config struct {
 	DataDir  string `json:"data_dir"`
 	S3Listen string `json:"s3_listen"`
 	// CacheOnly: serve our own content but host nothing for other peers.
-	CacheOnly     bool          `json:"cache_only"`
-	UIListen      string        `json:"ui_listen"`
-	P2PListen     []string      `json:"p2p_listen"`
-	I2PSAM        string        `json:"i2p_sam"`
-	I2PHTTPProxy  string        `json:"i2p_http_proxy"`
-	AccessKey     string        `json:"access_key"`
-	SecretKey     string        `json:"secret_key"`
-	CapacityBytes int64         `json:"capacity_bytes"`
+	CacheOnly     bool     `json:"cache_only"`
+	UIListen      string   `json:"ui_listen"`
+	P2PListen     []string `json:"p2p_listen"`
+	I2PSAM        string   `json:"i2p_sam"`
+	I2PHTTPProxy  string   `json:"i2p_http_proxy"`
+	AccessKey     string   `json:"access_key"`
+	SecretKey     string   `json:"secret_key"`
+	CapacityBytes int64    `json:"capacity_bytes"`
+	// PayoutAddress is where this node's CREDIT earnings are sent — an
+	// address the operator controls, typically their MetaMask. Empty means
+	// the node does the work but is never paid for it, so the dashboard
+	// nags until it is set.
+	PayoutAddress string        `json:"payout_address,omitempty"`
 	DataShards    int           `json:"data_shards"`
 	ParityShards  int           `json:"parity_shards"`
 	ChunkBytes    int           `json:"chunk_bytes"`

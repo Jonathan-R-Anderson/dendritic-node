@@ -102,6 +102,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.setStorageSettings(w, r)
 	case r.URL.Path == "/config/dcs" && r.Method == http.MethodPost:
 		s.setDCS(w, r)
+	case r.URL.Path == "/config/payout" && r.Method == http.MethodPost:
+		s.setPayout(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -129,6 +131,7 @@ func (s *Server) dashboard(w http.ResponseWriter) {
 		data["Mode"] = c.ResolvedRole()
 		data["RAMGiB"] = strconv.FormatFloat(float64(c.DCS.Limits.RAMBytes)/(1<<30), 'f', -1, 64)
 		data["Brokers"] = strings.Join(c.DCS.Policy.TrustedBrokers, "\n")
+		data["PayoutAddress"] = c.PayoutAddress
 	}
 	_ = s.template.Execute(w, data)
 }
@@ -378,6 +381,22 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
 </section>
 
 {{if .HasConfig}}
+<section class="panel cfg">
+  <h2>Getting paid</h2>
+  <p class="muted">Where this node&rsquo;s CREDIT earnings are sent. Use an address you control
+    &mdash; your MetaMask, for example. Until this is set the node still serves the network,
+    but nothing it earns has anywhere to go.</p>
+  <form method="post" action="/config/payout">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Payout address
+      <input type="text" name="payout_address" value="{{.PayoutAddress}}"
+             placeholder="0x…" size="46" spellcheck="false" autocomplete="off"></label>
+    <button type="submit">Save payout address</button>
+  </form>
+  <p class="muted">Checked when you save: a mistyped address cannot be recovered once rewards
+    are committed to an epoch.</p>
+</section>
+
 <section class="panel cfg">
   <h2>Run mode</h2>
   <p class="muted">What this node runs. Everything below is configured here &mdash; there are no launch flags.</p>

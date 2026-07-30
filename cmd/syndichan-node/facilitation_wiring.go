@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"log"
+	"net/url"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/facilitation"
@@ -77,6 +80,27 @@ func startFacilitation(ctx context.Context, cfg config.Config, node *p2p.Node,
 	node.SetChallengeHandler(facilitation.ChallengeResponder(
 		scheduler, facilitation.StoreShardLoader(storageNode)))
 
+	// Publish where earnings should go. Without this the node does the work and
+	// the credits have nowhere to land, so it is announced loudly rather than
+	// left as a silent default.
+	if cfg.PayoutAddress == "" {
+		logger.Printf("proof-of-facilitation: NO PAYOUT ADDRESS SET — this node will earn nothing. " +
+			"Set one on the management page.")
+	} else {
+		declaration := facilitation.DeclarePayout(pub, priv, cfg.PayoutAddress, uint64(time.Now().Unix()))
+		gateway := facilitation.NewGatewayClient(siteBaseURL(cfg))
+		publishCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := gateway.PublishPayout(publishCtx, declaration); err != nil {
+			// Not fatal: the node still serves and still earns receipts. The
+			// declaration is retried next start, and until it lands the
+			// aggregator falls back to the registry owner.
+			logger.Printf("proof-of-facilitation: could not publish payout address (%v) — will retry next start", err)
+		} else {
+			logger.Printf("proof-of-facilitation: earnings will be paid to %s", cfg.PayoutAddress)
+		}
+		cancel()
+	}
+
 	assignments, err := facilitation.LocalAssignments(agent.NodeID(), storageNode)
 	if err != nil {
 		logger.Printf("proof-of-facilitation: could not enumerate shards: %v", err)
@@ -102,4 +126,19 @@ func (f *facilitationRuntime) Close() {
 // identity it claims cannot be separated.
 func loadNodeSigningKey(node *p2p.Node) (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	return node.SigningKey()
+}
+
+// siteBaseURL derives the website root from the configured registration API, so
+// there is one place to point a node at a different deployment rather than a
+// second URL to keep in sync.
+func siteBaseURL(cfg config.Config) string {
+	raw := strings.TrimSpace(cfg.Gateway.RegistrationAPI)
+	if raw == "" {
+		return "https://syndichan.org"
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "https://syndichan.org"
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
