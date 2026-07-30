@@ -249,7 +249,7 @@ func TestAnswerChallengeSpoolsAttestedReceipt(t *testing.T) {
 			return nil
 		},
 	}
-	sr, err := s.AnswerChallenge(context.Background(), c, net.data[a.AssignmentID], net.chunk, a.Bytes)
+	sr, _, err := s.AnswerChallenge(context.Background(), c, net.data[a.AssignmentID], net.chunk, a.Bytes)
 	if err != nil {
 		t.Fatalf("AnswerChallenge: %v", err)
 	}

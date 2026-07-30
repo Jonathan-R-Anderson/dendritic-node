@@ -128,20 +128,25 @@ type leaseRequest struct {
 }
 
 type Node struct {
-	host           host.Host
-	dht            *dht.IpfsDHT
-	store          *store.Store
-	logger         *log.Logger
-	bootstrap      string
-	http           *http.Client
-	directHTTP     *http.Client
-	keyMu          sync.RWMutex
-	coordKey       ed25519.PublicKey
-	peerMu         sync.RWMutex
-	bootstrapPeers map[peer.ID]struct{}
-	i2pOnly        bool
-	replicaMu      sync.Mutex
-	replicated     map[string]struct{}
+	// challengeMu guards challengeHandler. Per-node, not package-level:
+	// a process can run more than one Node (tests do), and a shared
+	// handler would answer challenges with the wrong node's data.
+	challengeMu      sync.RWMutex
+	challengeHandler func(ctx context.Context, payload []byte) ([]byte, error)
+	host             host.Host
+	dht              *dht.IpfsDHT
+	store            *store.Store
+	logger           *log.Logger
+	bootstrap        string
+	http             *http.Client
+	directHTTP       *http.Client
+	keyMu            sync.RWMutex
+	coordKey         ed25519.PublicKey
+	peerMu           sync.RWMutex
+	bootstrapPeers   map[peer.ID]struct{}
+	i2pOnly          bool
+	replicaMu        sync.Mutex
+	replicated       map[string]struct{}
 	// cacheOnly nodes serve their own content but host nothing for anyone
 	// else; see the "store" branch of handleStream.
 	cacheOnly           bool
@@ -807,6 +812,10 @@ func (n *Node) handleStream(stream network.Stream) {
 		if err := writeJSONFrame(stream, responseHeader{OK: true, Size: int64(len(value))}); err == nil {
 			_, _ = stream.Write(value)
 		}
+	case "pof-challenge":
+		// Proof-of-Facilitation audit. Answering costs a Merkle proof over
+		// chunks we already hold, so it is served regardless of cacheOnly.
+		n.handleChallengeFrame(stream, reader, header.Size)
 	case "store":
 		if n.cacheOnly {
 			// This node contributes no storage to the network. It keeps only

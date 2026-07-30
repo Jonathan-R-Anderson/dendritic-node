@@ -207,15 +207,20 @@ func (s *Scheduler) RunEpoch(ctx context.Context, seed [32]byte, epoch uint64,
 // The receipt is spooled even with no attestations yet. Witnesses arrive
 // asynchronously and re-putting updates the row in place; dropping the receipt
 // until quorum would mean losing the proof if the node restarts mid-collection.
+// Returns the response as well as the receipt, and callers must send back THAT
+// response: answering twice produces a different AnsweredAt, hence a different
+// ResultHash, and the challenger would then verify a proof whose receipt is not
+// the one spooled here — the attestations would sign a different hash and
+// silently never count.
 func (s *Scheduler) AnswerChallenge(ctx context.Context, c StorageChallenge, data []byte,
-	chunkSize int, provenBytes uint64) (SignedReceipt, error) {
+	chunkSize int, provenBytes uint64) (SignedReceipt, StorageResponse, error) {
 	resp, err := s.Agent.AnswerStorageChallenge(c, data, chunkSize)
 	if err != nil {
-		return SignedReceipt{}, err
+		return SignedReceipt{}, StorageResponse{}, err
 	}
 	sr, err := s.Agent.BuildReceipt(c, resp, provenBytes)
 	if err != nil {
-		return SignedReceipt{}, err
+		return SignedReceipt{}, resp, err
 	}
 	if s.Attest != nil {
 		// Attestation failures are not fatal: an unattested receipt simply does
@@ -225,8 +230,8 @@ func (s *Scheduler) AnswerChallenge(ctx context.Context, c StorageChallenge, dat
 	}
 	if s.Store != nil {
 		if err := s.Store.Put(sr); err != nil {
-			return sr, err
+			return sr, resp, err
 		}
 	}
-	return sr, nil
+	return sr, resp, nil
 }
