@@ -190,20 +190,14 @@ func (a *Agent) VerifyStorageResponse(c StorageChallenge, resp StorageResponse) 
 	return nil
 }
 
-// BuildReceipt turns a verified challenge/response pair into a signed receipt.
-// It re-verifies rather than trusting the caller: this is the only door from
-// "work happened" to "work is claimable", so it does its own checking.
-//
-// Quantity is the proven-held byte count, not a self-declared figure.
-func (a *Agent) BuildReceipt(c StorageChallenge, resp StorageResponse, provenBytes uint64) (SignedReceipt, error) {
-	if err := a.VerifyStorageResponse(c, resp); err != nil {
-		return SignedReceipt{}, err
-	}
-	if c.TargetNodeID != a.NodeID() {
-		return SignedReceipt{}, ErrWrongTarget
-	}
-	r := ServiceReceipt{
-		ProviderNodeID: a.NodeID(),
+// ReceiptFor derives the receipt a challenge/response pair earns. Pure and
+// deterministic: the provider builds it to sign, and every witness rebuilds it
+// independently to know what it is attesting to. If a witness signed a receipt
+// the provider handed it, the provider could quietly inflate Quantity — so the
+// witness derives its own from the evidence instead.
+func ReceiptFor(c StorageChallenge, resp StorageResponse, provenBytes uint64) ServiceReceipt {
+	return ServiceReceipt{
+		ProviderNodeID: c.TargetNodeID,
 		VerifierNodeID: c.IssuerNodeID,
 		ServiceType:    ServiceStorage,
 		JobID:          c.AssignmentID,
@@ -216,7 +210,35 @@ func (a *Agent) BuildReceipt(c StorageChallenge, resp StorageResponse, provenByt
 		Quality:        1,
 		Nonce:          c.IssuedAt,
 	}
-	return NewSignedReceipt(a.Pub, a.Priv, r), nil
+}
+
+// BuildReceipt turns a verified challenge/response pair into a signed receipt.
+// It re-verifies rather than trusting the caller: this is the only door from
+// "work happened" to "work is claimable", so it does its own checking.
+//
+// Quantity is the proven-held byte count, not a self-declared figure.
+func (a *Agent) BuildReceipt(c StorageChallenge, resp StorageResponse, provenBytes uint64) (SignedReceipt, error) {
+	if err := a.VerifyStorageResponse(c, resp); err != nil {
+		return SignedReceipt{}, err
+	}
+	if c.TargetNodeID != a.NodeID() {
+		return SignedReceipt{}, ErrWrongTarget
+	}
+	return NewSignedReceipt(a.Pub, a.Priv, ReceiptFor(c, resp, provenBytes)), nil
+}
+
+// AttestationFor is the witness side of the same derivation: verify the proof,
+// rebuild the receipt from the evidence, and sign that. Returns the signature to
+// hand back to the provider.
+func (a *Agent) AttestationFor(c StorageChallenge, resp StorageResponse, provenBytes uint64) ([]byte, error) {
+	if c.TargetNodeID == a.NodeID() {
+		return nil, ErrSelfWitness
+	}
+	if err := a.VerifyStorageResponse(c, resp); err != nil {
+		return nil, err
+	}
+	h := CanonicalReceiptHash(ReceiptFor(c, resp, provenBytes))
+	return ed25519.Sign(a.Priv, h[:]), nil
 }
 
 // Attest countersigns a receipt as a witness, after verifying the underlying
