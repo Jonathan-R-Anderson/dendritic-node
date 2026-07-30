@@ -62,8 +62,16 @@ func Open(dir string, dataShards, parityShards, chunkBytes int, capacity int64) 
 	if err := os.MkdirAll(filepath.Join(dir, "shards"), 0700); err != nil {
 		return nil, err
 	}
-	db, err := bolt.Open(filepath.Join(dir, "metadata.db"), 0600, &bolt.Options{Timeout: time.Second})
+	metaPath := filepath.Join(dir, "metadata.db")
+	db, err := bolt.Open(metaPath, 0600, &bolt.Options{Timeout: time.Second})
 	if err != nil {
+		// bbolt reports a held file lock as the bare word "timeout", which reads
+		// like a network stall. Say what it actually is: a second node on the
+		// same data_dir. Only one process may own a data_dir at a time.
+		if errors.Is(err, bolt.ErrTimeout) {
+			return nil, fmt.Errorf("%s is locked by another syndichan-node already running on data_dir %s — "+
+				"stop it first (ps aux | grep syndichan-node) or point this instance at a different data_dir", metaPath, dir)
+		}
 		return nil, err
 	}
 	s := &Store{
