@@ -43,7 +43,7 @@ var storageRemovals = []struct {
 }{
 	{"missing S3 credentials", func(c *Config) { c.AccessKey, c.SecretKey = "", "" }},
 	{"short S3 secret", func(c *Config) { c.SecretKey = "too-short" }},
-	{"missing dashboard configuration", func(c *Config) { c.UIListen = "" }},
+	{"malformed dashboard address", func(c *Config) { c.UIListen = "not-an-address" }},
 	{"public dashboard address", func(c *Config) { c.UIListen = "0.0.0.0:9090" }},
 	{"missing S3 listen address", func(c *Config) { c.S3Listen = "" }},
 	{"missing storage capacity", func(c *Config) { c.CapacityBytes = 0 }},
@@ -385,5 +385,21 @@ func TestPlaceholderACMEEmailIsRejected(t *testing.T) {
 	cfg.Gateway.TLS.ACMEEmail = "operator@example.com"
 	if err := cfg.ValidateForRole(RoleGatewayOnly); err != nil {
 		t.Fatalf("non-ACME mode was held to the ACME contact rule: %v", err)
+	}
+}
+
+// An empty ui_listen means "no dashboard", which is a valid posture for a
+// server administered over SSH: the page is loopback-only and unauthenticated,
+// so an operator who cannot reach it should be able to not run it at all.
+func TestEmptyDashboardAddressDisablesItRatherThanFailing(t *testing.T) {
+	cfg := gatewayCandidateConfig(t)
+	cfg.UIListen = ""
+	if err := cfg.ValidateForRole(RoleStorage); err != nil {
+		t.Fatalf("an empty ui_listen should disable the dashboard, not fail: %v", err)
+	}
+	// A malformed one is still an error — "off" and "wrong" are different.
+	cfg.UIListen = "127.0.0.1"
+	if err := cfg.ValidateForRole(RoleStorage); err == nil {
+		t.Fatal("a malformed dashboard address was accepted")
 	}
 }

@@ -36,6 +36,10 @@ func main() {
 	var configFile string
 	flag.StringVar(&configFile, "config", "",
 		"path to config.json (default: the OS config location)")
+	// Headless operation: a rented server has no browser, and the management
+	// page binds loopback only, so the settings people change on first run also
+	// have flags. Everything else remains editable in the config JSON.
+	headless := registerHeadlessFlags()
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
@@ -59,8 +63,19 @@ func main() {
 	if err != nil {
 		logger.Fatalf("configuration %s: %v", path, err)
 	}
+	if done, ferr := applyHeadlessFlags(headless, &cfg, path); ferr != nil {
+		logger.Fatal(ferr)
+	} else if done {
+		return
+	}
 	logger.Printf("runtime role: %s (%s)", role, role.Description())
-	logger.Printf("configure gateway, storage and Docker at the management page: http://%s/", cfg.UIListen)
+	logger.Print(headlessSummary(cfg, path))
+	if cfg.UIListen != "" {
+		logger.Printf("configure gateway, storage and Docker at the management page: http://%s/ "+
+			"(or edit %s directly — every setting lives there)", cfg.UIListen, path)
+	} else {
+		logger.Printf("management page disabled; edit %s to configure this node", path)
+	}
 
 	noStorage := !role.NeedsStorage()
 	if created {
@@ -508,9 +523,16 @@ func main() {
 		logger.Printf("starting S3 gateway on %s", cfg.S3Listen)
 		go serve(s3Server, cfg, logger, "S3 gateway")
 	}
-	// The management page starts in every mode.
-	logger.Printf("starting management page on http://%s/", cfg.UIListen)
-	go serve(uiServer, cfg, logger, "management page")
+	// The management page starts in every mode EXCEPT when it is switched off.
+	// A headless server administered over SSH cannot reach a loopback page
+	// anyway, and running an unauthenticated one it never uses is pure surface.
+	if cfg.UIListen != "" {
+		logger.Printf("starting management page on http://%s/", cfg.UIListen)
+		go serve(uiServer, cfg, logger, "management page")
+	} else {
+		uiServer = nil
+		logger.Printf("management page disabled — configure by editing %s", path)
+	}
 	// Distributed Container Service. Off unless dcs.enabled + role.worker; a
 	// no-op otherwise, and non-fatal if Docker is unreachable. Needs the full
 	// storage node (host, DHT, I2P, store), so it is wired here in that path.

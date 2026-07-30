@@ -433,12 +433,19 @@ func (c Config) validateStorage() error {
 	if c.CapacityBytes > 8<<50 {
 		return errors.New("capacity_bytes must not exceed 8 PiB")
 	}
-	uiHost, _, err := net.SplitHostPort(c.UIListen)
-	if err != nil {
-		return fmt.Errorf("invalid listen address %q: %w", c.UIListen, err)
-	}
-	if !isLoopback(uiHost) {
-		return errors.New("the management dashboard must remain bound to loopback")
+	// An empty ui_listen turns the dashboard OFF. That is the right posture for
+	// a rented server: the page has no authentication (it is loopback-only for
+	// exactly that reason), so an operator who administers over SSH should be
+	// able to not run it at all rather than run something they cannot reach and
+	// would not want reachable.
+	if c.UIListen != "" {
+		uiHost, _, err := net.SplitHostPort(c.UIListen)
+		if err != nil {
+			return fmt.Errorf("invalid listen address %q: %w", c.UIListen, err)
+		}
+		if !isLoopback(uiHost) {
+			return errors.New("the management dashboard must remain bound to loopback")
+		}
 	}
 	s3Host, _, err := net.SplitHostPort(c.S3Listen)
 	if err != nil {
