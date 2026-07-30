@@ -163,3 +163,32 @@ func (n *Node) PeerForNodeID(nodeID [32]byte) (peer.ID, bool) {
 
 // LocalNodeID is this node's Proof-of-Facilitation id.
 func (n *Node) LocalNodeID() ([32]byte, error) { return NodeIDFromPeer(n.host.ID()) }
+
+// SigningKey returns the raw ed25519 keypair behind the libp2p identity.
+//
+// Deliberately narrow and deliberately raw: Proof-of-Facilitation receipts are
+// signed with the SAME key whose keccak256 is the node id, so a receipt's
+// signature cannot be separated from the identity it claims. PublicKey() is not
+// usable for that — it returns the protobuf-marshalled form, whose hash is a
+// different value entirely, and receipts signed against it would be
+// unattributable.
+//
+// The key stays in this process. It must never be logged, written outside
+// p2p.key, or sent anywhere: it is the node's whole identity, and anyone
+// holding it can claim its earnings.
+func (n *Node) SigningKey() (ed25519.PublicKey, ed25519.PrivateKey, error) {
+	priv := n.host.Peerstore().PrivKey(n.host.ID())
+	if priv == nil {
+		return nil, nil, errors.New("p2p: node private key unavailable")
+	}
+	raw, err := priv.Raw()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(raw) != ed25519.PrivateKeySize {
+		return nil, nil, errors.New("p2p: node identity is not ed25519")
+	}
+	privKey := ed25519.PrivateKey(append([]byte(nil), raw...))
+	pubKey := privKey.Public().(ed25519.PublicKey)
+	return pubKey, privKey, nil
+}

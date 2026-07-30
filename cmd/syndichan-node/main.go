@@ -209,6 +209,13 @@ func main() {
 		})
 		go node.AdvertiseStored(ctx)
 
+		// Proof-of-Facilitation: make this node auditable. Answering costs a
+		// Merkle path over data already on disk, and unauditable storage cannot
+		// be paid for.
+		if pof := startFacilitation(ctx, cfg, node, storageNode, logger); pof != nil {
+			defer pof.Close()
+		}
+
 		s3Server = &http.Server{
 			Addr: cfg.S3Listen, Handler: s3api.New(storageNode, cfg.AccessKey, cfg.SecretKey, logger),
 			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute,
