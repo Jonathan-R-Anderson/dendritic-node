@@ -109,7 +109,21 @@ func startFacilitation(ctx context.Context, cfg config.Config, node *p2p.Node,
 		logger.Printf("proof-of-facilitation: answering audits for %d shard(s) as node %x",
 			len(assignments), nodeID[:8])
 	}
-	logger.Printf("proof-of-facilitation: not issuing challenges yet (no network assignment directory)")
+	// The epoch loop: advertise, audit whoever we were drawn to audit, upload
+	// what we earned. Runs in the background so a slow relay never delays the
+	// node serving data.
+	go facilitation.RunEpochLoop(ctx, facilitation.EpochLoopConfig{
+		Agent:     agent,
+		Scheduler: scheduler,
+		Store:     storageNode,
+		Spool:     spool,
+		Gateway:   facilitation.NewGatewayClient(siteBaseURL(cfg)),
+		Pub:       pub,
+		Logger:    logger,
+		Interval:  10 * time.Minute,
+	})
+	logger.Printf("proof-of-facilitation: epoch loop started (epoch %d)",
+		facilitation.EpochAt(time.Now()))
 
 	return &facilitationRuntime{agent: agent, scheduler: scheduler, spool: spool}
 }
