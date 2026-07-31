@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -293,6 +294,22 @@ func main() {
 				ResultValidity: time.Duration(cfg.Gateway.Verification.ProbeResultValiditySeconds) * time.Second,
 			})
 		}
+		if cfg.Gateway.Content.Enabled {
+			originURL, parseErr := url.Parse(cfg.Gateway.Content.OriginURL)
+			if parseErr != nil {
+				logger.Fatalf("gateway content origin_url is invalid: %v", parseErr)
+			}
+			contentProxy := gateway.NewContentProxy(
+				originURL, originURL.Hostname(), signer.ID(),
+				cfg.Gateway.Content.OriginAddress,
+			)
+			if cfg.Gateway.Content.MaxBytes > 0 {
+				contentProxy.MaxBytes = cfg.Gateway.Content.MaxBytes
+			}
+			gatewayService.SetContentProxy(contentProxy)
+			logger.Printf("gateway serves content for %s under %s as %s",
+				originURL.Host, cfg.Gateway.PublicHostname, signer.ID())
+		}
 		gatewayAddress := net.JoinHostPort(
 			cfg.Gateway.ListenAddress, fmt.Sprint(cfg.Gateway.ListenPort),
 		)
@@ -364,6 +381,7 @@ func main() {
 				LocalAddress:      gatewayListener.Addr().String(),
 				LocalHostname:     cfg.Gateway.PublicHostname,
 				SNIAllowlist:      cfg.Gateway.Frontend.SNIAllowlist,
+				SNIRoutes:         cfg.Gateway.Frontend.SNIRoutes,
 				MaxConnections:    cfg.Gateway.Frontend.MaxConnections,
 				MaxBytesPerSecond: cfg.Gateway.Frontend.MaxBytesPerSecond,
 				HandshakeTimeout: time.Duration(

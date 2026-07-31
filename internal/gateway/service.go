@@ -35,7 +35,13 @@ type Service struct {
 	probeSlots         chan struct{}
 	trustLoopbackProxy bool
 	requireDHTReady    bool
+	content            *ContentProxy
 }
+
+// SetContentProxy enables serving site content under this gateway's own
+// hostname. Nil (the default) keeps the gateway a pure identity/probe endpoint,
+// which is what an operator who only wants to donate transport should get.
+func (s *Service) SetContentProxy(proxy *ContentProxy) { s.content = proxy }
 
 func NewService(signer Signer, version string, trustedProbes map[string]string, logger *log.Logger) *Service {
 	trusted := make(map[string]string, len(trustedProbes))
@@ -79,6 +85,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Gateway-Version", s.version)
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
+		// (control-plane routes below; content, if enabled, is the default case)
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": s.version})
 	case r.Method == http.MethodGet && r.URL.Path == "/readyz":
 		s.ready(w)
@@ -88,6 +95,17 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.challenge(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/probe/verify":
 		s.probe(w, r)
+	case s.content != nil:
+		// Site content. The control-plane routes above are matched first and
+		// always win, so a path collision cannot let the origin's response
+		// masquerade as this gateway's identity or health.
+		//
+		// The JSON defaults set above are wrong for HTML, and the origin sends
+		// its own; clear them rather than letting them override, or a signed
+		// page arrives labelled application/json and no-store.
+		w.Header().Del("Content-Type")
+		w.Header().Del("Cache-Control")
+		s.content.ServeHTTP(w, r)
 	default:
 		http.NotFound(w, r)
 	}

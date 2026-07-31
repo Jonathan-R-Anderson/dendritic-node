@@ -15,10 +15,23 @@ import (
 var ErrServerClosed = errors.New("frontend: server closed")
 
 type Config struct {
-	OriginAddress     string
-	LocalAddress      string
-	LocalHostname     string
-	SNIAllowlist      []string
+	OriginAddress string
+	LocalAddress  string
+	LocalHostname string
+	SNIAllowlist  []string
+	// SNIRoutes sends specific names somewhere other than the origin, without
+	// decrypting them.
+	//
+	// A volunteer's public 443 is a single socket, but it is not necessarily a
+	// single service: a host may already terminate an unrelated name that must
+	// keep working after the gateway takes the port. Passing those names through
+	// to whatever already served them turns "the gateway displaces that service"
+	// into "the gateway carries it", which is the difference between an outage
+	// and a port change.
+	//
+	// Routed names are still passthrough — the gateway never sees their
+	// plaintext, and the backend behind them keeps its own certificate.
+	SNIRoutes         map[string]string
 	MaxConnections    int
 	MaxBytesPerSecond int64
 	HandshakeTimeout  time.Duration
@@ -30,6 +43,7 @@ type Config struct {
 type Server struct {
 	config   Config
 	allowed  map[string]struct{}
+	routes   map[string]string
 	logger   interface{ Printf(string, ...any) }
 	slots    chan struct{}
 	mu       sync.Mutex
@@ -61,12 +75,26 @@ func New(config Config, logger interface{ Printf(string, ...any) }) (*Server, er
 		}
 		allowed[normalized] = struct{}{}
 	}
+	routes := make(map[string]string, len(config.SNIRoutes))
+	for hostname, target := range config.SNIRoutes {
+		normalized := normalizeHost(hostname)
+		if normalized == "" || normalized == localHostname {
+			return nil, fmt.Errorf("frontend: invalid or duplicate-purpose routed SNI name %q", hostname)
+		}
+		if _, _, err := net.SplitHostPort(target); err != nil {
+			return nil, fmt.Errorf("frontend: route target for %q must be host:port", hostname)
+		}
+		// A routed name is reachable by definition; requiring it in the
+		// allowlist as well would be a second place to forget.
+		allowed[normalized] = struct{}{}
+		routes[normalized] = target
+	}
 	if len(allowed) == 0 {
 		return nil, errors.New("frontend: origin SNI allowlist is empty")
 	}
 	config.LocalHostname = localHostname
 	return &Server{
-		config: config, allowed: allowed, logger: logger,
+		config: config, allowed: allowed, routes: routes, logger: logger,
 		slots:  make(chan struct{}, config.MaxConnections),
 		active: make(map[net.Conn]struct{}),
 	}, nil
@@ -160,6 +188,12 @@ func (s *Server) handle(client net.Conn) {
 		sendProxy = false
 	} else if _, allowed := s.allowed[hostname]; !allowed {
 		return
+	} else if routed, ok := s.routes[hostname]; ok {
+		// A co-tenant service on this host. It speaks for itself and holds its
+		// own certificate, so the PROXY header the origin expects would be
+		// noise at best and a protocol error at worst.
+		target = routed
+		sendProxy = false
 	}
 	upstream, err := (&net.Dialer{Timeout: s.config.DialTimeout}).Dial("tcp", target)
 	if err != nil {

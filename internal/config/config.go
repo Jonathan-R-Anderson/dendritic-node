@@ -199,20 +199,47 @@ type GatewayConfig struct {
 	// DNS credentials exist only on that server.
 	RegistrationAPI string                `json:"registration_api"`
 	Frontend        GatewayFrontendConfig `json:"frontend"`
+	Content         GatewayContentConfig  `json:"content"`
+}
+
+// GatewayContentConfig serves site content under the gateway's OWN hostname.
+//
+// Distinct from Frontend, which forwards encrypted bytes it cannot read. This
+// one decrypts, fetches and re-serves, so the gateway becomes a party a reader
+// can name — and, necessarily, one that could lie. That is the trade: a
+// passthrough gateway is harmless and unmeasurable, and only a gateway that
+// could tamper can be shown not to have. See internal/gateway/contentproxy.go.
+//
+// Off by default. Donating transport must not silently enrol an operator in
+// handling other people's reads.
+type GatewayContentConfig struct {
+	Enabled bool `json:"enabled"`
+	// OriginURL is the site being served, e.g. https://syndichan.org.
+	OriginURL string `json:"origin_url,omitempty"`
+	// OriginAddress pins the origin to a literal host:port. DNS for the site
+	// points at gateways too, so resolving the name here could send this
+	// gateway's fetch to another gateway: a loop, and a way for one volunteer's
+	// answer to be laundered through another's identity.
+	OriginAddress string `json:"origin_address,omitempty"`
+	MaxBytes      int64  `json:"max_bytes,omitempty"`
 }
 
 type GatewayFrontendConfig struct {
-	Enabled                 bool     `json:"enabled"`
-	OriginAddress           string   `json:"origin_address"`
-	OriginServerName        string   `json:"origin_server_name"`
-	SNIAllowlist            []string `json:"sni_allowlist"`
-	MaxConnections          int      `json:"max_connections"`
-	MaxBytesPerSecond       int64    `json:"max_bytes_per_second"`
-	HandshakeTimeoutSeconds int      `json:"handshake_timeout_seconds"`
-	DialTimeoutSeconds      int      `json:"dial_timeout_seconds"`
-	IdleTimeoutSeconds      int      `json:"idle_timeout_seconds"`
-	DrainSeconds            int      `json:"drain_seconds"`
-	ProxyProtocol           bool     `json:"proxy_protocol"`
+	Enabled          bool     `json:"enabled"`
+	OriginAddress    string   `json:"origin_address"`
+	OriginServerName string   `json:"origin_server_name"`
+	SNIAllowlist     []string `json:"sni_allowlist"`
+	// SNIRoutes forwards specific names to a co-tenant service on this host
+	// instead of to the origin, without decrypting them. Lets a gateway take
+	// public 443 on a machine that already terminates an unrelated name.
+	SNIRoutes               map[string]string `json:"sni_routes,omitempty"`
+	MaxConnections          int               `json:"max_connections"`
+	MaxBytesPerSecond       int64             `json:"max_bytes_per_second"`
+	HandshakeTimeoutSeconds int               `json:"handshake_timeout_seconds"`
+	DialTimeoutSeconds      int               `json:"dial_timeout_seconds"`
+	IdleTimeoutSeconds      int               `json:"idle_timeout_seconds"`
+	DrainSeconds            int               `json:"drain_seconds"`
+	ProxyProtocol           bool              `json:"proxy_protocol"`
 	// AllowPrivateOrigin is an explicit development escape hatch. Production
 	// configurations must never silently turn a volunteer into a route to its
 	// loopback or private network.
@@ -516,6 +543,26 @@ func (c Config) validateGateway() error {
 		}
 		if g.Frontend.Enabled && g.TLS.Mode == "reverse_proxy" {
 			return errors.New("gateway frontend requires existing or ACME TLS for its local identity endpoint")
+		}
+	}
+	if g.Content.Enabled {
+		if !g.Enabled {
+			return errors.New("gateway.content requires gateway.enabled: content is served under the gateway's own hostname")
+		}
+		origin, err := url.Parse(g.Content.OriginURL)
+		if err != nil || origin.Scheme != "https" || origin.Host == "" {
+			return errors.New("gateway.content.origin_url must be an HTTPS URL, e.g. https://syndichan.org")
+		}
+		if g.Content.OriginAddress != "" {
+			if _, _, err := net.SplitHostPort(g.Content.OriginAddress); err != nil {
+				return errors.New("gateway.content.origin_address must be host:port")
+			}
+		}
+		// Serving content under a hostname the operator does not hold a
+		// certificate for cannot work, and the failure would look like a
+		// TLS error four steps later rather than a configuration mistake.
+		if g.TLS.Mode == "reverse_proxy" && g.PublicHostname == "" {
+			return errors.New("gateway.content needs a public_hostname readers can reach")
 		}
 	}
 	if g.Enabled {
