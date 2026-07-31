@@ -13,6 +13,9 @@ It does two jobs, and you choose one or both:
 - **HTTPS gateway.** Your machine acts as one of the public front doors for
   `syndichan.org`. This one needs a public port and is off by default.
 
+Donated storage **earns credits** you can spend in the store on
+`syndichan.org` — see [Getting paid](#getting-paid-proof-of-facilitation).
+
 That's the whole idea. The rest of this page is how to build it, how to run it,
 and what to open on your router if you want to run a gateway from home.
 
@@ -105,8 +108,8 @@ Open the dashboard to see what you're storing, change how much disk you donate,
 and reject anything you don't want to host. Both ports are loopback-only and
 should stay that way.
 
-**Everything is configured on the management page — there are no configuration
-flags.** Open `http://127.0.0.1:9090` and from there you can:
+**Everything is configured in the config file, and the management page is one
+way to edit it.** Open `http://127.0.0.1:9090` and from there you can:
 
 - donate more (or less) disk, and choose **where** the encrypted shards live;
 - switch to **cache-only** (keep only your own content, host nothing for peers);
@@ -116,12 +119,110 @@ flags.** Open `http://127.0.0.1:9090` and from there you can:
 - set the node's **run mode** — storage, gateway-only, or probe-only.
 
 Changes are written to the config file and most take effect the next time the
-node starts. The one and only command-line flag is `-config <path>`, which points
-at a config file other than the default location above.
+node starts.
+
+**On a server with no browser, use the flags instead.** The management page
+binds loopback only — deliberately, since it has no password — so an operator
+with only SSH cannot reach it at all. Every setting lives in the JSON and can be
+edited with any text editor; these are the handful people change on first run:
+
+| Flag | What it does |
+| --- | --- |
+| `-config <path>` | use a config file other than the default location above |
+| `-payout 0x…` | where CREDIT earnings are sent; saved to the config |
+| `-capacity-gib <n>` | how much disk to donate |
+| `-ui-listen off` | turn the management page off entirely |
+| `-show-config` | print the effective config (secret redacted) and exit |
+| `-config-path` | print where the config file is and exit |
+
+A flag is saved to the config and used from then on, so you pass it once rather
+than baking it into a service unit:
+
+```sh
+./syndichan-node -payout 0xYourWalletAddress -capacity-gib 100 -ui-listen off
+```
+
+A bad payout address is refused rather than saved with a warning: a typo there
+sends every reward the node ever earns to an address nobody controls.
 
 Back up `master.key` and `metadata.db` from your data directory. Without them
 your own uploaded files cannot be reassembled — no peer can do it for you,
 which is the point.
+
+## Getting paid: Proof of Facilitation
+
+Donating disk earns **CREDIT**, the network's token on ZKsync Era. You spend it
+in the store on `syndichan.org`, and other people buy it with a card — which is
+where the money behind it comes from.
+
+### Set a payout address
+
+Nothing is earned without one, because there is nowhere to send it:
+
+```sh
+./syndichan-node -payout 0xYourWalletAddress
+```
+
+or set `"payout_address"` in the config file. On start the node publishes that
+address **signed by its own identity key**, so nobody who learns your node's id
+— which is public, it is the libp2p peer id — can redirect your earnings to
+themselves. The declaration carries a sequence number, so the newest signed
+statement wins and an old one cannot be replayed to point you somewhere else.
+
+It is an ordinary wallet address. Nothing about it needs to match the machine
+the node runs on, so several nodes can pay into one wallet.
+
+### What actually earns
+
+Time is cut into **epochs** of one hour. In each one your node:
+
+1. **advertises what it holds** — the shards it can prove possession of;
+2. **answers audits** — a peer drawn to test you asks for a Merkle proof over
+   chunks it picks from the epoch randomness, so the answer cannot be prepared
+   in advance and possession is the only way to produce it;
+3. **performs audits** — you are drawn to test other people's shards on the
+   same public rule, and doing that work is worth more than merely being
+   auditable, because the network needs auditors more than it needs volunteers;
+4. **uploads the receipts** it earned, each signed by the provider and attested
+   by witnesses the protocol selected — not chosen by either party.
+
+At the end of an epoch the receipts are settled: their roots go on-chain, a
+challenge window opens in which anyone holding the same receipts can recompute
+the roots and dispute a mismatch, and rewards are claimable against the reward
+root once it finalizes.
+
+Two consequences worth stating plainly:
+
+- **A cache-only node earns nothing from storage.** It hosts no shards for
+  peers, so there is nothing for anyone to audit. That is a legitimate way to
+  run — you keep your own content and nothing else — it just is not paid work.
+- **Being offline is not punished, it is simply unpaid.** A node nobody can
+  reach earns nothing that epoch, and unreachable is never recorded as
+  dishonest. A power cut is not fraud.
+
+### Reputation
+
+Every node carries a score derived from what it actually did — proofs accepted,
+audits performed, proofs failed — published at
+[syndichan.org/reputation](https://syndichan.org/reputation). It is recomputed
+from the evidence on every view rather than stored, so there is no number anyone
+can edit, and you can recompute it yourself from the same public receipts.
+
+Gains are slow and penalties are not. Failing an audit costs a little; being
+caught attesting with witnesses nobody drew costs enormously, because a
+reputation that is cheap to rebuild is not worth protecting.
+
+### Watching it work
+
+```
+proof-of-facilitation: earnings will be paid to 0x…
+proof-of-facilitation: epoch anchor is epoch 0 at unix …, 3600s each
+proof-of-facilitation: answering audits for 12 shard(s) as node 9587ac2d…
+proof-of-facilitation: uploaded 3 receipt(s) for epoch 41
+```
+
+The node id in that log is the same one the reputation page lists. If you see
+`NO PAYOUT ADDRESS SET`, the node is serving the network for free.
 
 ## Running from home: ports and forwarding
 

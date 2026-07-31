@@ -17,21 +17,22 @@ import (
 
 // Wiring the node into Proof-of-Facilitation.
 //
-// This turns the audit machinery on in the one direction that is safe to enable
-// unconditionally: ANSWERING challenges. A node that stores shards can prove it
-// at any time, the proof costs a Merkle path over data already on disk, and
-// being auditable is what makes the storage worth paying for.
+// Three jobs, all on one p2p protocol: answer challenges about what this node
+// holds, witness other nodes' claims when drawn to, and issue the challenges
+// this node is drawn to issue.
 //
-// Issuing challenges is deliberately NOT started here. A challenger needs the
-// network's assignment list — who is supposed to hold what — and no directory
-// for that exists yet. Running the issuing side against a partial view would
-// produce audits of a handful of visible peers and silently ignore everyone
-// else, which is worse than not auditing: it would look like coverage.
+// The witness half is what makes a receipt evidence rather than a diary entry.
+// A receipt signed only by its provider is that provider's own account of its
+// own work; settlement wants signatures from the specific nodes the protocol
+// drew for that claim, and it will reject anything else. So a provider collects
+// them, and every node answers requests to give them — after checking, itself,
+// that it was actually drawn and that the proof it is endorsing holds up.
 
 type facilitationRuntime struct {
 	agent     *facilitation.Agent
 	scheduler *facilitation.Scheduler
 	spool     *facilitation.ReceiptStore
+	views     *facilitation.EpochViews
 }
 
 // startFacilitation installs the challenge responder. Returns nil (and logs
@@ -63,32 +64,62 @@ func startFacilitation(ctx context.Context, cfg config.Config, node *p2p.Node,
 		return nil
 	}
 
+	send := func(ctx context.Context, target [32]byte, payload []byte) ([]byte, error) {
+		peerID, ok := node.PeerForNodeID(target)
+		if !ok {
+			// Unreachable, NOT failed: the caller must not record an offline
+			// peer as one that lost its data.
+			return nil, facilitation.ErrPeerUnreachable
+		}
+		return node.SendChallenge(ctx, peerID, payload)
+	}
+	gateway := facilitation.NewGatewayClient(siteBaseURL(cfg))
+	views := facilitation.NewEpochViews(gateway)
+
 	scheduler := &facilitation.Scheduler{
-		Agent: agent,
-		Store: spool,
-		Transport: facilitation.P2PTransport{Send: func(ctx context.Context, target [32]byte, payload []byte) ([]byte, error) {
-			peerID, ok := node.PeerForNodeID(target)
-			if !ok {
-				// Unreachable, NOT failed: the caller must not record an
-				// offline peer as one that lost its data.
-				return nil, facilitation.ErrPeerUnreachable
-			}
-			return node.SendChallenge(ctx, peerID, payload)
-		}},
+		Agent:     agent,
+		Store:     spool,
+		Transport: facilitation.P2PTransport{Send: send},
+	}
+	// Collect attestations for every receipt this node earns. Installed as a
+	// hook rather than called inline so the scheduler stays testable without a
+	// network, and so a node that cannot reach the witness pool still spools
+	// its receipts instead of losing the proof.
+	scheduler.Attest = func(ctx context.Context, sr *facilitation.SignedReceipt,
+		c facilitation.StorageChallenge, resp facilitation.StorageResponse,
+		provenBytes uint64) error {
+		view, err := views.For(ctx, sr.Receipt.Epoch)
+		if err != nil {
+			return err
+		}
+		got, err := collectErr(facilitation.CollectAttestations(
+			ctx, sr, c, resp, provenBytes, view, send))
+		if err != nil {
+			return err
+		}
+		need := facilitation.ThresholdFor(sr.Receipt.ServiceType).Need
+		if got < need {
+			hash := sr.Hash()
+			// Logged, not failed: the receipt is still spooled and witnesses
+			// can still arrive. Silence here would hide the difference between
+			// "not paid yet" and "will never be paid".
+			logger.Printf("proof-of-facilitation: receipt %x has %d of the %d "+
+				"attestations it needs", hash[:6], got, need)
+		}
+		return nil
 	}
 
-	node.SetChallengeHandler(facilitation.ChallengeResponder(
-		scheduler, facilitation.StoreShardLoader(storageNode)))
+	node.SetChallengeHandler(facilitation.FacilitationResponder(
+		scheduler, views, facilitation.StoreShardLoader(storageNode)))
 
-	// Publish where earnings should go. Without this the node does the work and
-	// the credits have nowhere to land, so it is announced loudly rather than
-	// left as a silent default.
+	// Publish where earnings should go, and file for registration. Without a
+	// payout address the node does the work and the credits have nowhere to
+	// land, so it is announced loudly rather than left as a silent default.
 	if cfg.PayoutAddress == "" {
 		logger.Printf("proof-of-facilitation: NO PAYOUT ADDRESS SET — this node will earn nothing. " +
-			"Set one on the management page.")
+			"Set one with -payout 0x… or in the config file.")
 	} else {
 		declaration := facilitation.DeclarePayout(pub, priv, cfg.PayoutAddress, uint64(time.Now().Unix()))
-		gateway := facilitation.NewGatewayClient(siteBaseURL(cfg))
 		publishCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if err := gateway.PublishPayout(publishCtx, declaration); err != nil {
 			// Not fatal: the node still serves and still earns receipts. The
@@ -99,6 +130,7 @@ func startFacilitation(ctx context.Context, cfg config.Config, node *p2p.Node,
 			logger.Printf("proof-of-facilitation: earnings will be paid to %s", cfg.PayoutAddress)
 		}
 		cancel()
+		registerSelf(ctx, cfg, gateway, pub, priv, logger)
 	}
 
 	assignments, err := facilitation.LocalAssignments(agent.NodeID(), storageNode)
@@ -109,6 +141,12 @@ func startFacilitation(ctx context.Context, cfg config.Config, node *p2p.Node,
 		logger.Printf("proof-of-facilitation: answering audits for %d shard(s) as node %x",
 			len(assignments), nodeID[:8])
 	}
+	// The registry binds this key to a wallet, and registering is what makes the
+	// node eligible to be paid. It is printed in full because an operator may
+	// have to paste it somewhere — deriving it from the peer id by hand means
+	// base58-decoding a multihash and unwrapping a protobuf, which nobody
+	// should have to do to get paid for their disk.
+	logger.Printf("proof-of-facilitation: p2p public key %x", []byte(pub))
 	// The epoch loop: advertise, audit whoever we were drawn to audit, upload
 	// what we earned. Runs in the background so a slow relay never delays the
 	// node serving data.
@@ -117,7 +155,7 @@ func startFacilitation(ctx context.Context, cfg config.Config, node *p2p.Node,
 		Scheduler: scheduler,
 		Store:     storageNode,
 		Spool:     spool,
-		Gateway:   facilitation.NewGatewayClient(siteBaseURL(cfg)),
+		Gateway:   gateway,
 		Pub:       pub,
 		Logger:    logger,
 		Interval:  10 * time.Minute,
@@ -127,7 +165,7 @@ func startFacilitation(ctx context.Context, cfg config.Config, node *p2p.Node,
 	// put a number in the log that no other node agrees with.
 	logger.Printf("proof-of-facilitation: epoch loop started")
 
-	return &facilitationRuntime{agent: agent, scheduler: scheduler, spool: spool}
+	return &facilitationRuntime{agent: agent, scheduler: scheduler, spool: spool, views: views}
 }
 
 func (f *facilitationRuntime) Close() {
@@ -158,3 +196,64 @@ func siteBaseURL(cfg config.Config) string {
 	}
 	return parsed.Scheme + "://" + parsed.Host
 }
+
+// nodeCapabilities is the bitmap this node files with the registry: what it
+// actually offers, derived from the config rather than assumed.
+//
+// Witness is unconditional. Auditing a peer needs no stored data and no public
+// port — it is a signature over a Merkle proof someone else produced — so every
+// node can do it, and a network whose auditors must also be providers has an
+// audit pool made entirely of people with a shared interest in lenient audits.
+func nodeCapabilities(cfg config.Config) uint64 {
+	caps := facilitation.CapDHT | facilitation.CapWitness
+	if !cfg.CacheOnly {
+		caps |= facilitation.CapStorage
+	}
+	if cfg.Gateway.Enabled {
+		caps |= facilitation.CapGateway
+	}
+	if cfg.DCS.Enabled && cfg.DCS.Role.Worker {
+		caps |= facilitation.CapDockerWorker
+	}
+	return caps
+}
+
+// registerSelf files this node's registration with the site.
+//
+// The node cannot put itself on-chain: NodeRegistry needs a transaction, which
+// needs a wallet key, and a rented server holding one would give away exactly
+// what the signed payout declaration exists to protect. So it files the half
+// only it can produce — proof that this p2p key consented to this payout
+// address — and the wallet owner turns that into a registry entry.
+//
+// Failure is logged, never fatal. An unregistered node still serves the network
+// and still spools receipts; it just has no wallet on-chain for settlement to
+// pay, and it retries on the next start.
+func registerSelf(ctx context.Context, cfg config.Config, gateway *facilitation.GatewayClient,
+	pub ed25519.PublicKey, priv ed25519.PrivateKey, logger *log.Logger) {
+	caps := nodeCapabilities(cfg)
+	req := facilitation.SelfRegistration(pub, priv, cfg.PayoutAddress, caps, uint64(time.Now().Unix()))
+
+	registerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	status, err := gateway.Register(registerCtx, req)
+	if err != nil {
+		logger.Printf("proof-of-facilitation: could not file registration (%v) — will retry next start", err)
+		return
+	}
+	switch status {
+	case "submitted":
+		logger.Printf("proof-of-facilitation: registered on-chain (capabilities %d)", caps)
+	default:
+		// Only say this when it is true. Printing "go and register" beneath
+		// "registered on-chain" trains an operator to ignore both.
+		logger.Printf("proof-of-facilitation: registration filed (capabilities %d, status %q) — "+
+			"until the wallet owner submits it at %s/admin/contracts, settlement has no "+
+			"wallet to pay and rejects this node's receipts", caps, status, siteBaseURL(cfg))
+	}
+}
+
+// collectErr keeps the attestation hook readable: CollectAttestations returns a
+// count and an error together, and the count is meaningful even when the error
+// is not nil.
+func collectErr(n int, err error) (int, error) { return n, err }

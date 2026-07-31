@@ -31,6 +31,32 @@ import (
 // controls; the contract itself remains open to a direct call, which is a
 // contract-level issue and not something the node can fix.
 
+// ZeroCommitment is the endpoint commitment for a node reachable only over
+// I2P: there is no endpoint worth committing to that would not also say where
+// the machine is, which is the thing I2P exists to hide.
+const ZeroCommitment = "0x" + "0000000000000000000000000000000000000000000000000000000000000000"
+
+// SelfRegistration is the registration a node files for itself.
+//
+// It carries no secp256k1 signature, and cannot: the node holds an ed25519
+// identity, not a wallet key, and putting a wallet key on a rented server to
+// register it would trade the whole point of the payout declaration for a
+// convenience. What it does carry is proof that this p2p key consented to this
+// payout address, which is the part only the node can supply. Turning that into
+// an on-chain record is the wallet owner's job, and costs them gas.
+func SelfRegistration(pub ed25519.PublicKey, priv ed25519.PrivateKey,
+	wallet string, capabilities uint64, nonce uint64) RegistrationRequest {
+	return RegistrationRequest{
+		P2PPublicKey:       hex.EncodeToString(pub),
+		Wallet:             strings.ToLower(wallet),
+		Capabilities:       capabilities,
+		EndpointCommitment: ZeroCommitment,
+		Nonce:              nonce,
+		P2PProof: P2PRegistrationProof(priv, wallet, capabilities, ZeroCommitment,
+			new(big.Int).SetUint64(nonce)),
+	}
+}
+
 // P2PRegistrationProof signs the wallet binding with the node's p2p key. The
 // message must match the site's proof_message byte for byte.
 func P2PRegistrationProof(priv ed25519.PrivateKey, wallet string, capabilities uint64,

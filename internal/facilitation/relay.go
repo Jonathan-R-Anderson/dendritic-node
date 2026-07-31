@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strings"
 )
@@ -174,4 +175,69 @@ func (c *GatewayClient) UploadReceipts(ctx context.Context, receipts []SignedRec
 		return 0, err
 	}
 	return out.Stored, nil
+}
+
+
+type candidatesListing struct {
+	Candidates []struct {
+		P2PPublicKey  string `json:"p2p_public_key"`
+		NodeID        string `json:"node_id"`
+		StakeWei      string `json:"stake_wei"`
+		ReputationBps uint32 `json:"reputation_bps"`
+		Group         string `json:"group"`
+	} `json:"candidates"`
+	BootstrapStakeFloorWei string `json:"bootstrap_stake_floor_wei"`
+}
+
+// FetchCandidates reads the witness pool: every registered node, with the
+// weights it is drawn on.
+//
+// Node ids are DERIVED from the published keys rather than read from the
+// node_id field, for the same reason assignments are: a directory that could
+// name a node id independently of the key behind it could put a victim in a
+// draw it has no way to answer.
+func (c *GatewayClient) FetchCandidates(ctx context.Context) ([]Candidate, error) {
+	url := strings.TrimSuffix(c.BaseURL, "/") + "/api/v1/pof/candidates"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("facilitation: witness pool unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("facilitation: witness pool returned HTTP %d", resp.StatusCode)
+	}
+	var listing candidatesListing
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		return nil, err
+	}
+
+	out := make([]Candidate, 0, len(listing.Candidates))
+	for _, entry := range listing.Candidates {
+		raw, err := hex.DecodeString(strings.TrimPrefix(entry.P2PPublicKey, "0x"))
+		if err != nil || len(raw) != 32 {
+			continue
+		}
+		stake, ok := new(big.Int).SetString(strings.TrimSpace(entry.StakeWei), 10)
+		if !ok {
+			// An unparseable stake is treated as none rather than skipped: the
+			// node is registered, and dropping it here would give this node a
+			// smaller pool than settlement uses.
+			stake = big.NewInt(0)
+		}
+		reputation := entry.ReputationBps
+		if reputation == 0 {
+			reputation = 10000
+		}
+		out = append(out, Candidate{
+			NodeID:        NodeID(raw),
+			Stake:         stake,
+			ReputationBps: reputation,
+			Group:         entry.Group,
+		})
+	}
+	return out, nil
 }

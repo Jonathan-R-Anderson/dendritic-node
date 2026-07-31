@@ -190,12 +190,48 @@ func (a *Agent) VerifyStorageResponse(c StorageChallenge, resp StorageResponse) 
 	return nil
 }
 
+// ProvableBytes is the most a challenge/response pair can possibly demonstrate.
+//
+// The Merkle root commits to exactly NumChunks leaves, and every sampled chunk
+// shows how big a leaf is, so the shard cannot be larger than NumChunks leaves
+// of the largest size actually seen. Anything above that was not proven; it was
+// asserted.
+//
+// The bound is conservative when every sampled chunk happens to be the short
+// final one, which costs an honest provider some credit on that single receipt
+// and only when NumChunks is tiny. That is the right way round: rewards are
+// shared out of a fixed epoch budget, so an over-claim is not the claimant
+// taking extra from nowhere — it is the claimant taking it from everyone else
+// who worked that epoch.
+func ProvableBytes(c StorageChallenge, resp StorageResponse) uint64 {
+	widest := 0
+	for _, p := range resp.Proofs {
+		if len(p.Chunk) > widest {
+			widest = len(p.Chunk)
+		}
+	}
+	if widest <= 0 || c.NumChunks <= 0 {
+		return 0
+	}
+	return uint64(c.NumChunks) * uint64(widest)
+}
+
 // ReceiptFor derives the receipt a challenge/response pair earns. Pure and
 // deterministic: the provider builds it to sign, and every witness rebuilds it
-// independently to know what it is attesting to. If a witness signed a receipt
-// the provider handed it, the provider could quietly inflate Quantity — so the
-// witness derives its own from the evidence instead.
+// independently to know what it is attesting to.
+//
+// Quantity is CLAMPED to what the evidence supports rather than taken on trust.
+// It used to be whatever the caller passed, which meant a provider could name
+// its own figure: Score weights payouts linearly by quantity against a fixed
+// epoch budget and a per-node cap, so a single receipt claiming a terabyte took
+// the entire cap and left every honest node with a rounding error. Clamping
+// here rather than at the witness is deliberate — this is the one derivation
+// both sides run, so provider and witness arrive at the same number and the
+// signatures still match.
 func ReceiptFor(c StorageChallenge, resp StorageResponse, provenBytes uint64) ServiceReceipt {
+	if limit := ProvableBytes(c, resp); provenBytes > limit {
+		provenBytes = limit
+	}
 	return ServiceReceipt{
 		ProviderNodeID: c.TargetNodeID,
 		VerifierNodeID: c.IssuerNodeID,
