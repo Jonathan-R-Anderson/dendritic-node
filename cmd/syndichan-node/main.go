@@ -285,7 +285,18 @@ func main() {
 		gatewayService.SetTrustLoopbackProxy(cfg.Gateway.TLS.Mode == "reverse_proxy")
 		// The storage DHT only exists in the storage role; a standalone
 		// gateway or probe reports readiness from its listener alone.
-		gatewayService.SetRequireDHTReady(!noStorage)
+		//
+		// A content-serving gateway is excluded even in storage mode, because
+		// its gateway duty is fetching from the origin over HTTPS and does not
+		// touch the DHT. Coupling them means a node that is serving content
+		// perfectly reports not_ready because an unrelated subsystem has not
+		// bootstrapped -- the controller then refuses its registration and
+		// pulls its DNS, which is an outage caused by a healthy gateway
+		// truthfully describing a part of itself nobody was asking about.
+		//
+		// Readiness is a self-report either way; the controller still connects
+		// back independently before publishing anything.
+		gatewayService.SetRequireDHTReady(!noStorage && !cfg.Gateway.Content.Enabled)
 		if cfg.Gateway.ProbeEnabled {
 			gatewayService.SetProber(&gateway.Prober{
 				Signer: signer, Network: cfg.Gateway.ProbeNetwork,
@@ -293,6 +304,23 @@ func main() {
 				Timeout:        time.Duration(cfg.Gateway.Verification.VerificationTimeoutSeconds) * time.Second,
 				ResultValidity: time.Duration(cfg.Gateway.Verification.ProbeResultValiditySeconds) * time.Second,
 			})
+		}
+		if cfg.Gateway.Validator.Enabled {
+			originURL := cfg.Gateway.Validator.OriginURL
+			if originURL == "" {
+				originURL = "https://syndichan.org"
+			}
+			validator := gateway.NewValidator(signer, originURL, logger,
+				time.Now().UnixNano())
+			if seconds := cfg.Gateway.Validator.IntervalSeconds; seconds > 0 {
+				validator.Interval = time.Duration(seconds) * time.Second
+			}
+			if size := cfg.Gateway.Validator.SampleSize; size > 0 {
+				validator.SampleSize = size
+			}
+			go validator.Run(ctx)
+			logger.Printf("validator auditing gateways published by %s every %s",
+				originURL, validator.Interval)
 		}
 		if cfg.Gateway.Content.Enabled {
 			originURL, parseErr := url.Parse(cfg.Gateway.Content.OriginURL)
@@ -459,7 +487,18 @@ func main() {
 		}
 		gatewayRegistry.PublicHostname = cfg.Gateway.PublicHostname
 		var publisher gateway.RegistrationPublisher = gatewayRegistry
-		if node != nil {
+		// The DHT record is the PEER-VERIFIED artifact: every reader of it
+		// independently checks the probe quorum before accepting it, so a
+		// registration carrying no probe results can never be published there.
+		// Including the DHT publisher without a quorum therefore adds a step
+		// that is guaranteed to fail.
+		//
+		// That is not merely noisy. MultiPublisher stops at the first error, the
+		// manager treats the whole attempt as failed, and the health machine
+		// eventually reports the gateway unhealthy -- which the registry client
+		// sends as an UNREGISTER. A gateway serving perfectly over HTTPS would
+		// register and then delete itself, once a minute, forever.
+		if node != nil && cfg.Gateway.Verification.Enabled {
 			publisher = gateway.MultiPublisher{
 				// The central controller verifies the direct source IP and owns
 				// DNS. The DHT receives the record only after that request succeeds.

@@ -189,6 +189,21 @@ func (p *ContentProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Syndichan-Gateway", p.NodeID)
 	w.Header().Set("X-Gateway-Version", "1")
 
+	// Readable cross-origin, so a reader on syndichan.org can fetch the same
+	// object here and compare it against the origin's signature. Without this
+	// the browser hides the response and a gateway becomes un-auditable by the
+	// only party positioned to audit it.
+	//
+	// Safe precisely because of the rules above: no cookie was forwarded, so
+	// this is the anonymous public view and nothing here is authorised by the
+	// reader's identity. Credentials are NOT allowed, which is what keeps that
+	// true — with them, "*" would let any site read a logged-in view.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Credentials", "false")
+	w.Header().Set("Access-Control-Expose-Headers",
+		"X-Syndichan-Version, X-Syndichan-Hash, X-Syndichan-Signature, "+
+			"X-Syndichan-Key, X-Syndichan-Gateway, X-Gateway-Version")
+
 	w.WriteHeader(response.StatusCode)
 	if r.Method == http.MethodHead {
 		return

@@ -165,3 +165,45 @@ func TestControllerRegistrationRejectsIneligibleAddresses(t *testing.T) {
 		t.Fatal("a registration with no addresses was accepted")
 	}
 }
+
+// A registration goes to the controller and to the DHT through one publisher
+// that returns on the first error. A gateway without a peer probe quorum
+// always fails the DHT step -- so the controller would accept and store
+// sequence N while the node kept N-1, then offer N again after a restart and
+// be refused with 409 forever.
+//
+// The sequence must therefore advance on the ATTEMPT. This is a regression
+// test for a failure that is silent, permanent, and indistinguishable from a
+// gateway that simply stopped working.
+func TestSequenceAdvancesEvenWhenPublishingFails(t *testing.T) {
+	config := noQuorumManagerConfig(t)
+	failing := &recordingPublisher{err: context.DeadlineExceeded}
+	manager, err := NewManager(newTestSigner(t), failing, config, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.verify(context.Background())
+	first := manager.Current()
+	if first == nil {
+		t.Fatal("a failed publish left no registration; the sequence it spent is lost")
+	}
+
+	manager.verify(context.Background())
+	second := manager.Current()
+	if second.Sequence <= first.Sequence {
+		t.Fatalf("sequence did not advance after a failed publish: %d then %d; "+
+			"the controller would refuse the retry as a replay",
+			first.Sequence, second.Sequence)
+	}
+
+	// And it must survive a restart, or the next boot reuses a spent number.
+	restarted, err := NewManager(newTestSigner(t), failing, config, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := restarted.Current()
+	if recovered == nil || recovered.Sequence < second.Sequence {
+		t.Fatalf("restart did not recover the spent sequence: got %v, want >= %d",
+			recovered, second.Sequence)
+	}
+}

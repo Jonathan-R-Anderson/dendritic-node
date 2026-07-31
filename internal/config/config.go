@@ -197,9 +197,32 @@ type GatewayConfig struct {
 	// RegistrationAPI is a public, credential-free HTTPS endpoint. The node
 	// authenticates requests with its existing Ed25519 identity; authoritative
 	// DNS credentials exist only on that server.
-	RegistrationAPI string                `json:"registration_api"`
-	Frontend        GatewayFrontendConfig `json:"frontend"`
-	Content         GatewayContentConfig  `json:"content"`
+	RegistrationAPI string                 `json:"registration_api"`
+	Frontend        GatewayFrontendConfig  `json:"frontend"`
+	Content         GatewayContentConfig   `json:"content"`
+	Validator       GatewayValidatorConfig `json:"validator"`
+}
+
+// GatewayValidatorConfig audits OTHER gateways and reports what they served,
+// signed with this node's registered identity.
+//
+// Independent of every other role: a validator needs no storage, serves no
+// content, and gains nothing from the gateways it audits. Running one is a
+// contribution to the network's ability to check itself.
+//
+// Running several does not multiply anyone's voice. The origin weighs receipts
+// by distinct operator and network rather than by count, so a fleet under one
+// owner is one opinion however large it grows.
+type GatewayValidatorConfig struct {
+	Enabled bool `json:"enabled"`
+	// OriginURL publishes the signing key, the gateway directory and the
+	// spot-check feed.
+	OriginURL string `json:"origin_url,omitempty"`
+	// IntervalSeconds between rounds; each round audits one gateway.
+	IntervalSeconds int `json:"interval_seconds,omitempty"`
+	// SampleSize caps objects checked per round, so a validator stays a
+	// background contributor rather than a load generator.
+	SampleSize int `json:"sample_size,omitempty"`
 }
 
 // GatewayContentConfig serves site content under the gateway's OWN hostname.

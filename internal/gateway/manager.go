@@ -214,6 +214,9 @@ func (m *Manager) verify(ctx context.Context) {
 		m.failed(ctx, "registration failed: %v", err)
 		return
 	}
+	if err := m.consume(ctx, registration); err != nil {
+		return
+	}
 	publishCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	err = m.publisher.PublishGatewayRegistration(publishCtx, registration)
 	cancel()
@@ -221,12 +224,7 @@ func (m *Manager) verify(ctx context.Context) {
 		m.failed(ctx, "gateway registration publish failed: %v", err)
 		return
 	}
-	if err := m.save(registration); err != nil {
-		m.failed(ctx, "persist registration: %v", err)
-		return
-	}
 	m.mu.Lock()
-	m.current = &registration
 	m.health = HealthMachine{State: StateHealthy}
 	m.mu.Unlock()
 	if m.onVerified != nil {
@@ -260,6 +258,9 @@ func (m *Manager) registerWithoutQuorum(ctx context.Context) {
 		m.failed(ctx, "registration failed: %v", err)
 		return
 	}
+	if err := m.consume(ctx, registration); err != nil {
+		return
+	}
 	publishCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	err = m.publisher.PublishGatewayRegistration(publishCtx, registration)
 	cancel()
@@ -267,12 +268,7 @@ func (m *Manager) registerWithoutQuorum(ctx context.Context) {
 		m.failed(ctx, "gateway registration publish failed: %v", err)
 		return
 	}
-	if err := m.save(registration); err != nil {
-		m.failed(ctx, "persist registration: %v", err)
-		return
-	}
 	m.mu.Lock()
-	m.current = &registration
 	m.health = HealthMachine{State: StateHealthy}
 	m.mu.Unlock()
 	// Deliberately false: registered with the controller, but not
@@ -397,6 +393,35 @@ func (m *Manager) save(registration Registration) error {
 		return err
 	}
 	return os.Rename(temp, m.config.StatePath)
+}
+
+// consume records a registration BEFORE it is published, because its sequence
+// is spent the moment the controller sees it.
+//
+// The controller refuses any registration whose sequence is not strictly
+// greater than the last it stored. It does not require them to be contiguous,
+// so skipping a number when an attempt fails costs nothing — while REUSING one
+// is refused permanently, and a gateway in that state can never come back.
+//
+// That is not hypothetical. A registration goes to the controller and to the
+// DHT through one MultiPublisher, which returns on the first error. A gateway
+// running without a peer probe quorum always fails the DHT step, so the
+// controller would accept and store sequence N while the node, seeing an error
+// from a later and unrelated step, discarded it and kept N-1. On the next
+// restart it offered N again, was refused with 409, and stayed refused —
+// forever, with no message naming the cause.
+//
+// Saving first inverts that: the number is burnt on attempt. A failure now
+// costs one wasted sequence instead of the gateway's identity.
+func (m *Manager) consume(ctx context.Context, registration Registration) error {
+	m.mu.Lock()
+	m.current = &registration
+	m.mu.Unlock()
+	if err := m.save(registration); err != nil {
+		m.failed(ctx, "persist registration: %v", err)
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) load() {

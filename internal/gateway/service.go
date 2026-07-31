@@ -43,6 +43,19 @@ type Service struct {
 // which is what an operator who only wants to donate transport should get.
 func (s *Service) SetContentProxy(proxy *ContentProxy) { s.content = proxy }
 
+// controlPlanePaths are answered by this node itself and never by the origin.
+// They are how a probe or the controller establishes what this node is, so a
+// content proxy must not be able to shadow any of them.
+var controlPlanePaths = map[string]struct{}{
+	"/healthz": {}, "/readyz": {},
+	"/gateway/identity": {}, "/gateway/challenge": {}, "/probe/verify": {},
+}
+
+func isControlPlanePath(path string) bool {
+	_, found := controlPlanePaths[path]
+	return found
+}
+
 func NewService(signer Signer, version string, trustedProbes map[string]string, logger *log.Logger) *Service {
 	trusted := make(map[string]string, len(trustedProbes))
 	for id, key := range trustedProbes {
@@ -83,6 +96,19 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Gateway-Version", s.version)
+	// The control plane is claimed by PATH, before any method is considered. A
+	// method-qualified match would let anything else -- a HEAD, most obviously
+	// -- fall through to the content proxy, and /readyz would then be answered
+	// by the origin instead of by this node. That is how a probe decides
+	// whether this gateway is who it says it is, so the origin must never be
+	// able to answer it.
+	if s.content != nil && isControlPlanePath(r.URL.Path) &&
+		r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		writeJSON(w, http.StatusMethodNotAllowed,
+			map[string]string{"error": "control plane accepts GET or POST"})
+		return
+	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
 		// (control-plane routes below; content, if enabled, is the default case)
