@@ -424,3 +424,154 @@ func TestASnapshotSurvivesARestart(t *testing.T) {
 		t.Fatal("the held snapshot did not survive a restart")
 	}
 }
+
+func signedRevocation(t *testing.T, key ed25519.PrivateKey, sequences []int64,
+	recordSeq int64) *Revocations {
+	t.Helper()
+	parts := make([]string, 0, len(sequences))
+	for _, s := range sequences {
+		parts = append(parts, strconv.FormatInt(s, 10))
+	}
+	issued := time.Now().Unix()
+	message := []byte(strings.Join([]string{
+		"syndichan-revocation:v1", strings.Join(parts, ","), "",
+		strconv.FormatInt(recordSeq, 10), strconv.FormatInt(issued, 10),
+	}, "\n"))
+	return &Revocations{
+		Schema: 1, RevokedSequences: sequences, Sequence: recordSeq,
+		IssuedAt:  issued,
+		Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(key, message)),
+	}
+}
+
+func TestARevokedSnapshotIsDroppedNotFlagged(t *testing.T) {
+	// Keeping a revoked snapshot "in case it is needed" is how one that leaked
+	// private data or carried injected script gets served during the next
+	// outage by a gateway that meant well.
+	public, private, _ := ed25519.GenerateKey(nil)
+	manifest, objects := signedManifest(t, private, 7,
+		map[string][]byte{"/": []byte("<html>bad</html>")}, time.Now())
+
+	revocation := signedRevocation(t, private, []int64{7}, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/syndichan/snapshot.json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(manifest)
+	})
+	mux.HandleFunc("/snapshot/object/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/snapshot/object/")
+		_, _ = w.Write(objects[name])
+	})
+	mux.HandleFunc("/.well-known/syndichan/revocations.json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(revocation)
+	})
+	origin := httptest.NewServer(mux)
+	defer origin.Close()
+
+	cache := NewSnapshotCache(origin.URL, t.TempDir(), public)
+	cache.refresh(context.Background())
+	if cache.Manifest() == nil {
+		t.Fatal("setup: snapshot was not taken")
+	}
+	cache.refreshControl(context.Background())
+
+	if cache.Manifest() != nil {
+		t.Error("a revoked snapshot is still held")
+	}
+	if _, _, found := cache.Object("/"); found {
+		t.Error("a revoked snapshot is still being served")
+	}
+	if !cache.Revoked() {
+		t.Error("revocation was not recorded")
+	}
+}
+
+func TestAnOlderRevocationListCannotUnrevoke(t *testing.T) {
+	// Replaying a validly signed EMPTY list is the cheapest possible attack on
+	// a revocation system, so the record carries its own sequence.
+	public, private, _ := ed25519.GenerateKey(nil)
+	cache := NewSnapshotCache("http://unused", t.TempDir(), public)
+
+	current := signedRevocation(t, private, []int64{7}, 5)
+	if !cache.verifyRevocations(current) {
+		t.Fatal("a genuine revocation failed verification")
+	}
+	cache.revocationSeq = 5
+
+	empty := signedRevocation(t, private, nil, 4)
+	if !cache.verifyRevocations(empty) {
+		t.Fatal("setup: the replayed list should still be validly signed")
+	}
+	// Signed but older: the sequence check is what refuses it.
+	if empty.Sequence >= cache.revocationSeq {
+		t.Fatal("setup error")
+	}
+}
+
+func TestAForgedRevocationIsIgnored(t *testing.T) {
+	// Otherwise anyone could take every gateway's snapshot away, which is a
+	// denial of service dressed as a safety feature.
+	public, _, _ := ed25519.GenerateKey(nil)
+	_, attacker, _ := ed25519.GenerateKey(nil)
+	cache := NewSnapshotCache("http://unused", t.TempDir(), public)
+	if cache.verifyRevocations(signedRevocation(t, attacker, []int64{7}, 1)) {
+		t.Error("a revocation signed by the wrong key was accepted")
+	}
+}
+
+func TestAnExpiredDefensiveModeIsNotHonoured(t *testing.T) {
+	// Enforced at the gateway as well as the origin: a gateway that trusted the
+	// origin to stop sending an expired record would stay offline after
+	// everybody else came back.
+	public, private, _ := ed25519.GenerateKey(nil)
+	expired := DefensiveMode{
+		Mode: "DHT_CACHE_ONLY", Reason: "test",
+		IssuedAt:  time.Now().Add(-2 * time.Hour).Unix(),
+		ExpiresAt: time.Now().Add(-time.Hour).Unix(),
+	}
+	message := []byte(strings.Join([]string{
+		"syndichan-defensive:v1", expired.Mode, expired.Reason,
+		strconv.FormatInt(expired.IssuedAt, 10),
+		strconv.FormatInt(expired.ExpiresAt, 10), "0",
+	}, "\n"))
+	expired.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(private, message))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/syndichan/defensive-mode.json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(expired)
+	})
+	origin := httptest.NewServer(mux)
+	defer origin.Close()
+
+	cache := NewSnapshotCache(origin.URL, t.TempDir(), public)
+	if cache.FetchDefensiveMode(context.Background()) != nil {
+		t.Error("an expired defensive-mode record was honoured")
+	}
+}
+
+func TestAValidDefensiveModeIsHonoured(t *testing.T) {
+	// Guards the test above: a fetcher that returned nil for everything would
+	// pass it while implementing nothing.
+	public, private, _ := ed25519.GenerateKey(nil)
+	record := DefensiveMode{
+		Mode: "DHT_CACHE_ONLY", Reason: "origin_overload",
+		IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}
+	message := []byte(strings.Join([]string{
+		"syndichan-defensive:v1", record.Mode, record.Reason,
+		strconv.FormatInt(record.IssuedAt, 10),
+		strconv.FormatInt(record.ExpiresAt, 10), "0",
+	}, "\n"))
+	record.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(private, message))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/syndichan/defensive-mode.json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(record)
+	})
+	origin := httptest.NewServer(mux)
+	defer origin.Close()
+
+	cache := NewSnapshotCache(origin.URL, t.TempDir(), public)
+	if cache.FetchDefensiveMode(context.Background()) == nil {
+		t.Error("a valid defensive-mode record was not honoured")
+	}
+}

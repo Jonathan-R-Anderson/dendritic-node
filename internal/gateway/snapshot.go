@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,9 +59,11 @@ type SnapshotCache struct {
 	MaxObjectBytes int64
 	Logger         interface{ Printf(string, ...any) }
 
-	mu       sync.RWMutex
-	manifest *SnapshotManifest
-	client   *http.Client
+	mu            sync.RWMutex
+	manifest      *SnapshotManifest
+	client        *http.Client
+	revoked       bool
+	revocationSeq int64
 }
 
 // SnapshotManifest is the published description of one frozen copy.
@@ -147,12 +150,14 @@ func (c *SnapshotCache) Run(ctx context.Context) {
 	}
 	ticker := time.NewTicker(c.Poll)
 	defer ticker.Stop()
+	c.refreshControl(ctx)
 	c.refresh(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			c.refreshControl(ctx)
 			c.refresh(ctx)
 		}
 	}
@@ -386,4 +391,148 @@ func (c *SnapshotCache) logf(format string, args ...any) {
 	if c.Logger != nil {
 		c.Logger.Printf(format, args...)
 	}
+}
+
+// -- control records -------------------------------------------------------
+
+// Revocations is a signed, cumulative list of snapshots that must not be served.
+type Revocations struct {
+	Schema             int      `json:"schema"`
+	RevokedSequences   []int64  `json:"revoked_sequences"`
+	RevokedSnapshotIDs []string `json:"revoked_snapshot_ids"`
+	Sequence           int64    `json:"sequence"`
+	IssuedAt           int64    `json:"issued_at"`
+	Signature          string   `json:"signature"`
+}
+
+// DefensiveMode tells gateways to stop forwarding to the origin until it expires.
+type DefensiveMode struct {
+	Mode                    string `json:"mode"`
+	Reason                  string `json:"reason"`
+	IssuedAt                int64  `json:"issued_at"`
+	ExpiresAt               int64  `json:"expires_at"`
+	MinimumSnapshotSequence int64  `json:"minimum_snapshot_sequence"`
+	Signature               string `json:"signature"`
+}
+
+// Revoked reports whether the held snapshot has been revoked.
+func (c *SnapshotCache) Revoked() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.revoked
+}
+
+// refreshControl fetches the revocation list and honours it.
+//
+// A revoked snapshot is DROPPED, not merely flagged. Keeping it around "in case
+// it is needed" is how a snapshot that leaked private data or carried injected
+// script gets served during the next outage by a gateway that meant well.
+func (c *SnapshotCache) refreshControl(ctx context.Context) {
+	body, err := c.get(ctx, c.Origin+"/.well-known/syndichan/revocations.json", 1<<20)
+	if err != nil {
+		return
+	}
+	var record Revocations
+	if json.Unmarshal(body, &record) != nil {
+		return
+	}
+	if record.Signature == "" {
+		return
+	}
+	if !c.verifyRevocations(&record) {
+		c.logf("emergency cache: a revocation list failed signature verification; ignoring")
+		return
+	}
+	c.mu.Lock()
+	// Never accept an older record. Replaying a validly signed empty list would
+	// otherwise un-revoke everything, which is the cheapest possible attack on
+	// a revocation system.
+	if record.Sequence < c.revocationSeq {
+		c.mu.Unlock()
+		return
+	}
+	c.revocationSeq = record.Sequence
+	held := c.manifest
+	revoked := false
+	if held != nil {
+		for _, sequence := range record.RevokedSequences {
+			if sequence == held.Sequence {
+				revoked = true
+			}
+		}
+		for _, id := range record.RevokedSnapshotIDs {
+			if id == held.SnapshotID {
+				revoked = true
+			}
+		}
+	}
+	if revoked {
+		c.logf("emergency cache: snapshot %d is REVOKED; dropping it", held.Sequence)
+		c.manifest = nil
+		c.revoked = true
+	}
+	c.mu.Unlock()
+	if revoked {
+		_ = os.Remove(filepath.Join(c.Dir, "current.json"))
+	}
+}
+
+func (c *SnapshotCache) verifyRevocations(r *Revocations) bool {
+	sequences := make([]int64, len(r.RevokedSequences))
+	copy(sequences, r.RevokedSequences)
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	ids := append([]string(nil), r.RevokedSnapshotIDs...)
+	sort.Strings(ids)
+
+	parts := make([]string, 0, len(sequences))
+	for _, s := range sequences {
+		parts = append(parts, strconv.FormatInt(s, 10))
+	}
+	message := []byte(strings.Join([]string{
+		"syndichan-revocation:v1",
+		strings.Join(parts, ","),
+		strings.Join(ids, ","),
+		strconv.FormatInt(r.Sequence, 10),
+		strconv.FormatInt(r.IssuedAt, 10),
+	}, "\n"))
+	return c.checkSignature(message, r.Signature)
+}
+
+// FetchDefensiveMode returns a verified, unexpired defensive-mode record.
+func (c *SnapshotCache) FetchDefensiveMode(ctx context.Context) *DefensiveMode {
+	body, err := c.get(ctx, c.Origin+"/.well-known/syndichan/defensive-mode.json", 1<<16)
+	if err != nil {
+		return nil
+	}
+	var record DefensiveMode
+	if json.Unmarshal(body, &record) != nil || record.Signature == "" {
+		return nil
+	}
+	message := []byte(strings.Join([]string{
+		"syndichan-defensive:v1", record.Mode, record.Reason,
+		strconv.FormatInt(record.IssuedAt, 10),
+		strconv.FormatInt(record.ExpiresAt, 10),
+		strconv.FormatInt(record.MinimumSnapshotSequence, 10),
+	}, "\n"))
+	if !c.checkSignature(message, record.Signature) {
+		return nil
+	}
+	// Enforced here as well as at the origin. A record whose expiry has passed
+	// is not a record; a gateway that trusted the origin to stop sending it
+	// would stay offline after everybody else came back.
+	if record.ExpiresAt <= time.Now().Unix() {
+		return nil
+	}
+	return &record
+}
+
+func (c *SnapshotCache) checkSignature(message []byte, encoded string) bool {
+	signature, err := base64.StdEncoding.DecodeString(strings.TrimRight(encoded, "="))
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		signature, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(encoded, "="))
+		if err != nil {
+			return false
+		}
+	}
+	return ed25519.Verify(c.PublisherKey, message, signature)
 }
