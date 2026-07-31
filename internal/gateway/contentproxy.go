@@ -174,7 +174,7 @@ func (p *ContentProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// origin-first, because a gateway quietly deciding to answer from an
 	// hour-old copy is a behaviour nobody asked for.
 	if p.Offload && p.Snapshot != nil && p.Snapshot.Offloadable(r.URL.Path) {
-		if p.serveSnapshot(w, r) {
+		if p.serveOffload(w, r) {
 			return
 		}
 	}
@@ -379,4 +379,43 @@ func htmlEscape(value string) string {
 	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;",
 		`"`, "&quot;", "'", "&#39;")
 	return replacer.Replace(value)
+}
+
+// serveOffload answers from the UNTOUCHED variant while the origin is healthy.
+//
+// Deliberately not serveSnapshot. That one sets emergency headers and a Warning,
+// and serves the rewritten copy — correct during an outage and wrong here, where
+// nothing is wrong: it would tell every reader the site was broken and hand them
+// a page with its search box disabled.
+//
+// What a reader gets here is the origin's own bytes, so the only difference from
+// a live fetch is age — and the publisher only marks a route offloadable once it
+// has rendered identically for several builds, which is what makes "old" and
+// "current" the same thing.
+func (p *ContentProxy) serveOffload(w http.ResponseWriter, r *http.Request) bool {
+	body, contentType, found := p.Snapshot.OffloadObject(r.URL.Path)
+	if !found {
+		return false
+	}
+	manifest := p.Snapshot.Manifest()
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	// Named honestly. Not "snapshot", because a client verifier must check
+	// these against the LIVE object signature they carry — they are the
+	// origin's bytes and have one — rather than against the snapshot manifest.
+	w.Header().Set("X-Syndichan-Source", "gateway-cache")
+	if manifest != nil {
+		w.Header().Set("X-Syndichan-Snapshot", strconv.FormatInt(manifest.Sequence, 10))
+		w.Header().Set("X-Syndichan-Snapshot-Time",
+			time.Unix(manifest.CreatedAt, 0).UTC().Format(time.RFC3339))
+	}
+	w.Header().Set("X-Syndichan-Gateway", p.NodeID)
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return true
+	}
+	_, _ = w.Write(body)
+	return true
 }

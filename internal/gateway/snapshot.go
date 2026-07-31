@@ -96,6 +96,10 @@ type SnapshotRoute struct {
 	// AND the read-only rewrite took nothing away — so the stored bytes are the
 	// origin's own and a reader loses neither freshness nor a capability.
 	Offload bool `json:"offload"`
+	// OffloadObject is the UNTOUCHED render — the origin's own bytes — served
+	// while the origin is healthy. Object is the emergency variant, with forms
+	// replaced and a banner added, served only when the origin cannot answer.
+	OffloadObject string `json:"offload_object"`
 }
 
 // Freshness states from the specification. A reader is told which one they are
@@ -256,33 +260,50 @@ func (c *SnapshotCache) verify(m *SnapshotManifest) error {
 func (c *SnapshotCache) download(ctx context.Context, m *SnapshotManifest) (int, error) {
 	stored := 0
 	for path, entry := range m.Routes {
-		if ctx.Err() != nil {
-			return stored, ctx.Err()
-		}
-		if c.have(entry.Object) {
+		for _, name := range []string{entry.Object, entry.OffloadObject} {
+			if name == "" {
+				continue
+			}
+			if ctx.Err() != nil {
+				return stored, ctx.Err()
+			}
+			if c.have(name) {
+				stored++
+				continue
+			}
+			body, err := c.get(ctx, c.Origin+"/snapshot/object/"+name, c.MaxObjectBytes)
+			if err != nil {
+				return stored, fmt.Errorf("%s: %w", path, err)
+			}
+			digest := sha256.Sum256(body)
+			if hex.EncodeToString(digest[:]) != name {
+				// The manifest is signed, so bytes that do not match it did not
+				// come from the publisher — whoever served them substituted
+				// something.
+				return stored, fmt.Errorf("%s: object does not match the signed manifest", path)
+			}
+			if err := c.put(name, body); err != nil {
+				return stored, err
+			}
 			stored++
-			continue
 		}
-		body, err := c.get(ctx, c.Origin+"/snapshot/object/"+entry.Object, c.MaxObjectBytes)
-		if err != nil {
-			return stored, fmt.Errorf("%s: %w", path, err)
-		}
-		digest := sha256.Sum256(body)
-		if hex.EncodeToString(digest[:]) != entry.Object {
-			// The manifest is signed, so bytes that do not match it did not come
-			// from the publisher — whoever served them substituted something.
-			return stored, fmt.Errorf("%s: object does not match the signed manifest", path)
-		}
-		if err := c.put(entry.Object, body); err != nil {
-			return stored, err
-		}
-		stored++
 	}
 	return stored, nil
 }
 
-// Object returns the bytes for a route, or nil. Verified again on the way out.
+// Object returns the emergency variant for a route, or nil.
 func (c *SnapshotCache) Object(path string) ([]byte, string, bool) {
+	return c.object(path, false)
+}
+
+// OffloadObject returns the untouched variant, for serving while the origin is
+// healthy. Separate method rather than a flag on Object so a caller cannot
+// reach for the wrong one by forgetting an argument.
+func (c *SnapshotCache) OffloadObject(path string) ([]byte, string, bool) {
+	return c.object(path, true)
+}
+
+func (c *SnapshotCache) object(path string, offload bool) ([]byte, string, bool) {
 	manifest := c.Manifest()
 	if manifest == nil || !manifest.Usable(time.Now()) {
 		return nil, "", false
@@ -291,7 +312,14 @@ func (c *SnapshotCache) Object(path string) ([]byte, string, bool) {
 	if !found {
 		return nil, "", false
 	}
-	body, err := os.ReadFile(c.objectPath(entry.Object))
+	name := entry.Object
+	if offload {
+		if entry.OffloadObject == "" {
+			return nil, "", false
+		}
+		name = entry.OffloadObject
+	}
+	body, err := os.ReadFile(c.objectPath(name))
 	if err != nil {
 		return nil, "", false
 	}
@@ -299,7 +327,7 @@ func (c *SnapshotCache) Object(path string) ([]byte, string, bool) {
 	// the gateway, and the guarantee being offered to a reader is that the
 	// operator cannot change what they are handed.
 	digest := sha256.Sum256(body)
-	if hex.EncodeToString(digest[:]) != entry.Object {
+	if hex.EncodeToString(digest[:]) != name {
 		return nil, "", false
 	}
 	return body, entry.ContentType, true

@@ -582,6 +582,8 @@ func offloadManifest(t *testing.T, key ed25519.PrivateKey, created time.Time) (
 	}, created)
 	faq := m.Routes["/faq"]
 	faq.Offload = true
+	// The offload variant is the untouched render; here the same bytes suffice.
+	faq.OffloadObject = faq.Object
 	m.Routes["/faq"] = faq
 	return m, objects
 }
