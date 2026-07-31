@@ -270,6 +270,14 @@ type GatewayEmergencyConfig struct {
 	// MaxObjectBytes bounds one object, so a hostile manifest cannot ask this
 	// gateway to buy a disk.
 	MaxObjectBytes int64 `json:"max_object_bytes,omitempty"`
+	// Offload serves publisher-approved routes from the snapshot even while the
+	// origin is HEALTHY, taking read traffic off it entirely.
+	//
+	// Off by default and separate from Enabled, because it changes what a
+	// reader gets during ordinary operation rather than only during an outage.
+	// The publisher still decides WHICH routes; this only says whether this
+	// gateway participates.
+	Offload bool `json:"offload,omitempty"`
 }
 
 type GatewayFrontendConfig struct {

@@ -68,22 +68,34 @@ type SnapshotCache struct {
 
 // SnapshotManifest is the published description of one frozen copy.
 type SnapshotManifest struct {
-	Schema       int    `json:"schema"`
-	SnapshotID   string `json:"snapshot_id"`
-	Sequence     int64  `json:"sequence"`
-	CreatedAt    int64  `json:"created_at"`
-	RefreshAfter int64  `json:"refresh_after"`
-	StaleAfter   int64  `json:"stale_after"`
-	ExpiresAt    int64  `json:"expires_at"`
-	RootHash     string `json:"root_hash"`
-	ObjectCount  int    `json:"object_count"`
-	Signature    string `json:"signature"`
-	Routes       map[string]struct {
-		Object      string `json:"object"`
-		ContentType string `json:"content_type"`
-		Status      int    `json:"status"`
-		Size        int64  `json:"size"`
-	} `json:"routes"`
+	Schema       int                      `json:"schema"`
+	SnapshotID   string                   `json:"snapshot_id"`
+	Sequence     int64                    `json:"sequence"`
+	CreatedAt    int64                    `json:"created_at"`
+	RefreshAfter int64                    `json:"refresh_after"`
+	StaleAfter   int64                    `json:"stale_after"`
+	ExpiresAt    int64                    `json:"expires_at"`
+	RootHash     string                   `json:"root_hash"`
+	ObjectCount  int                      `json:"object_count"`
+	Signature    string                   `json:"signature"`
+	Routes       map[string]SnapshotRoute `json:"routes"`
+}
+
+// SnapshotRoute is one path in a manifest.
+//
+// A named type rather than an anonymous struct: it appears in every caller and
+// in tests, and adding a field to an anonymous one breaks every literal that
+// constructs it.
+type SnapshotRoute struct {
+	Object      string `json:"object"`
+	ContentType string `json:"content_type"`
+	Status      int    `json:"status"`
+	Size        int64  `json:"size"`
+	// Offload: this route may be served while the origin is UP. Set by the
+	// publisher only when the page has rendered identically for several builds
+	// AND the read-only rewrite took nothing away — so the stored bytes are the
+	// origin's own and a reader loses neither freshness nor a capability.
+	Offload bool `json:"offload"`
 }
 
 // Freshness states from the specification. A reader is told which one they are
@@ -535,4 +547,24 @@ func (c *SnapshotCache) checkSignature(message []byte, encoded string) bool {
 		}
 	}
 	return ed25519.Verify(c.PublisherKey, message, signature)
+}
+
+// Offloadable reports whether this route may be served while the origin is up.
+//
+// Deliberately conservative: the publisher decides, and it only says yes for a
+// page that has been byte-stable across builds and lost nothing to the
+// read-only rewrite. A gateway must never widen that on its own — the operator
+// of a volunteer machine is exactly the party who should not get to decide that
+// a stale copy is good enough for somebody else's readers.
+//
+// Fresh only. A snapshot past its refresh window may still be the right thing
+// to serve during an OUTAGE, and is never the right thing to serve when the
+// origin is answering perfectly well.
+func (c *SnapshotCache) Offloadable(path string) bool {
+	manifest := c.Manifest()
+	if manifest == nil || manifest.State(time.Now()) != SnapshotFresh {
+		return false
+	}
+	entry, found := manifest.Routes[path]
+	return found && entry.Offload
 }

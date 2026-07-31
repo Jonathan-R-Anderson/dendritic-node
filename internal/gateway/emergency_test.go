@@ -31,12 +31,7 @@ func signedManifest(t *testing.T, key ed25519.PrivateKey, sequence int64,
 		RefreshAfter: created.Add(1 * time.Hour).Unix(),
 		StaleAfter:   created.Add(6 * time.Hour).Unix(),
 		ExpiresAt:    created.Add(24 * time.Hour).Unix(),
-		Routes: map[string]struct {
-			Object      string `json:"object"`
-			ContentType string `json:"content_type"`
-			Status      int    `json:"status"`
-			Size        int64  `json:"size"`
-		}{},
+		Routes:       map[string]SnapshotRoute{},
 	}
 	objects := map[string][]byte{}
 	for path, body := range routes {
@@ -573,5 +568,110 @@ func TestAValidDefensiveModeIsHonoured(t *testing.T) {
 	cache := NewSnapshotCache(origin.URL, t.TempDir(), public)
 	if cache.FetchDefensiveMode(context.Background()) == nil {
 		t.Error("a valid defensive-mode record was not honoured")
+	}
+}
+
+// offloadManifest builds a snapshot where one route is publisher-approved for
+// serving while the origin is up and another is not.
+func offloadManifest(t *testing.T, key ed25519.PrivateKey, created time.Time) (
+	*SnapshotManifest, map[string][]byte) {
+	t.Helper()
+	m, objects := signedManifest(t, key, 7, map[string][]byte{
+		"/faq":      []byte("<html>stable faq</html>"),
+		"/boards/b": []byte("<html>busy board</html>"),
+	}, created)
+	faq := m.Routes["/faq"]
+	faq.Offload = true
+	m.Routes["/faq"] = faq
+	return m, objects
+}
+
+func TestOffloadServesApprovedRoutesWhileTheOriginIsUp(t *testing.T) {
+	public, private, _ := ed25519.GenerateKey(nil)
+	manifest, objects := offloadManifest(t, private, time.Now())
+	origin := publisherOrigin(t, manifest, objects, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>FROM ORIGIN</html>")
+	})
+	defer origin.Close()
+
+	cache := warmCache(t, origin.URL, public)
+	parsed, _ := url.Parse(origin.URL)
+	proxy := NewContentProxy(parsed, parsed.Host, "12D3KooWTest", "")
+	proxy.Snapshot = cache
+	proxy.Health = NewOriginHealth()
+	proxy.Offload = true
+
+	// Approved: answered from cache, taking the request off the origin.
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/faq", nil))
+	if !strings.Contains(recorder.Body.String(), "stable faq") {
+		t.Fatalf("offloadable route was not served from cache: %q", recorder.Body.String())
+	}
+
+	// Not approved: still goes to the origin, because a busy board from an
+	// hour-old copy is worse than a slow page.
+	recorder = httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/boards/b", nil))
+	if !strings.Contains(recorder.Body.String(), "FROM ORIGIN") {
+		t.Errorf("a volatile route was served from cache: %q", recorder.Body.String())
+	}
+}
+
+func TestOffloadIsOffByDefault(t *testing.T) {
+	// A gateway quietly deciding to answer from an hour-old copy is a behaviour
+	// nobody asked for. The default must stay origin-first.
+	public, private, _ := ed25519.GenerateKey(nil)
+	manifest, objects := offloadManifest(t, private, time.Now())
+	origin := publisherOrigin(t, manifest, objects, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>FROM ORIGIN</html>")
+	})
+	defer origin.Close()
+
+	cache := warmCache(t, origin.URL, public)
+	parsed, _ := url.Parse(origin.URL)
+	proxy := NewContentProxy(parsed, parsed.Host, "12D3KooWTest", "")
+	proxy.Snapshot = cache
+	proxy.Health = NewOriginHealth()
+	// Offload deliberately left false.
+
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/faq", nil))
+	if !strings.Contains(recorder.Body.String(), "FROM ORIGIN") {
+		t.Error("cache was served while the origin was healthy without opt-in")
+	}
+}
+
+func TestAStaleSnapshotIsNeverOffloaded(t *testing.T) {
+	// Past its refresh window a snapshot may still be the right thing to serve
+	// during an OUTAGE, and is never right while the origin answers perfectly.
+	public, private, _ := ed25519.GenerateKey(nil)
+	manifest, objects := offloadManifest(t, private, time.Now().Add(-3*time.Hour))
+	origin := publisherOrigin(t, manifest, objects, nil)
+	defer origin.Close()
+
+	cache := warmCache(t, origin.URL, public)
+	if cache.Manifest().State(time.Now()) == SnapshotFresh {
+		t.Fatal("setup: expected a stale snapshot")
+	}
+	if cache.Offloadable("/faq") {
+		t.Error("a stale snapshot was offered for normal-operation serving")
+	}
+}
+
+func TestAGatewayCannotWidenTheOffloadSet(t *testing.T) {
+	// The publisher decides. The operator of a volunteer machine is exactly the
+	// party who should not get to rule that a stale copy is good enough for
+	// somebody else's readers.
+	public, private, _ := ed25519.GenerateKey(nil)
+	manifest, objects := offloadManifest(t, private, time.Now())
+	origin := publisherOrigin(t, manifest, objects, nil)
+	defer origin.Close()
+
+	cache := warmCache(t, origin.URL, public)
+	if cache.Offloadable("/boards/b") {
+		t.Error("a route the publisher did not approve was offered for offload")
+	}
+	if !cache.Offloadable("/faq") {
+		t.Error("an approved route was not offered")
 	}
 }

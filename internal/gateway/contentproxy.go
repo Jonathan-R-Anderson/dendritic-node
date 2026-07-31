@@ -73,6 +73,10 @@ type ContentProxy struct {
 	// transport gets exactly that.
 	Snapshot *SnapshotCache
 	Health   *OriginHealth
+	// Offload serves publisher-approved routes from the snapshot even while the
+	// origin is healthy, which is what turns this from an emergency cache into
+	// a way to take read traffic off the origin entirely.
+	Offload bool
 }
 
 // Paths a gateway has no business carrying even anonymously.
@@ -155,6 +159,21 @@ func (p *ContentProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the reader wait out a timeout first. Every request that still probes a
 	// dead origin is a reader watching a spinner for no information.
 	if p.Health != nil && p.Health.Emergency() {
+		if p.serveSnapshot(w, r) {
+			return
+		}
+	}
+
+	// ORIGIN OFFLOADING. A route the publisher marked offloadable is one that
+	// has rendered identically for several builds AND lost nothing to the
+	// read-only rewrite — so the cached bytes ARE the origin's bytes, and
+	// serving them costs the reader neither freshness nor a capability.
+	//
+	// This is the only path that serves cache while the origin is healthy, and
+	// it is off unless the operator turned it on. The default stays
+	// origin-first, because a gateway quietly deciding to answer from an
+	// hour-old copy is a behaviour nobody asked for.
+	if p.Offload && p.Snapshot != nil && p.Snapshot.Offloadable(r.URL.Path) {
 		if p.serveSnapshot(w, r) {
 			return
 		}

@@ -359,9 +359,11 @@ func main() {
 				}
 				contentProxy.Snapshot = snapshots
 				contentProxy.Health = gateway.NewOriginHealth()
+				contentProxy.Offload = emergency.Offload
 				go snapshots.Run(ctx)
-				logger.Printf("emergency cache enabled: polling %s every %s, holding in %s",
-					originURL.Host, snapshots.Poll, cacheDir)
+				logger.Printf("emergency cache enabled: polling %s every %s, holding in %s%s",
+					originURL.Host, snapshots.Poll, cacheDir,
+					map[bool]string{true: " (origin offload ON)", false: ""}[emergency.Offload])
 			}
 			gatewayService.SetContentProxy(contentProxy)
 			logger.Printf("gateway serves content for %s under %s as %s",
