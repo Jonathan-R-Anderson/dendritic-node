@@ -70,6 +70,12 @@ func startDCSWorker(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 		NodeID:         node.ID(),
 	}
 	agent := dcs.NewAgent(agentCfg, docker, allocator, &logAudit{logger: logger})
+	// Container ownership on disk, not just in memory. Without it a restart
+	// orphans every running container permanently: only the node that deployed
+	// one may destroy it, and after a restart the agent could attribute none of
+	// them — leaving deliberately vulnerable boxes running with nobody able to
+	// take them down.
+	agent.SetStatePath(filepath.Join(cfg.DataDir, "dcs", "ownership.json"))
 	agent.SetAdmission(admission, instanceTTL(cfg))
 	// Build-context deploys: fetch the Dockerfile+files from the shard store and
 	// build locally, registry-free.

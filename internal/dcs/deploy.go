@@ -199,6 +199,10 @@ type Agent struct {
 	attached  map[string]NetworkHandle // containerID → its network, for teardown
 	owners    map[string]string        // containerID → the envelope owner (for destroy auth)
 	composeOf map[string]string        // primary containerID → compose project id, for teardown
+
+	// Durable mirror of owners/composeOf. Held in memory alone, a restart made
+	// every running container un-destroyable forever; see ownership.go.
+	ownership *ownershipStore
 }
 
 // ComposeRunner runs a docker-compose project (a vulhub-style challenge). Unlike
@@ -273,6 +277,55 @@ func NewAgent(cfg AgentConfig, runtime Runtime, alloc Allocator, audit AuditSink
 		cfg: cfg, runtime: runtime, alloc: alloc, audit: audit,
 		now: time.Now, attached: map[string]NetworkHandle{},
 		owners: map[string]string{}, composeOf: map[string]string{},
+	}
+}
+
+// SetStatePath makes container ownership survive a restart. Without it the
+// agent still works, but every container it launched becomes un-destroyable the
+// moment it restarts — so a deployment that runs containers people care about
+// should always set this.
+func (a *Agent) SetStatePath(path string) {
+	store := newOwnershipStore(path)
+	a.mu.Lock()
+	a.ownership = store
+	for containerID, record := range store.records {
+		a.owners[containerID] = record.Owner
+		if record.Compose != "" {
+			a.composeOf[containerID] = record.Compose
+		}
+	}
+	recovered := len(store.records)
+	a.mu.Unlock()
+	if recovered > 0 {
+		a.audit.Record(AuditEntry{
+			At: a.now(), Method: MethodDestroy, Decision: "recovered",
+			Reason: fmt.Sprintf("restored ownership of %d container(s) from %s",
+				recovered, path),
+		})
+	}
+}
+
+// rememberOwner records who deployed a container, durably.
+func (a *Agent) rememberOwner(containerID, owner string) {
+	a.mu.Lock()
+	a.owners[containerID] = owner
+	compose := a.composeOf[containerID]
+	store := a.ownership
+	a.mu.Unlock()
+	if store != nil {
+		store.set(containerID, owner, compose)
+		_ = store.flush()
+	}
+}
+
+// forgetOwner drops a container from both the map and the file.
+func (a *Agent) forgetOwner(containerID string) {
+	a.mu.Lock()
+	store := a.ownership
+	a.mu.Unlock()
+	if store != nil {
+		store.forget(containerID)
+		_ = store.flush()
 	}
 }
 
@@ -538,9 +591,7 @@ func (a *Agent) HandleLaunch(ctx context.Context, env Envelope) (DeployReply, er
 		reply.Note = strings.TrimSpace(reply.Note + " (address allocated but not yet bridged on this host)")
 	}
 
-	a.mu.Lock()
-	a.owners[containerID] = owner
-	a.mu.Unlock()
+	a.rememberOwner(containerID, owner)
 	a.audit.Record(AuditEntry{
 		At: a.now(), Requester: owner, DeploymentID: req.DeploymentID,
 		Method: MethodLaunch, Decision: "admitted",
@@ -574,6 +625,7 @@ func (a *Agent) HandleDestroy(ctx context.Context, env Envelope) error {
 	a.mu.Lock()
 	delete(a.owners, req.ContainerID)
 	a.mu.Unlock()
+	a.forgetOwner(req.ContainerID)
 	return nil
 }
 
@@ -634,6 +686,7 @@ func (a *Agent) Destroy(ctx context.Context, containerID string) error {
 		delete(a.composeOf, containerID)
 	}
 	a.mu.Unlock()
+	a.forgetOwner(containerID)
 	// purge=true: a destroyed container's address must not survive it, or a
 	// later container could inherit an address someone was told about.
 	_ = a.alloc.Release(containerID, true)
@@ -714,7 +767,16 @@ func (a *Agent) launchCompose(ctx context.Context, owner string, req DeployReque
 	}
 	a.mu.Lock()
 	a.composeOf[containerID] = project
+	store := a.ownership
 	a.mu.Unlock()
+	// Persisted with the project name: tearing down a compose challenge means
+	// `compose down` on the whole project, and a restart that forgot the
+	// project name would leave the backing services (a database, a cache)
+	// running even if the primary container were removed by hand.
+	if store != nil {
+		store.setCompose(containerID, project)
+		_ = store.flush()
+	}
 	return containerID, address, nil
 }
 
