@@ -192,3 +192,69 @@ func TestStoreBackedNodeAnswersAnAudit(t *testing.T) {
 		t.Fatalf("quantity %d, want the shard size %d", rows[0].Receipt.Quantity, len(data))
 	}
 }
+
+func TestAdvertisableAssignmentsFitsTheRelayLimit(t *testing.T) {
+	// The failure this prevents: a node holding more shards than the relay
+	// accepts advertised all of them, was refused, and so advertised NOTHING —
+	// leaving the node with the most to prove unable to prove any of it.
+	all := make([]Assignment, MaxAdvertisedAssignments*4+137)
+	for i := range all {
+		all[i].AssignmentID[0] = byte(i)
+		all[i].AssignmentID[1] = byte(i >> 8)
+		all[i].AssignmentID[2] = byte(i >> 16)
+	}
+	got := AdvertisableAssignments(all, 0)
+	if len(got) != MaxAdvertisedAssignments {
+		t.Fatalf("advertised %d, want %d", len(got), MaxAdvertisedAssignments)
+	}
+}
+
+func TestSmallNodesAdvertiseEverything(t *testing.T) {
+	all := make([]Assignment, 12)
+	for i := range all {
+		all[i].AssignmentID[0] = byte(i)
+	}
+	if got := AdvertisableAssignments(all, 7); len(got) != len(all) {
+		t.Fatalf("advertised %d of %d; a node under the cap must advertise all of it",
+			len(got), len(all))
+	}
+}
+
+func TestTheWindowCoversEveryShardOverTime(t *testing.T) {
+	// Rotation is the whole justification for advertising a subset. If it did
+	// not cover everything, some shards would simply never be auditable and the
+	// node would be paid less than it earned, permanently.
+	const total = MaxAdvertisedAssignments*3 + 41
+	all := make([]Assignment, total)
+	for i := range all {
+		all[i].AssignmentID[0] = byte(i)
+		all[i].AssignmentID[1] = byte(i >> 8)
+		all[i].AssignmentID[2] = byte(i >> 16)
+	}
+	seen := map[[32]byte]bool{}
+	for epoch := uint64(0); epoch < 8; epoch++ {
+		for _, a := range AdvertisableAssignments(all, epoch) {
+			seen[a.AssignmentID] = true
+		}
+	}
+	if len(seen) != total {
+		t.Fatalf("after 8 epochs only %d of %d shards had been advertised", len(seen), total)
+	}
+}
+
+func TestTheWindowIsDeterministic(t *testing.T) {
+	// A node must not be able to re-roll until it advertises only the shards it
+	// still happens to hold.
+	all := make([]Assignment, MaxAdvertisedAssignments*2)
+	for i := range all {
+		all[i].AssignmentID[0] = byte(i)
+		all[i].AssignmentID[1] = byte(i >> 8)
+	}
+	first := AdvertisableAssignments(all, 5)
+	second := AdvertisableAssignments(all, 5)
+	for i := range first {
+		if first[i].AssignmentID != second[i].AssignmentID {
+			t.Fatal("two calls for the same epoch produced different windows")
+		}
+	}
+}

@@ -109,8 +109,18 @@ func runEpochPass(ctx context.Context, cfg *EpochLoopConfig) {
 	assignments, err := LocalAssignments(cfg.Agent.NodeID(), cfg.Store)
 	if err != nil {
 		logf("could not enumerate local shards: %v", err)
-	} else if err := cfg.Gateway.PublishAssignments(ctx, cfg.Pub, assignments); err != nil {
-		logf("could not advertise %d shard(s): %v", len(assignments), err)
+	} else {
+		// A large node advertises a rotating window rather than everything, so
+		// the relay accepts it and every shard still takes its turn over
+		// successive epochs.
+		advertised := AdvertisableAssignments(assignments, epoch)
+		if err := cfg.Gateway.PublishAssignments(ctx, cfg.Pub, advertised); err != nil {
+			logf("could not advertise %d of %d shard(s): %v",
+				len(advertised), len(assignments), err)
+		} else if len(advertised) < len(assignments) {
+			logf("advertised %d of %d shard(s) this epoch; the window rotates so "+
+				"all of them are auditable over time", len(advertised), len(assignments))
+		}
 	}
 
 	// 2. Upload receipts earned earlier. Before auditing, so a node that is

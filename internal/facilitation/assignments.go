@@ -100,3 +100,51 @@ func StoreShardLoader(store ShardReader) ShardLoader {
 		return data, AssignmentChunkSize, true
 	}
 }
+
+// MaxAdvertisedAssignments bounds one advertisement.
+//
+// A node holding thousands of shards used to advertise every one of them, which
+// the relay refused outright — so it advertised NOTHING, and a node with the
+// most to prove was the one that could prove none of it. The relay's limit is
+// the real constraint; this stays under it.
+//
+// Advertising a subset costs nothing in the long run because the subset
+// ROTATES: over enough epochs every shard takes its turn. What it must not do
+// is rotate randomly, or a node could re-roll until it advertised only the
+// shards it still has.
+const MaxAdvertisedAssignments = 1000
+
+// AdvertisableAssignments returns the window of assignments to publish this
+// epoch.
+//
+// The window walks forward one full stride per epoch over a canonically-ordered
+// list, so coverage is complete, deterministic, and not something the node
+// chooses. A node holding fewer than the cap advertises everything, every time.
+func AdvertisableAssignments(all []Assignment, epoch uint64) []Assignment {
+	if len(all) <= MaxAdvertisedAssignments {
+		return all
+	}
+	// LocalAssignments already sorts by shard id; sorting here too keeps this
+	// correct for any caller and costs nothing on an already-sorted slice.
+	ordered := make([]Assignment, len(all))
+	copy(ordered, all)
+	sort.Slice(ordered, func(i, j int) bool {
+		return lessAssignmentID(ordered[i].AssignmentID, ordered[j].AssignmentID)
+	})
+
+	start := int((epoch * uint64(MaxAdvertisedAssignments)) % uint64(len(ordered)))
+	out := make([]Assignment, 0, MaxAdvertisedAssignments)
+	for i := 0; i < MaxAdvertisedAssignments; i++ {
+		out = append(out, ordered[(start+i)%len(ordered)])
+	}
+	return out
+}
+
+func lessAssignmentID(a, b [32]byte) bool {
+	for i := 0; i < 32; i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
+}
