@@ -122,8 +122,10 @@ func startFacilitation(ctx context.Context, cfg config.Config, node *p2p.Node,
 		Logger:    logger,
 		Interval:  10 * time.Minute,
 	})
-	logger.Printf("proof-of-facilitation: epoch loop started (epoch %d)",
-		facilitation.EpochAt(time.Now()))
+	// The epoch number is not logged here: it is not knowable until the loop
+	// has read the network's anchor, and printing a clock-derived guess would
+	// put a number in the log that no other node agrees with.
+	logger.Printf("proof-of-facilitation: epoch loop started")
 
 	return &facilitationRuntime{agent: agent, scheduler: scheduler, spool: spool}
 }

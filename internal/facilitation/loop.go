@@ -25,6 +25,11 @@ type EpochLoopConfig struct {
 	Logger    *log.Logger
 	Interval  time.Duration // how often to run a pass
 	EpochOf   func(time.Time) uint64
+
+	// anchor pins epoch numbers to the chain's numbering. Fetched on the first
+	// pass that can reach the site and reused after: it describes genesis,
+	// which never moves.
+	anchor EpochAnchor
 }
 
 // DefaultEpochSeconds matches the roadmap's one-hour epochs. Long enough that
@@ -32,10 +37,12 @@ type EpochLoopConfig struct {
 // sees earnings the same day.
 const DefaultEpochSeconds = 3600
 
-// EpochAt maps wall-clock time to an epoch number. Derived from the clock
-// rather than counted locally so every node agrees without coordination; a node
-// with a badly wrong clock audits the wrong epoch and its receipts are rejected,
-// which is the correct outcome and visible in its logs.
+// EpochAt maps wall-clock time to an epoch number counted from the unix epoch.
+//
+// Used only where no anchor is available (tests, and the pre-genesis log line).
+// The live loop uses the published EpochAnchor instead, because this function's
+// origin — 1970 — is not the origin EpochManager counts from, and a node using
+// it asks the chain about epochs that do not exist. See anchor.go.
 func EpochAt(t time.Time) uint64 { return uint64(t.Unix()) / DefaultEpochSeconds }
 
 // RunEpochLoop runs until the context is cancelled.
@@ -43,32 +50,59 @@ func RunEpochLoop(ctx context.Context, cfg EpochLoopConfig) {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Minute
 	}
-	if cfg.EpochOf == nil {
-		cfg.EpochOf = EpochAt
-	}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
 	// One pass immediately: a node restarted mid-epoch should not sit idle
 	// until the next tick, since unaudited time is unpaid time.
-	runEpochPass(ctx, cfg)
+	runEpochPass(ctx, &cfg)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runEpochPass(ctx, cfg)
+			runEpochPass(ctx, &cfg)
 		}
 	}
 }
 
-func runEpochPass(ctx context.Context, cfg EpochLoopConfig) {
+// epochNow resolves the current epoch, fetching the anchor if this is the first
+// pass that can reach the site. Returns false when the network has no epoch
+// numbering yet, which is a reason to wait rather than to invent one.
+func epochNow(ctx context.Context, cfg *EpochLoopConfig) (uint64, bool) {
+	if cfg.EpochOf != nil {
+		return cfg.EpochOf(time.Now()), true
+	}
+	if !cfg.anchor.Valid() {
+		if cfg.Gateway == nil {
+			return 0, false
+		}
+		anchor, err := cfg.Gateway.FetchEpochAnchor(ctx)
+		if err != nil {
+			if cfg.Logger != nil {
+				cfg.Logger.Printf("proof-of-facilitation: %v — waiting for genesis", err)
+			}
+			return 0, false
+		}
+		cfg.anchor = anchor
+		if cfg.Logger != nil {
+			cfg.Logger.Printf("proof-of-facilitation: epoch anchor is epoch %d at unix %d, %ds each",
+				anchor.Epoch, anchor.At, anchor.Seconds)
+		}
+	}
+	return cfg.anchor.EpochAt(time.Now()), true
+}
+
+func runEpochPass(ctx context.Context, cfg *EpochLoopConfig) {
 	logf := func(format string, args ...any) {
 		if cfg.Logger != nil {
 			cfg.Logger.Printf("proof-of-facilitation: "+format, args...)
 		}
 	}
-	epoch := cfg.EpochOf(time.Now())
+	epoch, ok := epochNow(ctx, cfg)
+	if !ok {
+		return
+	}
 
 	// 1. Advertise what we hold, so others can audit us. Done first: being
 	// auditable is what earns, and it costs nothing if the rest fails.
