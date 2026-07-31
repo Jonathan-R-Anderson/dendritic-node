@@ -245,6 +245,31 @@ type GatewayContentConfig struct {
 	// answer to be laundered through another's identity.
 	OriginAddress string `json:"origin_address,omitempty"`
 	MaxBytes      int64  `json:"max_bytes,omitempty"`
+
+	// Emergency keeps a verified read-only copy of the site so this gateway can
+	// answer when the origin cannot. See internal/gateway/snapshot.go.
+	Emergency GatewayEmergencyConfig `json:"emergency"`
+}
+
+// GatewayEmergencyConfig is the read-only fallback copy.
+//
+// The publisher key is REQUIRED and is not defaulted. A gateway that would serve
+// an unverified snapshot is one whose operator decides what syndichan says
+// during an outage — the precise thing this whole design exists to prevent — so
+// an absent key disables the feature rather than relaxing it.
+type GatewayEmergencyConfig struct {
+	Enabled bool `json:"enabled"`
+	// PublisherKey is the base64 Ed25519 key from
+	// /.well-known/syndichan/snapshot-key.json. NOT the origin content key.
+	PublisherKey string `json:"publisher_key,omitempty"`
+	// CacheDir holds the copy between restarts, so a gateway that reboots
+	// mid-outage is useful immediately rather than after reaching a dead origin.
+	CacheDir string `json:"cache_dir,omitempty"`
+	// PollSeconds between checks for a newer snapshot.
+	PollSeconds int `json:"poll_seconds,omitempty"`
+	// MaxObjectBytes bounds one object, so a hostile manifest cannot ask this
+	// gateway to buy a disk.
+	MaxObjectBytes int64 `json:"max_object_bytes,omitempty"`
 }
 
 type GatewayFrontendConfig struct {
@@ -586,6 +611,22 @@ func (c Config) validateGateway() error {
 		// TLS error four steps later rather than a configuration mistake.
 		if g.TLS.Mode == "reverse_proxy" && g.PublicHostname == "" {
 			return errors.New("gateway.content needs a public_hostname readers can reach")
+		}
+		if g.Content.Emergency.Enabled {
+			// Refused rather than defaulted. Without the key this gateway would
+			// either serve an unverified snapshot -- letting its operator decide
+			// what syndichan says during an outage -- or silently do nothing,
+			// and an emergency feature that silently does nothing is worse than
+			// one that is plainly off.
+			if strings.TrimSpace(g.Content.Emergency.PublisherKey) == "" {
+				return errors.New(
+					"gateway.content.emergency needs publisher_key: copy it from " +
+						"/.well-known/syndichan/snapshot-key.json (it is NOT the " +
+						"origin content-signing key)")
+			}
+			if strings.TrimSpace(g.Content.Emergency.CacheDir) == "" {
+				return errors.New("gateway.content.emergency needs a cache_dir")
+			}
 		}
 	}
 	if g.Enabled {

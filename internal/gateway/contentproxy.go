@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -66,6 +67,12 @@ type ContentProxy struct {
 	MaxBytes   int64
 	client     *http.Client
 	deniedPath []string
+
+	// Snapshot and Health turn this from a proxy into a gateway that survives
+	// the origin. Both nil by default: an operator who only wants to donate
+	// transport gets exactly that.
+	Snapshot *SnapshotCache
+	Health   *OriginHealth
 }
 
 // Paths a gateway has no business carrying even anonymously.
@@ -144,6 +151,15 @@ func (p *ContentProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Already known to be down: go straight to the snapshot rather than making
+	// the reader wait out a timeout first. Every request that still probes a
+	// dead origin is a reader watching a spinner for no information.
+	if p.Health != nil && p.Health.Emergency() {
+		if p.serveSnapshot(w, r) {
+			return
+		}
+	}
+
 	target := *p.Origin
 	target.Path = r.URL.Path
 	target.RawQuery = r.URL.RawQuery
@@ -169,10 +185,29 @@ func (p *ContentProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	response, err := p.client.Do(outbound)
 	if err != nil {
+		if p.Health != nil {
+			p.Health.RecordFailure(ClassifyError(err))
+		}
+		// The origin just failed for this reader; serve them the snapshot now
+		// rather than making them wait for the threshold to be reached.
+		if p.serveSnapshot(w, r) {
+			return
+		}
 		http.Error(w, "origin unavailable", http.StatusBadGateway)
 		return
 	}
 	defer response.Body.Close()
+
+	if p.Health != nil {
+		if kind := ClassifyStatus(response.StatusCode); kind != "" {
+			p.Health.RecordFailure(kind)
+			if p.serveSnapshot(w, r) {
+				return
+			}
+		} else {
+			p.Health.RecordSuccess()
+		}
+	}
 
 	for name, values := range response.Header {
 		if headerIn(name, strippedResponseHeaders) {
@@ -219,4 +254,110 @@ func headerIn(name string, list []string) bool {
 		}
 	}
 	return false
+}
+
+// serveSnapshot answers from the held emergency copy. Reports whether it did.
+//
+// THE LOOKUP GUARD
+// ----------------
+// A route is only served if the SIGNED manifest names it. That is not merely
+// tidiness: without it, a request for a random path becomes a cache miss, a disk
+// probe, and in a DHT-backed design a network lookup — so anyone with a loop
+// could point this gateway's storage at the network as an amplifier. Unknown
+// paths get a flat 404 with no lookup at all.
+func (p *ContentProxy) serveSnapshot(w http.ResponseWriter, r *http.Request) bool {
+	if p.Snapshot == nil || !p.Snapshot.Enabled() {
+		return false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	manifest := p.Snapshot.Manifest()
+	if manifest == nil || !manifest.Usable(time.Now()) {
+		return false
+	}
+	if !p.Snapshot.HasRoute(r.URL.Path) {
+		// Known-unknown: the snapshot exists and does not contain this path.
+		// Answering here rather than falling through keeps the guard meaningful.
+		p.snapshotHeaders(w, manifest)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		if r.Method != http.MethodHead {
+			_, _ = io.WriteString(w, maintenancePage(manifest, "That page is not in the emergency copy."))
+		}
+		return true
+	}
+	body, contentType, found := p.Snapshot.Object(r.URL.Path)
+	if !found {
+		return false
+	}
+
+	p.snapshotHeaders(w, manifest)
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return true
+	}
+	_, _ = w.Write(body)
+	return true
+}
+
+func (p *ContentProxy) snapshotHeaders(w http.ResponseWriter, m *SnapshotManifest) {
+	state := m.State(time.Now())
+	// Names this as emergency content so the reader's verifier checks it against
+	// the snapshot manifest rather than a live object signature it cannot have.
+	// The header only SELECTS that path — the manifest signature decides whether
+	// the bytes are genuine, so a gateway cannot use it to escape checking.
+	w.Header().Set("X-Syndichan-Source", "snapshot")
+	w.Header().Set("X-Syndichan-Snapshot", strconv.FormatInt(m.Sequence, 10))
+	w.Header().Set("X-Syndichan-Snapshot-Time",
+		time.Unix(m.CreatedAt, 0).UTC().Format(time.RFC3339))
+	w.Header().Set("X-Syndichan-Cache-State", state)
+	w.Header().Set("X-Syndichan-Gateway", p.NodeID)
+	// Short: the origin may come back at any moment, and a reader holding an
+	// emergency copy for an hour would not notice.
+	w.Header().Set("Cache-Control", "public, max-age=120")
+	w.Header().Set("Warning", `110 - "Response served from emergency cached snapshot"`)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers",
+		"X-Syndichan-Source, X-Syndichan-Snapshot, X-Syndichan-Snapshot-Time, "+
+			"X-Syndichan-Cache-State, X-Syndichan-Gateway")
+}
+
+// MaintenancePage is served when there is no usable snapshot at all.
+//
+// Compiled in, and depending on nothing: no stylesheet, no script, no font, no
+// DHT, no origin. Everything it could depend on is a thing that is plausibly
+// broken at the moment it is needed, and a maintenance page that fails to load
+// is indistinguishable from the outage it is trying to explain.
+func MaintenancePage() string { return maintenancePage(nil, "") }
+
+func maintenancePage(m *SnapshotManifest, note string) string {
+	taken := ""
+	if m != nil {
+		taken = "<p>The most recent saved copy is from " +
+			htmlEscape(time.Unix(m.CreatedAt, 0).UTC().Format("2 January 2006 at 15:04 UTC")) +
+			".</p>"
+	}
+	if note != "" {
+		note = "<p>" + htmlEscape(note) + "</p>"
+	}
+	return `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+		`<meta name="viewport" content="width=device-width,initial-scale=1">` +
+		`<title>syndichan — temporarily unavailable</title></head>` +
+		`<body style="background:#111;color:#ddd;font:16px/1.6 system-ui,sans-serif;` +
+		`margin:0;padding:3rem 1.5rem;text-align:center">` +
+		`<h1 style="font-size:1.4rem;color:#ffb84d">syndichan is temporarily in emergency mode</h1>` +
+		`<p>The live service is unavailable and no usable cached copy is held here.</p>` +
+		note + taken +
+		`<p>No logins, posts, purchases or transfers are being processed.</p>` +
+		`<p style="color:#888">Please try again shortly.</p></body></html>`
+}
+
+func htmlEscape(value string) string {
+	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;",
+		`"`, "&quot;", "'", "&#39;")
+	return replacer.Replace(value)
 }

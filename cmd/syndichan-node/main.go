@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -333,6 +336,32 @@ func main() {
 			)
 			if cfg.Gateway.Content.MaxBytes > 0 {
 				contentProxy.MaxBytes = cfg.Gateway.Content.MaxBytes
+			}
+			if emergency := cfg.Gateway.Content.Emergency; emergency.Enabled {
+				key, keyErr := base64.StdEncoding.DecodeString(
+					strings.TrimSpace(emergency.PublisherKey))
+				if keyErr != nil || len(key) != ed25519.PublicKeySize {
+					// Fatal, not a warning. A gateway that thinks it has an
+					// emergency copy and does not is worse than one that knows
+					// it has none: the operator would learn during the outage.
+					logger.Fatalf("gateway emergency publisher_key is not a "+
+						"base64 ed25519 public key: %v", keyErr)
+				}
+				cacheDir := emergency.CacheDir
+				snapshots := gateway.NewSnapshotCache(originURL.String(), cacheDir,
+					ed25519.PublicKey(key))
+				snapshots.Logger = logger
+				if emergency.PollSeconds > 0 {
+					snapshots.Poll = time.Duration(emergency.PollSeconds) * time.Second
+				}
+				if emergency.MaxObjectBytes > 0 {
+					snapshots.MaxObjectBytes = emergency.MaxObjectBytes
+				}
+				contentProxy.Snapshot = snapshots
+				contentProxy.Health = gateway.NewOriginHealth()
+				go snapshots.Run(ctx)
+				logger.Printf("emergency cache enabled: polling %s every %s, holding in %s",
+					originURL.Host, snapshots.Poll, cacheDir)
 			}
 			gatewayService.SetContentProxy(contentProxy)
 			logger.Printf("gateway serves content for %s under %s as %s",
