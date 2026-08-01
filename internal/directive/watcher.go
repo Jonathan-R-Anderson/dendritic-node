@@ -2,10 +2,13 @@ package directive
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -242,10 +245,82 @@ func (w *Watcher) Poll(ctx context.Context) {
 	}
 }
 
+// isLoopback reports whether a URL points at this machine.
+//
+// Loopback sources are the node's OWN object-store endpoint, which is the one
+// place a directive can be read without the origin, its domain or its
+// certificate — all of which a directive may be announcing the loss of.
+func isLoopback(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
+}
+
+// flipScheme returns the same URL with http<->https swapped.
+//
+// The node's S3 endpoint serves TLS only when the operator has configured a
+// certificate, so its scheme is not knowable when the config is generated at
+// download time. Guessing wrong would mean the node silently never reads the
+// one source that survives losing the domain — a failure that looks like
+// nothing at all until a move happens and it does not follow.
+func flipScheme(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	switch parsed.Scheme {
+	case "http":
+		parsed.Scheme = "https"
+	case "https":
+		parsed.Scheme = "http"
+	default:
+		return ""
+	}
+	return parsed.String()
+}
+
 func (w *Watcher) fetch(ctx context.Context, source string) (*Document, error) {
+	doc, err := w.fetchOnce(ctx, source)
+	if err == nil || !isLoopback(source) {
+		return doc, err
+	}
+	alternate := flipScheme(source)
+	if alternate == "" {
+		return doc, err
+	}
+	if retried, retryErr := w.fetchOnce(ctx, alternate); retryErr == nil {
+		w.logf("network directive: %s answered on %s instead", source, alternate)
+		return retried, nil
+	}
+	return doc, err
+}
+
+func (w *Watcher) fetchOnce(ctx context.Context, source string) (*Document, error) {
 	client := w.Client
 	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Second}
+		timeout := 20 * time.Second
+		if isLoopback(source) {
+			// Certificate verification is skipped for the node's OWN endpoint,
+			// and only for it. The cert there is self-signed by this machine,
+			// so verifying it establishes nothing — and nothing is being
+			// trusted from the transport anyway: the directive's authority is
+			// the wallet signature, which is checked whatever carried it.
+			client = &http.Client{
+				Timeout: timeout,
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				},
+			}
+		} else {
+			client = &http.Client{Timeout: timeout}
+		}
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
