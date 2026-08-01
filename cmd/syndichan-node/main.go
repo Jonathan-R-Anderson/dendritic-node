@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/syndichan/maniwani/storage-client/internal/bootstrap"
 	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/directive"
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
@@ -130,6 +131,27 @@ func main() {
 	if node != nil {
 		defer node.Close()
 		signer = node
+		// Opt-in: a config with no `bootstrap` section keeps the single-URL
+		// behaviour it has always had. The discovered path refuses a lone
+		// unverifiable source, which is correct for an install that was given a
+		// pinned coordinator key and would take an upgraded node off the DHT
+		// entirely if applied to one that was not.
+		if cfg.Bootstrap.Configured() {
+			node.SetBootstrapConfig(bootstrap.Config{
+				CoordinatorKey:   cfg.Bootstrap.CoordinatorKey,
+				SRVName:          cfg.Bootstrap.SRVName,
+				URLs:             cfg.Bootstrap.URLs,
+				MinimumAgreement: cfg.Bootstrap.MinimumAgreement,
+			})
+			if cfg.Bootstrap.CoordinatorKey == "" {
+				logger.Printf("bootstrap: no coordinator key pinned, so the " +
+					"document can only be corroborated across sources, never " +
+					"verified. Set bootstrap.coordinator_key to fix that.")
+			} else {
+				logger.Printf("bootstrap: discovering sources via %s, verifying "+
+					"against the pinned coordinator key", cfg.Bootstrap.SRVName)
+			}
+		}
 		node.SetGatewayState(cfg.Gateway.Enabled, false)
 		// node is non-nil only in the storage role, which is also the only role
 		// that sends the five-minute storage heartbeat.

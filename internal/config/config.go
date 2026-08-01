@@ -85,6 +85,37 @@ type NetworkDirectiveConfig struct {
 	PollSeconds int `json:"poll_seconds,omitempty"`
 }
 
+// BootstrapConfig decides how this node joins the DHT, and — more importantly —
+// whom it believes about the coordinator key.
+//
+// The bootstrap document names which peers to dial AND which coordinator key to
+// accept for storage leases. A node that takes that key out of the document is
+// trusting whoever served it, which was tolerable while exactly one host under
+// our own TLS did, and is not once volunteer gateways share the job. So the key
+// is pinned here, at install, and the document's signature is checked against
+// it.
+//
+// An ABSENT section keeps the old single-URL behaviour on purpose. The new
+// rules refuse a lone unverifiable source, which is right for a fresh install
+// that was given a pinned key and fatal for an existing node that was not —
+// applying them on upgrade would take those nodes off the DHT entirely.
+type BootstrapConfig struct {
+	// CoordinatorKey, base64. Empty falls back to requiring agreement.
+	CoordinatorKey string `json:"coordinator_key,omitempty"`
+	// SRVName is resolved to find gateways serving the document, so one host
+	// being offline costs nothing — the node simply tries the next.
+	SRVName string `json:"srv_name,omitempty"`
+	// URLs tried in addition to whatever SRV turns up.
+	URLs []string `json:"urls,omitempty"`
+	// MinimumAgreement when no key is pinned. Zero takes the package default.
+	MinimumAgreement int `json:"minimum_agreement,omitempty"`
+}
+
+// Configured reports whether this node was told to use discovered bootstrap.
+func (b BootstrapConfig) Configured() bool {
+	return b.SRVName != "" || len(b.URLs) > 0 || b.CoordinatorKey != ""
+}
+
 type Config struct {
 	DataDir  string `json:"data_dir"`
 	S3Listen string `json:"s3_listen"`
@@ -111,6 +142,9 @@ type Config struct {
 	DCS           DCSConfig     `json:"dcs"`
 	// NetworkDirective is how this node learns the network has moved.
 	NetworkDirective NetworkDirectiveConfig `json:"network_directive"`
+	// Bootstrap is how this node finds its way into the DHT, and who it
+	// believes about it. Absent means the old single-URL behaviour.
+	Bootstrap BootstrapConfig `json:"bootstrap"`
 	// RunMode selects what this node runs, IN THE CONFIG rather than on the
 	// command line: "storage" (default full node), "gateway-only", or
 	// "probe-only". It is edited on the management page, so the node launches

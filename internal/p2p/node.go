@@ -38,6 +38,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 
+	"github.com/syndichan/maniwani/storage-client/internal/bootstrap"
 	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/dcs"
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
@@ -138,15 +139,20 @@ type Node struct {
 	store            *store.Store
 	logger           *log.Logger
 	bootstrap        string
-	http             *http.Client
-	directHTTP       *http.Client
-	keyMu            sync.RWMutex
-	coordKey         ed25519.PublicKey
-	peerMu           sync.RWMutex
-	bootstrapPeers   map[peer.ID]struct{}
-	i2pOnly          bool
-	replicaMu        sync.Mutex
-	replicated       map[string]struct{}
+	// bootstrapConfig is nil until SetBootstrapConfig is called, which is what
+	// keeps an upgraded node on its existing behaviour instead of refusing the
+	// only source it has.
+	bootstrapMu     sync.RWMutex
+	bootstrapConfig *bootstrap.Config
+	http            *http.Client
+	directHTTP      *http.Client
+	keyMu           sync.RWMutex
+	coordKey        ed25519.PublicKey
+	peerMu          sync.RWMutex
+	bootstrapPeers  map[peer.ID]struct{}
+	i2pOnly         bool
+	replicaMu       sync.Mutex
+	replicated      map[string]struct{}
 	// cacheOnly nodes serve their own content but host nothing for anyone
 	// else; see the "store" branch of handleStream.
 	cacheOnly           bool
@@ -670,7 +676,53 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 	client.Send(ctx)
 }
 
+// SetBootstrapConfig switches this node onto discovered, verified bootstrap.
+//
+// Opt-in on purpose. A node whose config has no `bootstrap` section keeps the
+// old single-URL behaviour, because the new rules would REFUSE a lone
+// unverifiable source — correct for a fresh install that was given a pinned
+// coordinator key, and fatal for an existing node that was not. Silently
+// applying them on upgrade would take those nodes off the DHT entirely, which
+// is a worse outcome than the weaker trust they have today.
+func (n *Node) SetBootstrapConfig(cfg bootstrap.Config) {
+	n.bootstrapMu.Lock()
+	defer n.bootstrapMu.Unlock()
+	n.bootstrapConfig = &cfg
+}
+
+func (n *Node) bootstrapCfg() *bootstrap.Config {
+	n.bootstrapMu.RLock()
+	defer n.bootstrapMu.RUnlock()
+	return n.bootstrapConfig
+}
+
+// refreshDiscoveredBootstrap is the path for nodes that were configured for it:
+// several sources, a signature checked against a pinned key, and agreement as a
+// second layer when there is no key to check against.
+func (n *Node) refreshDiscoveredBootstrap(ctx context.Context, cfg *bootstrap.Config) {
+	result, err := bootstrap.Fetch(ctx, n.http, nil, *cfg, n.logger, time.Now())
+	if err != nil {
+		n.logger.Printf("bootstrap: no usable document (%v); local services "+
+			"remain active", err)
+		return
+	}
+	publicKey, err := base64.RawStdEncoding.DecodeString(
+		result.Document.CoordinatorPublicKey)
+	if err != nil || len(publicKey) != ed25519.PublicKeySize {
+		n.logger.Printf("bootstrap coordinator key rejected")
+		return
+	}
+	n.keyMu.Lock()
+	n.coordKey = append(ed25519.PublicKey(nil), publicKey...)
+	n.keyMu.Unlock()
+	n.connectBootstrapPeers(ctx, result.Document.Peers)
+}
+
 func (n *Node) refreshBootstrap(ctx context.Context) {
+	if cfg := n.bootstrapCfg(); cfg != nil {
+		n.refreshDiscoveredBootstrap(ctx, cfg)
+		return
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, n.bootstrap, nil)
 	if err != nil {
 		return
