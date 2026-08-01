@@ -292,7 +292,18 @@ func main() {
 	// Verification is entirely local: an Ethereum signature checked against a
 	// wallet written into this node's config at install. Nothing here asks the
 	// origin anything, which is the point — the origin may be what moved.
-	if wallet := strings.TrimSpace(cfg.NetworkDirective.Wallet); wallet != "" {
+	if wallet := strings.TrimSpace(cfg.NetworkDirective.Wallet); wallet == "" {
+		// Said out loud, every start. Without a pinned wallet this node cannot
+		// tell a real directive from anybody else's, so it follows none — which
+		// is the safe behaviour and an invisible one. An operator upgrading an
+		// existing node gets the code and none of the protection, and nothing
+		// would ever mention it.
+		logger.Printf("network directive: no wallet pinned in %s "+
+			"(network_directive.wallet), so this node will NOT learn if the "+
+			"origin moves to a new domain or server. Set it to the address "+
+			"published at /.well-known/syndichan/network.json to enable this.",
+			path)
+	} else {
 		store, storeErr := directive.OpenStore(cfg.DataDir)
 		if storeErr != nil {
 			// Fatal on purpose. The store holds the highest sequence this node
@@ -310,10 +321,16 @@ func main() {
 			applyDirective(&cfg, store, held, logger)
 		}
 		watcher := &directive.Watcher{
-			Wallet:   wallet,
-			Sources:  cfg.NetworkDirective.Sources,
-			Store:    store,
-			Log:      logger,
+			Wallet:  wallet,
+			Sources: cfg.NetworkDirective.Sources,
+			Store:   store,
+			Log:     logger,
+			// This node's own S3 credentials, for reading the object-store copy
+			// through its own loopback endpoint. Not used for any other source.
+			Credentials: directive.Credentials{
+				AccessKey: cfg.AccessKey,
+				SecretKey: cfg.SecretKey,
+			},
 			Interval: time.Duration(cfg.NetworkDirective.PollSeconds) * time.Second,
 			OnAdopt: func(d *directive.Directive) {
 				// Restart rather than re-point live. Half this process is

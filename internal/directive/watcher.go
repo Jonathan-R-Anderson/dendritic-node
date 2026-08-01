@@ -141,6 +141,12 @@ type Watcher struct {
 	Client  *http.Client
 	Log     Logger
 
+	// Credentials for this node's OWN object store, used only for loopback
+	// sources. The object-store copy is the one a node can read without the
+	// origin, its domain or its certificate — and the endpoint requires SigV4,
+	// so an unsigned GET is a 403 and that path silently does not exist.
+	Credentials Credentials
+
 	Interval time.Duration
 	Now      func() int64
 
@@ -325,6 +331,12 @@ func (w *Watcher) fetchOnce(ctx context.Context, source string) (*Document, erro
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
 		return nil, err
+	}
+	if isLoopback(source) {
+		// Signed with this node's own credentials, for a service on its own
+		// loopback interface. Nothing is granted to anyone by this: it is the
+		// node proving to itself that it is itself.
+		SignGet(request, w.Credentials, time.Now())
 	}
 	response, err := client.Do(request)
 	if err != nil {
