@@ -303,6 +303,11 @@ func main() {
 		if held := store.Held(); held != nil {
 			logger.Printf("network directive: holding sequence %d (kind=%s, domain=%s)",
 				held.Sequence, held.Kind, held.OriginDomain)
+			// Applied HERE, before anything reads these URLs. Adopting a
+			// directive and restarting achieves nothing on its own: the config
+			// still names the old domain in every origin-derived URL, so the
+			// node would come back up and talk to precisely the host that moved.
+			applyDirective(&cfg, store, held, logger)
 		}
 		watcher := &directive.Watcher{
 			Wallet:   wallet,

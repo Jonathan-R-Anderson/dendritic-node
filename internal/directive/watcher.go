@@ -24,8 +24,9 @@ const StoreFile = "network-directive.json"
 type Store struct {
 	path string
 
-	mu   sync.RWMutex
-	held *Directive
+	mu      sync.RWMutex
+	held    *Directive
+	domains []string
 }
 
 type storedState struct {
@@ -33,6 +34,14 @@ type storedState struct {
 	Signature string     `json:"signature"`
 	Signer    string     `json:"signer"`
 	AdoptedAt int64      `json:"adopted_at"`
+	// Domains is every origin this node has adopted, oldest first.
+	//
+	// Kept as a list rather than just the current one so a later directive can
+	// move the network BACK -- the ordinary outcome of a registrar dispute
+	// being resolved. With only the current domain remembered, a URL that had
+	// already been rewritten away from the original would no longer match
+	// anything and would silently stop following.
+	Domains []string `json:"domains,omitempty"`
 }
 
 func OpenStore(dataDir string) (*Store, error) {
@@ -54,7 +63,15 @@ func OpenStore(dataDir string) (*Store, error) {
 			"without the sequence floor it holds", s.path, err)
 	}
 	s.held = state.Directive
+	s.domains = state.Domains
 	return s, nil
+}
+
+// Domains is every origin this node has adopted, oldest first.
+func (s *Store) Domains() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.domains...)
 }
 
 func (s *Store) Held() *Directive {
@@ -69,8 +86,13 @@ func (s *Store) Adopt(d *Directive, signature, signer string, now int64) error {
 	if err := CheckAcceptable(d, s.held); err != nil {
 		return err
 	}
+	domains := s.domains
+	if d.Kind == KindMove && d.OriginDomain != "" {
+		domains = appendUnique(domains, d.OriginDomain)
+	}
 	body, err := json.MarshalIndent(storedState{
 		Directive: d, Signature: signature, Signer: signer, AdoptedAt: now,
+		Domains: domains,
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -86,7 +108,17 @@ func (s *Store) Adopt(d *Directive, signature, signer string, now int64) error {
 		return err
 	}
 	s.held = d
+	s.domains = domains
 	return nil
+}
+
+func appendUnique(list []string, value string) []string {
+	for _, existing := range list {
+		if existing == value {
+			return list
+		}
+	}
+	return append(append([]string(nil), list...), value)
 }
 
 // Logger is the subset of *log.Logger this package needs.

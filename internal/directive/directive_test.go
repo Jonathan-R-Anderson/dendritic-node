@@ -114,10 +114,10 @@ func TestANoteCannotForgeAField(t *testing.T) {
 func TestMalformedMessagesAreRefused(t *testing.T) {
 	good := Canonical(&Directive{Kind: KindMove, Sequence: 1, OriginDomain: "a.example"})
 	cases := map[string]string{
-		"empty":       "",
+		"empty":        "",
 		"wrong header": "something else\n" + good,
-		"truncated":   good[:len(good)-10],
-		"extra line":  good + "\norigin_domain: evil.example",
+		"truncated":    good[:len(good)-10],
+		"extra line":   good + "\norigin_domain: evil.example",
 	}
 	for name, text := range cases {
 		t.Run(name, func(t *testing.T) {
