@@ -1,0 +1,246 @@
+package directive
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// StoreFile is where the last verified directive is kept, under the data dir.
+const StoreFile = "network-directive.json"
+
+// Store holds the directive this node has accepted, across restarts.
+//
+// Persistence is not a convenience here, it is the security property. The
+// sequence rule only means anything if the node REMEMBERS the highest one it
+// has seen -- a node that forgets on restart would accept a replayed directive
+// from a year ago, which is the exact attack the sequence exists to stop.
+type Store struct {
+	path string
+
+	mu   sync.RWMutex
+	held *Directive
+}
+
+type storedState struct {
+	Directive *Directive `json:"directive"`
+	Signature string     `json:"signature"`
+	Signer    string     `json:"signer"`
+	AdoptedAt int64      `json:"adopted_at"`
+}
+
+func OpenStore(dataDir string) (*Store, error) {
+	s := &Store{path: filepath.Join(dataDir, StoreFile)}
+	body, err := os.ReadFile(s.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return s, nil
+		}
+		return nil, err
+	}
+	var state storedState
+	if err := json.Unmarshal(body, &state); err != nil {
+		// A corrupt store is NOT treated as "nothing held". Starting from
+		// scratch would silently drop the sequence floor and re-open the replay
+		// window; refusing to start is the safe direction for a file that
+		// should only ever have been written by this node.
+		return nil, fmt.Errorf("%s is unreadable (%v) -- refusing to start "+
+			"without the sequence floor it holds", s.path, err)
+	}
+	s.held = state.Directive
+	return s, nil
+}
+
+func (s *Store) Held() *Directive {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.held
+}
+
+func (s *Store) Adopt(d *Directive, signature, signer string, now int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := CheckAcceptable(d, s.held); err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(storedState{
+		Directive: d, Signature: signature, Signer: signer, AdoptedAt: now,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Written to a temp file and renamed: a half-written store is a store that
+	// cannot be read, and OpenStore refuses to start on one. An interrupted
+	// power cycle must not brick the node.
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, append(body, '\n'), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	s.held = d
+	return nil
+}
+
+// Logger is the subset of *log.Logger this package needs.
+type Logger interface {
+	Printf(format string, v ...interface{})
+}
+
+// Watcher polls for a newer directive and adopts it when it verifies.
+type Watcher struct {
+	// Wallet is the address pinned in THIS node's config. Never fetched.
+	Wallet string
+	// Sources are URLs serving the document. More than one on purpose: the
+	// source that depends on the current domain is exactly the one that fails
+	// in the situation a directive exists for.
+	Sources []string
+	Store   *Store
+	Client  *http.Client
+	Log     Logger
+
+	Interval time.Duration
+	Now      func() int64
+
+	// OnAdopt is called with a directive that verified AND is effective. This
+	// is where the node changes what it points at.
+	OnAdopt func(*Directive)
+}
+
+func (w *Watcher) now() int64 {
+	if w.Now != nil {
+		return w.Now()
+	}
+	return time.Now().Unix()
+}
+
+func (w *Watcher) logf(format string, v ...interface{}) {
+	if w.Log != nil {
+		w.Log.Printf(format, v...)
+	}
+}
+
+// Run polls until the context ends.
+func (w *Watcher) Run(ctx context.Context) {
+	if w.Wallet == "" {
+		// Deliberately loud and then inert. A node with no pinned wallet has no
+		// way to tell a real directive from anyone else's, and quietly polling
+		// anyway would mean the first plausible document wins.
+		w.logf("network directive: no wallet is pinned in this node's config, " +
+			"so directives cannot be verified and will not be followed")
+		return
+	}
+	interval := w.Interval
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	w.Poll(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.Poll(ctx)
+		}
+	}
+}
+
+// Poll tries every source once and adopts the first directive that verifies.
+func (w *Watcher) Poll(ctx context.Context) {
+	for _, source := range w.Sources {
+		doc, err := w.fetch(ctx, source)
+		if err != nil {
+			w.logf("network directive: %s unavailable (%v)", source, err)
+			continue
+		}
+		if doc.Directive == nil {
+			continue
+		}
+		held := w.Store.Held()
+		if held != nil && doc.Directive.Sequence <= held.Sequence {
+			continue // nothing new here; not worth a log line every 15 minutes
+		}
+
+		verified, err := Verify(doc, w.Wallet, held)
+		if err != nil {
+			// Logged at every source, because a directive that fails to verify
+			// is either a mistake worth fixing or an attempt worth seeing.
+			w.logf("network directive: REFUSED from %s: %v", source, err)
+			continue
+		}
+
+		now := w.now()
+		if !verified.Effective(now) {
+			w.logf("network directive: sequence %d verified from %s but is not "+
+				"effective for another %ds -- this is the window in which an "+
+				"operator can freeze a directive they did not issue",
+				verified.Sequence, source, verified.NotBefore-now)
+			continue
+		}
+
+		if err := w.Store.Adopt(verified, doc.Signature, doc.Signer, now); err != nil {
+			w.logf("network directive: could not adopt sequence %d: %v",
+				verified.Sequence, err)
+			continue
+		}
+		if verified.Emergency {
+			// An emergency directive skipped the delay. The only thing bought
+			// in exchange is that it cannot happen quietly.
+			w.logf("NETWORK DIRECTIVE (EMERGENCY): adopted sequence %d, kind=%s, "+
+				"domain=%s -- this took effect immediately with no delay",
+				verified.Sequence, verified.Kind, verified.OriginDomain)
+		} else {
+			w.logf("network directive: adopted sequence %d, kind=%s, domain=%s",
+				verified.Sequence, verified.Kind, verified.OriginDomain)
+		}
+		if w.OnAdopt != nil {
+			w.OnAdopt(verified)
+		}
+		return
+	}
+}
+
+func (w *Watcher) fetch(ctx context.Context, source string) (*Document, error) {
+	client := w.Client
+	if client == nil {
+		client = &http.Client{Timeout: 20 * time.Second}
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", response.StatusCode)
+	}
+	// Capped: this document is a few hundred bytes, and an unbounded read from
+	// a host that may not be ours any more is a memory exhaustion primitive.
+	body, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	if err != nil {
+		return nil, err
+	}
+	return ParseDocument(body)
+}
+
+// OriginBase is the URL this node should treat as the origin, given what it
+// holds. Falls back to the configured default when nothing has been adopted.
+func OriginBase(held *Directive, configured string) string {
+	if held != nil && held.Kind == KindMove && held.OriginDomain != "" {
+		return "https://" + held.OriginDomain
+	}
+	return configured
+}

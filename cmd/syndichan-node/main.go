@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/syndichan/maniwani/storage-client/internal/config"
+	"github.com/syndichan/maniwani/storage-client/internal/directive"
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
 	gatewayfrontend "github.com/syndichan/maniwani/storage-client/internal/gateway/frontend"
 	"github.com/syndichan/maniwani/storage-client/internal/heartbeat"
@@ -283,6 +284,72 @@ func main() {
 	var gatewayListener net.Listener
 	var gatewayService *gateway.Service
 	var gatewayFrontend *gatewayfrontend.Server
+
+	// The network directive watcher, for EVERY role. A node that only stores
+	// shards still needs to know the origin moved, or it goes on reporting to
+	// a host that is gone.
+	//
+	// Verification is entirely local: an Ethereum signature checked against a
+	// wallet written into this node's config at install. Nothing here asks the
+	// origin anything, which is the point — the origin may be what moved.
+	if wallet := strings.TrimSpace(cfg.NetworkDirective.Wallet); wallet != "" {
+		store, storeErr := directive.OpenStore(cfg.DataDir)
+		if storeErr != nil {
+			// Fatal on purpose. The store holds the highest sequence this node
+			// has seen, and starting without it would silently drop the replay
+			// floor — a node that forgets accepts a directive from a year ago.
+			logger.Fatalf("network directive store: %v", storeErr)
+		}
+		if held := store.Held(); held != nil {
+			logger.Printf("network directive: holding sequence %d (kind=%s, domain=%s)",
+				held.Sequence, held.Kind, held.OriginDomain)
+		}
+		watcher := &directive.Watcher{
+			Wallet:   wallet,
+			Sources:  cfg.NetworkDirective.Sources,
+			Store:    store,
+			Log:      logger,
+			Interval: time.Duration(cfg.NetworkDirective.PollSeconds) * time.Second,
+			OnAdopt: func(d *directive.Directive) {
+				// Restart rather than re-point live. Half this process is
+				// already holding connections, registrations and a signer bound
+				// to the old origin; swapping the address underneath them would
+				// leave a node partly on each. Exiting is honest, and every
+				// supported way of running this restarts automatically.
+				logger.Printf("network directive: sequence %d adopted — restarting "+
+					"to come up against %s", d.Sequence,
+					directive.OriginBase(d, "the configured origin"))
+				cancel()
+			},
+		}
+		go watcher.Run(ctx)
+	}
+
+	// Started OUTSIDE the gateway block, which is what GatewayValidatorConfig
+	// already claims: "independent of every other role". It was nested under
+	// `Gateway.Enabled || Gateway.ProbeEnabled`, so a node configured to do
+	// nothing but validate started, logged nothing, and audited nothing — the
+	// worst shape of failure, because it looks like it is working.
+	//
+	// It needs the signer and the logger and nothing from gatewayService, so
+	// there is no ordering reason for it to have lived in there.
+	if cfg.Gateway.Validator.Enabled {
+		originURL := cfg.Gateway.Validator.OriginURL
+		if originURL == "" {
+			originURL = "https://syndichan.org"
+		}
+		validator := gateway.NewValidator(signer, originURL, logger,
+			time.Now().UnixNano())
+		if seconds := cfg.Gateway.Validator.IntervalSeconds; seconds > 0 {
+			validator.Interval = time.Duration(seconds) * time.Second
+		}
+		if size := cfg.Gateway.Validator.SampleSize; size > 0 {
+			validator.SampleSize = size
+		}
+		go validator.Run(ctx)
+		logger.Printf("validator auditing gateways published by %s every %s",
+			originURL, validator.Interval)
+	}
 	if cfg.Gateway.Enabled || cfg.Gateway.ProbeEnabled {
 		gatewayService = gateway.NewService(signer, "1.0.0", cfg.Gateway.TrustedProbes, logger)
 		gatewayService.SetTrustLoopbackProxy(cfg.Gateway.TLS.Mode == "reverse_proxy")
@@ -307,23 +374,6 @@ func main() {
 				Timeout:        time.Duration(cfg.Gateway.Verification.VerificationTimeoutSeconds) * time.Second,
 				ResultValidity: time.Duration(cfg.Gateway.Verification.ProbeResultValiditySeconds) * time.Second,
 			})
-		}
-		if cfg.Gateway.Validator.Enabled {
-			originURL := cfg.Gateway.Validator.OriginURL
-			if originURL == "" {
-				originURL = "https://syndichan.org"
-			}
-			validator := gateway.NewValidator(signer, originURL, logger,
-				time.Now().UnixNano())
-			if seconds := cfg.Gateway.Validator.IntervalSeconds; seconds > 0 {
-				validator.Interval = time.Duration(seconds) * time.Second
-			}
-			if size := cfg.Gateway.Validator.SampleSize; size > 0 {
-				validator.SampleSize = size
-			}
-			go validator.Run(ctx)
-			logger.Printf("validator auditing gateways published by %s every %s",
-				originURL, validator.Interval)
 		}
 		if cfg.Gateway.Content.Enabled {
 			originURL, parseErr := url.Parse(cfg.Gateway.Content.OriginURL)

@@ -60,6 +60,31 @@ func (r Role) Description() string {
 	return string(r)
 }
 
+// NetworkDirectiveConfig is how this node learns that the network has moved --
+// a new domain, a new origin server, or a new signing key -- and who is allowed
+// to tell it.
+//
+// WHY THE WALLET IS HERE AND NOT FETCHED
+// It is written when the node is downloaded and never updated from the network.
+// A node that asked the origin which address may replace the origin would be
+// asking the thing being replaced: whoever seized the domain would serve their
+// own address alongside their own directive, and the check would pass while
+// proving nothing.
+//
+// An empty Wallet is valid and means this node follows no directives at all.
+// That is the safe direction -- it keeps pointing where it was told at install
+// rather than following whoever answers first.
+type NetworkDirectiveConfig struct {
+	Wallet string `json:"wallet,omitempty"`
+	// Sources serving /.well-known/syndichan/network.json. More than one on
+	// purpose: the source reached through the CURRENT domain is exactly the one
+	// that fails in the situation a directive exists for.
+	Sources []string `json:"sources,omitempty"`
+	// PollSeconds between checks. Rarely, because this changes almost never and
+	// every check is a request to a host that may no longer be ours.
+	PollSeconds int `json:"poll_seconds,omitempty"`
+}
+
 type Config struct {
 	DataDir  string `json:"data_dir"`
 	S3Listen string `json:"s3_listen"`
@@ -84,6 +109,8 @@ type Config struct {
 	TLSKey        string        `json:"tls_key,omitempty"`
 	Gateway       GatewayConfig `json:"gateway"`
 	DCS           DCSConfig     `json:"dcs"`
+	// NetworkDirective is how this node learns the network has moved.
+	NetworkDirective NetworkDirectiveConfig `json:"network_directive"`
 	// RunMode selects what this node runs, IN THE CONFIG rather than on the
 	// command line: "storage" (default full node), "gateway-only", or
 	// "probe-only". It is edited on the management page, so the node launches
