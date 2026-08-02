@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/syndichan/maniwani/storage-client/internal/config"
@@ -68,7 +70,10 @@ func startDCSBridge(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", api.handleHealth)
-	mux.HandleFunc("/dcs/blob", api.handleBlob)     // PUT: publish a build context
+	mux.HandleFunc("/dcs/blob", api.handleBlob) // PUT publish, GET/HEAD fetch
+	// The trailing-slash pattern is what makes /dcs/blob/<digest> reach the
+	// handler; "/dcs/blob" alone matches only the exact path.
+	mux.HandleFunc("/dcs/blob/", api.handleBlob)
 	mux.HandleFunc("/dcs/deploy", api.handleDeploy) // POST: deploy for a user
 	mux.HandleFunc("/dcs/status", api.handleStatus) // POST: poll a queued deploy
 	mux.HandleFunc("/dcs/destroy", api.handleDestroy)
@@ -109,8 +114,18 @@ func (api *bridgeAPI) handleHealth(w http.ResponseWriter, r *http.Request) {
 // blob is opaque, content-addressed bytes; storing it announces this node as a
 // DHT provider so any worker can fetch it later by digest.
 func (api *bridgeAPI) handleBlob(w http.ResponseWriter, r *http.Request) {
+	// GET and HEAD complete the other half of a content-addressed store. Without
+	// them a publisher can only assert that it once called PUT: nothing can read
+	// a blob back to confirm it is still there and still correct. That gap is
+	// why the site cannot reclaim the local copy of a build context it has
+	// already published — it would be trading a copy it can verify for one it
+	// cannot. HEAD exists so that check costs a lookup rather than a transfer.
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		api.serveBlob(w, r)
+		return
+	}
 	if r.Method != http.MethodPut && r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "use PUT")
+		writeErr(w, http.StatusMethodNotAllowed, "use PUT, GET or HEAD")
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, dcs.MaxBuildContextBytes+1))
@@ -131,6 +146,55 @@ func (api *bridgeAPI) handleBlob(w http.ResponseWriter, r *http.Request) {
 	}
 	api.logger.Printf("dcs-bridge: published build context %s (%d bytes)", digest, len(body))
 	writeJSON(w, http.StatusOK, map[string]any{"digest": digest, "size": len(body)})
+}
+
+// serveBlob answers GET and HEAD for a published build context.
+//
+// The digest is REVERIFIED against the bytes before they are returned. This is a
+// content-addressed store, so handing back bytes that do not hash to what was
+// asked for is worse than a miss: the caller would trust them. A mismatch means
+// local corruption and is reported as such rather than as a 404, because the two
+// need different responses from an operator.
+//
+// HEAD returns the same status and Content-Length with no body, so "is this
+// still stored?" costs a lookup instead of a transfer — which is what makes it
+// usable as a pre-flight check before reclaiming a local copy.
+func (api *bridgeAPI) serveBlob(w http.ResponseWriter, r *http.Request) {
+	digest := strings.TrimSpace(r.URL.Query().Get("digest"))
+	if digest == "" {
+		// Also accept /dcs/blob/<digest>, which is the friendlier shape for a
+		// human with curl.
+		digest = strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/dcs/blob"), "/")
+	}
+	if digest == "" {
+		writeErr(w, http.StatusBadRequest, "digest required: /dcs/blob?digest=sha256:...")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	body, err := api.blobs.GetBlob(ctx, digest)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such blob: "+err.Error())
+		return
+	}
+	if actual := dcs.BlobDigest(body); actual != digest {
+		api.logger.Printf("dcs-bridge: blob %s hashes to %s — stored copy is corrupt",
+			digest, actual)
+		writeErr(w, http.StatusInternalServerError, "stored blob does not match its digest")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("ETag", `"`+digest+`"`)
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := w.Write(body); err != nil {
+		api.logger.Printf("dcs-bridge: writing blob %s failed: %v", digest, err)
+	}
 }
 
 // deployBody is the site's deploy request. Exactly one of image / build_context_digest
