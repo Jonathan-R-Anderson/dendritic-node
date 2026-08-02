@@ -59,6 +59,11 @@ type State struct {
 	// + role.worker). It is what makes the node draw its yellow role on the
 	// operator's map and marks it as a container host on the network.
 	DCSWorker bool
+	// Monitor is true when this node runs the status monitor. Reported so the
+	// operator's map can draw the role, and so they can see how many vantage
+	// points the status page actually has -- a page measured from one place
+	// cannot tell "the site is down" from "unreachable from that machine".
+	Monitor bool
 	// I2PDestination is the node's own base32 garlic destination. Reported so the
 	// coordinator can hand this node out to others as a LIVE bootstrap peer,
 	// instead of the network relying on a single hardcoded one.
@@ -94,6 +99,7 @@ type request struct {
 	GatewayVerified     bool                  `json:"gateway_verified"`
 	GatewayRegistration *gateway.Registration `json:"gateway_registration,omitempty"`
 	DCSWorker           bool                  `json:"dcs_worker"`
+	Monitor             bool                  `json:"monitor"`
 	I2PDestination      string                `json:"i2p_destination,omitempty"`
 	// Omitted entirely when the window is zero: the coordinator distinguishes
 	// "not reporting" from "reported nothing", and sending zeros would claim
@@ -173,6 +179,7 @@ func (c *Client) Send(ctx context.Context) {
 		GatewayVerified:     state.GatewayVerified,
 		GatewayRegistration: state.Registration,
 		DCSWorker:           state.DCSWorker,
+		Monitor:             state.Monitor,
 		I2PDestination:      state.I2PDestination,
 	}
 	// Sent only when there is a window to divide by. A zero window is not a

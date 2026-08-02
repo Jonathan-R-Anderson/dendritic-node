@@ -142,6 +142,7 @@ func main() {
 		// heartbeat, so shard traffic and object reads land in one figure
 		// rather than two nobody sums.
 		node.SetMeter(meter)
+		node.SetMonitorEnabled(cfg.Monitor.Enabled)
 		signer = node
 		// Opt-in: a config with no `bootstrap` section keeps the single-URL
 		// behaviour it has always had. The discovered path refuses a lone
@@ -692,6 +693,7 @@ func main() {
 					CapacityBytes:   0,
 					GatewayEnabled:  cfg.Gateway.Enabled,
 					GatewayVerified: gatewayVerified.Load(),
+					Monitor:         cfg.Monitor.Enabled,
 				}
 				w := meter.Window(time.Now())
 				state.Traffic = heartbeat.Traffic{
