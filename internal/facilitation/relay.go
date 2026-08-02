@@ -177,7 +177,6 @@ func (c *GatewayClient) UploadReceipts(ctx context.Context, receipts []SignedRec
 	return out.Stored, nil
 }
 
-
 type candidatesListing struct {
 	Candidates []struct {
 		P2PPublicKey  string `json:"p2p_public_key"`

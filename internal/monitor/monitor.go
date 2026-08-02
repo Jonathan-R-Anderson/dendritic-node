@@ -1,5 +1,5 @@
 // Package monitor checks that Syndichan answers, from wherever this node is,
-// and publishes the result to the public status page.
+// and publishes the result to the public status page at /status.
 //
 // # WHY THE NODE DOES THIS AND NOT THE SERVER
 //

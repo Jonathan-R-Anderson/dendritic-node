@@ -169,15 +169,9 @@ type MonitorConfig struct {
 	// there is one source of truth rather than two URLs to keep in step.
 	TargetsURL string `json:"targets_url,omitempty"`
 	ReportURL  string `json:"report_url,omitempty"`
-	// BoardURL is the JSON this node re-serves when it hosts the status page.
-	BoardURL string `json:"board_url,omitempty"`
 	// IntervalSeconds is a floor the coordinator can raise; it is jittered so a
 	// fleet started by one rollout does not arrive in lockstep forever.
 	IntervalSeconds int `json:"interval_seconds,omitempty"`
-	// ServesStatus declares that this node hosts status.<domain>. It needs the
-	// gateway role's inbound port and certificate, so it is meaningless without
-	// one -- the coordinator reads the same field out of the registration.
-	ServesStatus bool `json:"serves_status,omitempty"`
 }
 
 // ResolvedRole maps the config's RunMode to a runtime Role. An unset or unknown
