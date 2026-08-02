@@ -151,6 +151,33 @@ type Config struct {
 	// with no flags -- only the config file decides its posture. An empty value
 	// means "storage" for backward compatibility with older config files.
 	RunMode string `json:"run_mode,omitempty"`
+	// Monitor is the status-page role: check that Syndichan answers from where
+	// this node is, and publish the result. Absent means off, which is the
+	// right default -- a node should not start making outbound requests on a
+	// schedule because it was upgraded.
+	Monitor MonitorConfig `json:"monitor"`
+}
+
+// MonitorConfig configures the status monitor.
+//
+// The check LIST is not here on purpose: it is fetched from TargetsURL, so a
+// monitoring fleet is not limited to whatever its slowest operator last
+// installed. What lives in the config is only what a person chooses.
+type MonitorConfig struct {
+	Enabled bool `json:"enabled"`
+	// Where to ask what to check. The response also names where to report, so
+	// there is one source of truth rather than two URLs to keep in step.
+	TargetsURL string `json:"targets_url,omitempty"`
+	ReportURL  string `json:"report_url,omitempty"`
+	// BoardURL is the JSON this node re-serves when it hosts the status page.
+	BoardURL string `json:"board_url,omitempty"`
+	// IntervalSeconds is a floor the coordinator can raise; it is jittered so a
+	// fleet started by one rollout does not arrive in lockstep forever.
+	IntervalSeconds int `json:"interval_seconds,omitempty"`
+	// ServesStatus declares that this node hosts status.<domain>. It needs the
+	// gateway role's inbound port and certificate, so it is meaningless without
+	// one -- the coordinator reads the same field out of the registration.
+	ServesStatus bool `json:"serves_status,omitempty"`
 }
 
 // ResolvedRole maps the config's RunMode to a runtime Role. An unset or unknown

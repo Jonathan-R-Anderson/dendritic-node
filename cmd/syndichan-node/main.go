@@ -27,6 +27,7 @@ import (
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
 	gatewayfrontend "github.com/syndichan/maniwani/storage-client/internal/gateway/frontend"
 	"github.com/syndichan/maniwani/storage-client/internal/heartbeat"
+	"github.com/syndichan/maniwani/storage-client/internal/monitor"
 	"github.com/syndichan/maniwani/storage-client/internal/p2p"
 	"github.com/syndichan/maniwani/storage-client/internal/s3api"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
@@ -687,6 +688,20 @@ func main() {
 		}
 		logger.Printf("presence heartbeat every %s to %s", heartbeat.Interval, heartbeat.Endpoint)
 		go presence.Run(ctx)
+	}
+	// Status monitoring, in EVERY role including storage nodes. Checking that
+	// the site answers needs no disk, no port and no p2p node -- only an
+	// internet connection and a different vantage point from the server's own,
+	// which is the entire value of doing it out here.
+	if cfg.Monitor.Enabled && cfg.Monitor.TargetsURL != "" {
+		watcher := &monitor.Client{
+			Signer:     signer,
+			TargetsURL: cfg.Monitor.TargetsURL,
+			ReportURL:  cfg.Monitor.ReportURL,
+			Logger:     logger,
+		}
+		logger.Printf("status monitor: checking %s", cfg.Monitor.TargetsURL)
+		go watcher.Run(ctx)
 	}
 	if !noStorage {
 		uiServer.Handler.(*ui.Server).SetStoragePaths(cfg.DataDir, func(target string) error {

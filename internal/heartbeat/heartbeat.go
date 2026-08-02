@@ -63,6 +63,24 @@ type State struct {
 	// coordinator can hand this node out to others as a LIVE bootstrap peer,
 	// instead of the network relying on a single hardcoded one.
 	I2PDestination string
+	// Traffic this node moved since the last beacon. Summed across nodes to
+	// give the public status page a network throughput figure -- which the
+	// frontend cannot measure itself, because it never sees peer-to-peer shard
+	// transfers at all.
+	Traffic Traffic
+}
+
+// Traffic is a WINDOW, never a lifetime counter.
+//
+// A cumulative counter has to be differenced against the previous beacon to
+// become a rate, and it resets to zero when the node restarts -- which reads as
+// a large negative delta, i.e. as an enormous burst of traffic at exactly the
+// moment a node is flapping. Reporting "what moved in the last N seconds" makes
+// a restart worth nothing instead of worth a spike.
+type Traffic struct {
+	Bytes         int64 `json:"bytes"`
+	Requests      int   `json:"requests"`
+	WindowSeconds int   `json:"window_seconds"`
 }
 
 type request struct {
@@ -77,6 +95,10 @@ type request struct {
 	GatewayRegistration *gateway.Registration `json:"gateway_registration,omitempty"`
 	DCSWorker           bool                  `json:"dcs_worker"`
 	I2PDestination      string                `json:"i2p_destination,omitempty"`
+	// Omitted entirely when the window is zero: the coordinator distinguishes
+	// "not reporting" from "reported nothing", and sending zeros would claim
+	// the second when the first is true.
+	Traffic *Traffic `json:"traffic,omitempty"`
 }
 
 // Client posts the signed beacon. Endpoint and HTTP are injected so tests can
@@ -152,6 +174,13 @@ func (c *Client) Send(ctx context.Context) {
 		GatewayRegistration: state.Registration,
 		DCSWorker:           state.DCSWorker,
 		I2PDestination:      state.I2PDestination,
+	}
+	// Sent only when there is a window to divide by. A zero window is not a
+	// rate of zero -- it is the absence of a measurement, and the coordinator
+	// draws them differently on the status page.
+	if state.Traffic.WindowSeconds > 0 {
+		traffic := state.Traffic
+		payload.Traffic = &traffic
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
