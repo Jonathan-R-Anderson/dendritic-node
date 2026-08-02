@@ -5,14 +5,14 @@
 // point of the network -- so any throughput figure taken from the website's own
 // logs would describe the website and call it the network.
 //
-// WHAT COUNTS
+// # WHAT COUNTS
 //
 // Bytes served TO somebody else. Not bytes this node fetched for itself, not
 // its own uploads, not heartbeats or probes. The number is published as network
 // throughput, and a node's own housekeeping is not throughput the network
 // provided to anybody.
 //
-// WHY A DRAIN AND NOT A COUNTER
+// # WHY A DRAIN AND NOT A COUNTER
 //
 // Window() returns what accumulated since the last call and resets. A
 // cumulative counter would have to be differenced by the receiver, and it
@@ -114,5 +114,5 @@ func (m *Meter) Window(now time.Time) Window {
 		// sliver rather than double-counting it later.
 		return Window{}
 	}
-	return Window{Bytes: bytes, Requests: requests, WindowSeconds: elapsed}
+	return Window{Bytes: bytes, Requests: int(requests), WindowSeconds: elapsed}
 }

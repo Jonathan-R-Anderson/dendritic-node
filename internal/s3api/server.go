@@ -29,7 +29,17 @@ type Server struct {
 	maxBody int64
 	mu      sync.RWMutex
 	uploads map[string]*multipartUpload
+	// Meter counts bytes served to callers, for the network throughput figure
+	// on the public status page. Optional and nil-safe: a node that is not
+	// reporting simply has none, and the coordinator reads an absent report as
+	// "not measuring" rather than as "measured zero".
+	meter *traffic.Meter
 }
+
+// SetMeter attaches the traffic meter. Separate from New so the meter can be
+// owned by the process and shared with the other things that serve bytes,
+// rather than each subsystem keeping a count nobody adds up.
+func (s *Server) SetMeter(m *traffic.Meter) { s.meter = m }
 
 type multipartUpload struct {
 	ID          string
@@ -586,7 +596,13 @@ func (s *Server) getObject(w http.ResponseWriter, bucket, key string, head bool,
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	if _, err := s.store.GetObject(bucket, key, w); err != nil {
+	// Counted from what GetObject actually wrote, not from the manifest's
+	// declared size: a transfer that fails halfway moved the bytes it moved,
+	// and reporting the intended size would credit this node for delivery it
+	// did not complete.
+	written, err := s.store.GetObject(bucket, key, w)
+	s.meter.Serve(written)
+	if err != nil {
 		s.logger.Printf("GET %s/%s failed after response began: %v", bucket, key, err)
 	}
 }
