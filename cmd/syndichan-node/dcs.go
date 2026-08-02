@@ -14,6 +14,7 @@ import (
 	"github.com/syndichan/maniwani/storage-client/internal/dcs"
 	syndii2p "github.com/syndichan/maniwani/storage-client/internal/i2p"
 	"github.com/syndichan/maniwani/storage-client/internal/p2p"
+	"github.com/syndichan/maniwani/storage-client/internal/place"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 )
 
@@ -410,7 +411,17 @@ func (c *containerSessions) OpenForContainer(_ context.Context, containerID stri
 }
 
 // storeBlobStore stores build-context blobs in the shard store, content-addressed.
-type storeBlobStore struct{ store *store.Store }
+type storeBlobStore struct {
+	store *store.Store
+	// placer is set when the node has a p2p host, and is what makes a full
+	// local store stop being a hard failure: the blob goes to a peer with room
+	// and that peer announces itself as its provider. Nil on a node with no
+	// network, where local-or-nothing is the only honest behaviour.
+	placer *place.Placer
+}
+
+// SetPlacer enables peer placement for blobs this node cannot hold itself.
+func (b *storeBlobStore) SetPlacer(p *place.Placer) { b.placer = p }
 
 // NewStoreBlobStore adapts the shard store to dcs.BlobStore. Build contexts land
 // in a dedicated bucket keyed by their digest, so the store's chunking,
@@ -429,10 +440,34 @@ const buildContextBucket = "dcs-buildctx"
 func (b *storeBlobStore) PutBlob(ctx context.Context, data []byte) (string, error) {
 	digest := dcs.BlobDigest(data)
 	_, err := b.store.PutObject(buildContextBucket, digest, "application/x-tar", bytes.NewReader(data))
-	if err != nil {
+	if err == nil {
+		return digest, nil
+	}
+	// Local first, peer second. A node with room keeps its own writes, so the
+	// common path is unchanged and no traffic is generated for it.
+	//
+	// Being FULL is different from being broken: it is the one failure the
+	// network can answer, and answering it is the difference between a DHT that
+	// pools capacity and a directory of independent disks. Any other error —
+	// permissions, corruption, a bad bucket — is this node's problem and is
+	// returned unchanged rather than quietly shipped elsewhere.
+	if b.placer == nil || !isCapacityError(err) {
 		return "", err
 	}
+	_, placeErr := b.placer.Place(ctx, digest, data)
+	if placeErr != nil {
+		// Both failures are reported. "Full here AND nowhere to put it" is a
+		// different operational problem from either half alone.
+		return "", fmt.Errorf("local store full (%v) and placement failed: %w", err, placeErr)
+	}
 	return digest, nil
+}
+
+// isCapacityError matches the store's out-of-room condition. Compared on the
+// message because store.ensureCapacity returns errors.New; a sentinel there
+// would be better and is a change to that package rather than this one.
+func isCapacityError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "storage capacity exceeded")
 }
 
 func (b *storeBlobStore) GetBlob(_ context.Context, digest string) ([]byte, error) {

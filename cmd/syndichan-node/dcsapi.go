@@ -60,11 +60,18 @@ func startDCSBridge(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 		logger.Printf("dcs-bridge: worker record validator: %v", err)
 	}
 
+	blobs := NewStoreBlobStore(storage)
+	// Peer placement: capacity becomes a property of the network rather than of
+	// whichever node received the write. Without this a full local store fails
+	// the write outright, which is what made the DHT a directory of independent
+	// disks instead of pooled storage.
+	startBlobPlacement(ctx, node, storage, blobs, logger)
+
 	api := &bridgeAPI{
 		node:    node,
 		store:   storage,
 		manager: dcs.NewManager(node, dcs.NewStreamTransport(node.Host())),
-		blobs:   NewStoreBlobStore(storage),
+		blobs:   blobs,
 		logger:  logger,
 	}
 
