@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/syndichan/maniwani/storage-client/internal/store"
+	"github.com/syndichan/maniwani/storage-client/internal/traffic"
 )
 
 type Server struct {
@@ -596,15 +597,28 @@ func (s *Server) getObject(w http.ResponseWriter, bucket, key string, head bool,
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	// Counted from what GetObject actually wrote, not from the manifest's
-	// declared size: a transfer that fails halfway moved the bytes it moved,
-	// and reporting the intended size would credit this node for delivery it
-	// did not complete.
-	written, err := s.store.GetObject(bucket, key, w)
-	s.meter.Serve(written)
+	// Counted through a wrapper rather than from the manifest's declared size.
+	// A transfer that fails halfway moved the bytes it moved, and reporting the
+	// intended size would credit this node for delivery it did not complete --
+	// on a flaky link that difference is the whole story.
+	counted := &countingWriter{w: w}
+	_, err = s.store.GetObject(bucket, key, counted)
+	s.meter.Serve(counted.n)
 	if err != nil {
 		s.logger.Printf("GET %s/%s failed after response began: %v", bucket, key, err)
 	}
+}
+
+// countingWriter tallies bytes that actually reached the client.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	written, err := c.w.Write(p)
+	c.n += int64(written)
+	return written, err
 }
 
 func (s *Server) deleteObject(w http.ResponseWriter, bucket, key string) {

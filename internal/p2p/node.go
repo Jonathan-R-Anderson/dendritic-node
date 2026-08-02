@@ -45,6 +45,7 @@ import (
 	"github.com/syndichan/maniwani/storage-client/internal/heartbeat"
 	syndii2p "github.com/syndichan/maniwani/storage-client/internal/i2p"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
+	"github.com/syndichan/maniwani/storage-client/internal/traffic"
 )
 
 const (
@@ -129,6 +130,11 @@ type leaseRequest struct {
 }
 
 type Node struct {
+	// meter counts bytes this node served to others, drained once per
+	// heartbeat. Optional: a node with none reports an absent traffic block,
+	// which the coordinator reads as "not measuring" rather than "measured
+	// zero" -- the status page draws those differently.
+	meter *traffic.Meter
 	// challengeMu guards challengeHandler. Per-node, not package-level:
 	// a process can run more than one Node (tests do), and a shared
 	// handler would answer challenges with the wrong node's data.
@@ -647,6 +653,11 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 	}
 }
 
+// SetMeter attaches the shared traffic meter. One meter per process, so the
+// S3 gateway and the shard store add to the same total rather than each
+// keeping a count nobody sums.
+func (n *Node) SetMeter(m *traffic.Meter) { n.meter = m }
+
 // sendHeartbeat delegates to the shared client so a storage node and a
 // dedicated gateway put exactly the same signed document on the wire.
 func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
@@ -656,7 +667,7 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 			n.gatewayMu.RLock()
 			registration := n.gatewayRegistration
 			n.gatewayMu.RUnlock()
-			return heartbeat.State{
+			state := heartbeat.State{
 				CapacityBytes:   n.store.Capacity(),
 				GatewayEnabled:  n.gatewayEnabled.Load(),
 				GatewayVerified: n.gatewayVerified.Load(),
@@ -664,6 +675,17 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 				DCSWorker:       n.dcsWorker.Load(),
 				I2PDestination:  n.I2PDestination(),
 			}
+			// The ONE legitimate drain. Window() resets, so a second caller
+			// would silently take a slice of this one's interval and the
+			// traffic would simply vanish -- no error, just a number quietly
+			// too low. Everything else reads the meter by adding to it.
+			if n.meter != nil {
+				w := n.meter.Window(time.Now())
+				state.Traffic = heartbeat.Traffic{
+					Bytes: w.Bytes, Requests: w.Requests, WindowSeconds: w.WindowSeconds,
+				}
+			}
+			return state
 		},
 		// The heartbeat doubles as the live bootstrap exchange: we report our
 		// destination and the coordinator answers with a few reachable peers to

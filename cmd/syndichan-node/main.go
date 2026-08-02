@@ -31,6 +31,7 @@ import (
 	"github.com/syndichan/maniwani/storage-client/internal/p2p"
 	"github.com/syndichan/maniwani/storage-client/internal/s3api"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
+	"github.com/syndichan/maniwani/storage-client/internal/traffic"
 	"github.com/syndichan/maniwani/storage-client/internal/ui"
 )
 
@@ -50,6 +51,12 @@ func main() {
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "syndichan-node ", log.LstdFlags|log.LUTC)
+
+	// One meter for the whole process. Everything that serves bytes to somebody
+	// else adds to it; exactly ONE place drains it (the heartbeat), because
+	// Window() resets and a second drainer would silently swallow part of the
+	// interval -- no error, just a throughput number quietly too low.
+	meter := &traffic.Meter{}
 
 	path, err := config.ConfigPath(configFile)
 	if err != nil {
@@ -131,6 +138,10 @@ func main() {
 	}
 	if node != nil {
 		defer node.Close()
+		// Same meter the S3 gateway adds to. The node drains it once per
+		// heartbeat, so shard traffic and object reads land in one figure
+		// rather than two nobody sums.
+		node.SetMeter(meter)
 		signer = node
 		// Opt-in: a config with no `bootstrap` section keeps the single-URL
 		// behaviour it has always had. The discovered path refuses a lone
@@ -259,8 +270,10 @@ func main() {
 			defer pof.Close()
 		}
 
+		s3Handler := s3api.New(storageNode, cfg.AccessKey, cfg.SecretKey, logger)
+		s3Handler.SetMeter(meter)
 		s3Server = &http.Server{
-			Addr: cfg.S3Listen, Handler: s3api.New(storageNode, cfg.AccessKey, cfg.SecretKey, logger),
+			Addr: cfg.S3Listen, Handler: s3Handler,
 			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute,
 			WriteTimeout: 10 * time.Minute, IdleTimeout: 90 * time.Second,
 			MaxHeaderBytes: 64 << 10,
@@ -679,6 +692,10 @@ func main() {
 					CapacityBytes:   0,
 					GatewayEnabled:  cfg.Gateway.Enabled,
 					GatewayVerified: gatewayVerified.Load(),
+				}
+				w := meter.Window(time.Now())
+				state.Traffic = heartbeat.Traffic{
+					Bytes: w.Bytes, Requests: w.Requests, WindowSeconds: w.WindowSeconds,
 				}
 				if state.GatewayVerified && gatewayManager != nil {
 					state.Registration = gatewayManager.Current()
