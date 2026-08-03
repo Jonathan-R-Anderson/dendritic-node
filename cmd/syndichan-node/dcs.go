@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/syndichan/maniwani/storage-client/internal/compute"
 	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/dcs"
 	syndii2p "github.com/syndichan/maniwani/storage-client/internal/i2p"
@@ -162,9 +163,30 @@ func advertiseWorker(ctx context.Context, cfg config.Config, node *p2p.Node, adm
 		ttl = 900
 	}
 	var sequence uint64
+
+	// Probe ONCE, here, rather than inside publish().
+	//
+	// The benchmark runs the CPU flat out for the best part of a second. That
+	// is unremarkable at startup and would be rude every advertisement
+	// interval, for a number that does not change — the machine's hardware is
+	// not going to differ between one publish and the next. Re-probing belongs
+	// on a long timer or a config reload, not on the heartbeat.
+	//
+	// Detection never fails (see compute.Probe), so there is no error path.
+	profile := compute.Probe(compute.DefaultOptions())
+	logger.Printf("dcs: compute profile: %s", profile.Summary())
+
 	publish := func() {
 		sequence++
 		caps := []string{"worker"}
+		// What the machine can actually do, alongside what its operator opted
+		// into. Detection adds "cpu" — which every machine is, and which is the
+		// broad base the compute network is built on — and adds "gpu" only when
+		// a card reports a WORKING DRIVER. The config flag below is consent;
+		// this is capability, and a job needs both.
+		for _, detected := range profile.Capabilities() {
+			caps = append(caps, detected)
+		}
 		if cfg.DCS.Role.GPU {
 			caps = append(caps, "gpu")
 		}
@@ -188,8 +210,14 @@ func advertiseWorker(ctx context.Context, cfg config.Config, node *p2p.Node, adm
 		rec := dcs.WorkerRecord{
 			RecordType: "dcs_worker", ProtocolVer: 1, AgentVersion: "1.0.0",
 			Destination: destination, ContentPubKey: node.ContentPublicKey(),
-			Arch: config.PlatformLabel(), Capabilities: caps,
-			CPUCores: cfg.DCS.Limits.MaxContainers, RAMBytes: cfg.DCS.Limits.RAMBytes,
+			Arch: config.PlatformLabel(), Capabilities: dedupe(caps),
+			// CPUCores was MaxContainers — the number of containers this node
+			// will run, which is not a core count and is not what a scheduler
+			// sizing a parallel job needs. Physical cores, because two SMT
+			// threads on one core do not deliver two cores of throughput for
+			// compute-bound work, so logical count systematically overcommits.
+			CPUCores: profile.CPU.PhysicalCores, RAMBytes: cfg.DCS.Limits.RAMBytes,
+			Compute: &profile,
 			Slots: cfg.DCS.Limits.MaxContainers, Region: cfg.DCS.Region,
 			Sequence: sequence, IssuedAt: now.Unix(), ExpiresAt: now.Unix() + ttl,
 		}
@@ -492,4 +520,24 @@ func short(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+// dedupe keeps the first occurrence of each capability.
+//
+// Needed because two sources now contribute: what was detected, and what the
+// operator opted into in config. Both legitimately say "gpu" on a machine with
+// a working card whose owner has also enabled it, and a record listing it twice
+// is not wrong so much as sloppy — it inflates a record the DHT has to carry
+// and reads as a bug to anyone looking at one.
+func dedupe(items []string) []string {
+	seen := make(map[string]bool, len(items))
+	out := items[:0:0]
+	for _, item := range items {
+		if seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	return out
 }

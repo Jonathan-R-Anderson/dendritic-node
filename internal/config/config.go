@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/syndichan/maniwani/storage-client/internal/compute"
 )
 
 // Peer discovery starts at the dedicated data-node edge. That edge exposes only
@@ -140,6 +142,11 @@ type Config struct {
 	TLSKey        string        `json:"tls_key,omitempty"`
 	Gateway       GatewayConfig `json:"gateway"`
 	DCS           DCSConfig     `json:"dcs"`
+	// Compute is the local resource manager (roadmap M3): whether this machine
+	// offers CPU/GPU cycles, and the limits its owner set. Absent means OFF —
+	// the zero value never runs work, so a node that upgrades into a build with
+	// this feature does not silently start donating cycles.
+	Compute ComputeConfig `json:"compute"`
 	// NetworkDirective is how this node learns the network has moved.
 	NetworkDirective NetworkDirectiveConfig `json:"network_directive"`
 	// Bootstrap is how this node finds its way into the DHT, and who it
@@ -217,6 +224,19 @@ type DCSRoleConfig struct {
 	// A lab container is unreachable except through an I2P destination that is
 	// never published anywhere -- see dcs.LabContainment.
 	Lab bool `json:"lab"`
+}
+
+// ComputeConfig is the M3 policy: what this machine will lend, and when.
+//
+// Separate from DCSConfig on purpose. A DCS worker runs CONTAINERS somebody
+// deployed; a compute provider runs WORK UNITS from a signed catalogue with no
+// network access. They have different consent, different risk, and an operator
+// may well want one and not the other — collapsing them into one flag would
+// make enabling the safer thing require accepting the riskier one.
+type ComputeConfig struct {
+	// Policy fields are inlined so the config file reads as one block rather
+	// than compute.policy.enabled.
+	compute.Policy
 }
 
 type DCSLimits struct {

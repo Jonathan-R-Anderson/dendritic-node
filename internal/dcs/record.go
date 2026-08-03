@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/syndichan/maniwani/storage-client/internal/compute"
 )
 
 // DHTWorkerNamespace mirrors gateway.DHTNamespace. A worker publishes its
@@ -37,6 +39,17 @@ type WorkerRecord struct {
 	RAMBytes int64 `json:"ram_bytes"`
 	Slots    int   `json:"slots"`
 	Running  int   `json:"running"`
+
+	// Compute is the M1 capability profile: what this machine can compute
+	// with, and a measured figure for how fast, from a kernel any other node
+	// can reproduce. Optional — a node that predates this, or one that could
+	// not probe, simply does not carry it, and a scheduler treats its absence
+	// as "unknown" rather than "none".
+	//
+	// Covered by Signature like everything else here, because SignWorkerRecord
+	// marshals the whole struct. That matters: an unsigned performance claim
+	// is one any relay could inflate on the node's behalf.
+	Compute *compute.Profile `json:"compute,omitempty"`
 
 	HealthScore int    `json:"health_score"`
 	Region      string `json:"region,omitempty"`
