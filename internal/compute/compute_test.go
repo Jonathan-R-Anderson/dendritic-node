@@ -52,7 +52,7 @@ func TestDigestSurvivesGoroutineScheduling(t *testing.T) {
 }
 
 func TestVerifyAcceptsAnHonestResult(t *testing.T) {
-	if !Verify(Run(1234, 2)) {
+	if !VerifyBenchmark(Run(1234, 2)) {
 		t.Fatal("Verify rejected a result it had just produced")
 	}
 }
@@ -60,7 +60,7 @@ func TestVerifyAcceptsAnHonestResult(t *testing.T) {
 func TestVerifyRejectsATamperedDigest(t *testing.T) {
 	claim := Run(1234, 2)
 	claim.Digest = strings.Repeat("0", len(claim.Digest))
-	if Verify(claim) {
+	if VerifyBenchmark(claim) {
 		t.Fatal("Verify accepted a fabricated digest")
 	}
 }
@@ -71,7 +71,7 @@ func TestVerifyRejectsAnotherKernelVersion(t *testing.T) {
 	// node on another version as fraud.
 	claim := Run(5, 1)
 	claim.Version = KernelVersion + 1
-	if Verify(claim) {
+	if VerifyBenchmark(claim) {
 		t.Fatal("Verify accepted a result from an unknown kernel version")
 	}
 }
@@ -81,7 +81,7 @@ func TestVerifyRejectsAShortenedRun(t *testing.T) {
 	honest := Run(11, 4)
 	cheat := Run(11, 1)
 	cheat.Rounds = honest.Rounds // claim four rounds of work, having done one
-	if Verify(cheat) {
+	if VerifyBenchmark(cheat) {
 		t.Fatal("Verify accepted a result computed with fewer rounds than claimed")
 	}
 }
@@ -97,7 +97,7 @@ func TestCalibrateAimsAtTheTargetDuration(t *testing.T) {
 	if result.ElapsedM > 5000 {
 		t.Fatalf("calibrated run took %dms, target was 300ms", result.ElapsedM)
 	}
-	if !Verify(result) {
+	if !VerifyBenchmark(result) {
 		t.Fatal("a calibrated result did not verify")
 	}
 }
@@ -174,7 +174,7 @@ func TestProbeBenchmarksByDefault(t *testing.T) {
 	if profile.Bench == nil {
 		t.Fatal("no benchmark in a default probe")
 	}
-	if !Verify(*profile.Bench) {
+	if !VerifyBenchmark(*profile.Bench) {
 		t.Fatal("a probe's own benchmark did not verify")
 	}
 }

@@ -194,13 +194,16 @@ func Calibrate(seed int64, target time.Duration) Result {
 	return Run(seed, rounds)
 }
 
-// Verify recomputes a claimed result and reports whether the digest matches.
+// VerifyBenchmark recomputes a claimed benchmark and reports whether the digest
+// matches. Named apart from Verify, which checks WORK — mixing up "is this
+// machine as fast as it says" with "is this answer correct" would be a bad
+// mistake to make in a payment path.
 //
 // This is M5's redundant-execution check in its smallest form. Note what it
 // does NOT compare: throughput. Two machines legitimately disagree about how
 // fast they are, and the whole point is that they cannot disagree about what
 // the answer was.
-func Verify(claim Result) bool {
+func VerifyBenchmark(claim Result) bool {
 	if claim.Version != KernelVersion {
 		// A different kernel is not a mismatch, it is an unanswerable question.
 		// Refusing is correct: silently returning false would mark honest work
