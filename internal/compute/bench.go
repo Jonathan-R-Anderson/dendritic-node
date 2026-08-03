@@ -33,9 +33,9 @@ package compute
 // has to fall back to tolerance windows and spot-checks.)
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"crypto/sha256"
 	"runtime"
 	"time"
 )

@@ -67,18 +67,18 @@ type CPUInfo struct {
 	// scheduling input rather than a detail.
 	Features []string `json:"features,omitempty"`
 
-	Model     string `json:"model,omitempty"`
-	Vendor    string `json:"vendor,omitempty"`
-	Arch      string `json:"arch"`
-	CacheKB   int    `json:"cache_kb,omitempty"`
-	RAMBytes  int64  `json:"ram_bytes,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Arch     string `json:"arch"`
+	CacheKB  int    `json:"cache_kb,omitempty"`
+	RAMBytes int64  `json:"ram_bytes,omitempty"`
 }
 
 // GPUInfo describes one device. A machine with two cards has two entries: they
 // are separately schedulable and can differ in capability, so collapsing them
 // to a single "has GPU" flag loses the thing a scheduler needs.
 type GPUInfo struct {
-	Vendor string `json:"vendor"`           // nvidia, amd, intel, apple
+	Vendor string `json:"vendor"` // nvidia, amd, intel, apple
 	Model  string `json:"model,omitempty"`
 	// APIs a job can target — cuda, rocm, vulkan, opencl, metal. Detected
 	// independently of vendor because one card often has several, and the job
