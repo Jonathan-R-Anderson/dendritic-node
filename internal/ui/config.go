@@ -129,6 +129,43 @@ func (s *Server) setStorageSettings(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?saved=storage", http.StatusSeeOther)
 }
 
+// setRouter edits the payment-routing role.
+func (s *Server) setRouter(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	err := s.cfgApply(func(c *config.Config) error {
+		c.Router.Enabled = formBool(r, "router_enabled")
+		c.Router.PrivateRoutingOnly = formBool(r, "router_private_only")
+		c.Router.WatchtowerEnabled = formBool(r, "router_watchtower")
+		c.Router.Operator = strings.TrimSpace(r.FormValue("router_operator"))
+		c.Router.FaultDomain = strings.TrimSpace(r.FormValue("router_fault_domain"))
+		c.Router.MaxChannels = formInt(r, "router_max_channels", c.Router.MaxChannels)
+		c.Router.MaxInFlight = formInt(r, "router_max_inflight", c.Router.MaxInFlight)
+		c.Router.MinTimelockBlocks = formInt(r, "router_min_timelock", c.Router.MinTimelockBlocks)
+		c.Router.TotalCommittedMax = int64(formInt(r, "router_total_max", int(c.Router.TotalCommittedMax)))
+		c.Router.MinChannelCapacity = int64(formInt(r, "router_min_channel", int(c.Router.MinChannelCapacity)))
+		c.Router.MaxChannelCapacity = int64(formInt(r, "router_max_channel", int(c.Router.MaxChannelCapacity)))
+		c.Router.BaseFeeMilli = int64(formInt(r, "router_base_fee", int(c.Router.BaseFeeMilli)))
+		c.Router.ProportionalFeePPM = int64(formInt(r, "router_prop_fee", int(c.Router.ProportionalFeePPM)))
+		c.Router = c.Router.Normalise()
+		// Say why a configured router will not be selected, rather than letting
+		// the operator discover it through silence.
+		if c.Router.Enabled {
+			if ok, why := c.Router.CanRoute(); !ok {
+				s.logger.Printf("router enabled but not routable: %s", why)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.logger.Printf("router configuration updated (effective next start)")
+	http.Redirect(w, r, "/?saved=router", http.StatusSeeOther)
+}
+
 // setCompute edits what this machine lends to the compute network.
 //
 // The two device switches are independent of Enabled, and all three are read

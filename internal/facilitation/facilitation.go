@@ -1,5 +1,5 @@
 // Package facilitation is the storage-client's lightweight Proof-of-Facilitation
-// client. The node never runs a chain, holds no ETH, and encodes no ZKsync
+// client. The node never runs a chain, holds no ETH, and encodes no Ethereum
 // transactions: it holds a secp256k1 wallet key, signs a registration digest
 // that the website's NodeRegistry contract can recover the owner from
 // (registerWithSig), and POSTs the signed intent to the website's chain gateway,
@@ -57,7 +57,7 @@ func left32(b []byte) []byte {
 
 func u256(n *big.Int) []byte { return left32(n.Bytes()) }
 
-// Wallet is the node's secp256k1 key — its ZKsync account that owns rewards.
+// Wallet is the node's secp256k1 key — its Ethereum account that owns rewards.
 type Wallet struct{ priv *secp256k1.PrivateKey }
 
 // LoadOrCreateWallet reads a hex-encoded 32-byte key from path, or generates and
@@ -83,7 +83,7 @@ func LoadOrCreateWallet(path string) (*Wallet, error) {
 	return &Wallet{priv: priv}, nil
 }
 
-// Address is the Ethereum/ZKsync address: keccak256(uncompressedPubKey[1:])[12:].
+// Address is the Ethereum/Ethereum address: keccak256(uncompressedPubKey[1:])[12:].
 func (w *Wallet) Address() [20]byte {
 	pub := w.priv.PubKey().SerializeUncompressed() // 65 bytes, 0x04 || X || Y
 	h := keccak256(pub[1:])

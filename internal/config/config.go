@@ -147,6 +147,10 @@ type Config struct {
 	// the zero value never runs work, so a node that upgrades into a build with
 	// this feature does not silently start donating cycles.
 	Compute ComputeConfig `json:"compute"`
+
+	// Router is the payment-channel routing role: forwarding other people's
+	// payments for a fee. Absent means OFF.
+	Router RouterConfig `json:"router"`
 	// NetworkDirective is how this node learns the network has moved.
 	NetworkDirective NetworkDirectiveConfig `json:"network_directive"`
 	// Bootstrap is how this node finds its way into the DHT, and who it
@@ -943,4 +947,122 @@ func ConfigPath(override string) (string, error) {
 
 func PlatformLabel() string {
 	return runtime.GOOS + "/" + runtime.GOARCH
+}
+
+// RouterConfig is the payment-channel routing role.
+//
+// NOT "Lightning". The mechanism is the same family Lightning proved — channels,
+// conditional locks, unilateral close with a challenge period — but Lightning is
+// Bitcoin and this settles on Ethereum. Naming it Lightning in a config file
+// would be the sort of small untruth that later has to be explained to somebody
+// who trusted it.
+//
+// WHY A ROUTER NEEDS ITS OWN SETTINGS
+// -----------------------------------
+// A storage node lends disk it was not using. A router lends LIQUIDITY — money
+// locked in channels that cannot be spent elsewhere while it is committed. That
+// is a materially different thing to ask of somebody, and the settings below
+// exist so an operator can bound it precisely rather than agreeing to an
+// open-ended commitment.
+type RouterConfig struct {
+	Enabled bool `json:"enabled"`
+
+	// Operator and FaultDomain are how this node DECLARES its independence, and
+	// they feed route diversity: a private route must cross three distinct
+	// operators, and a node that leaves these blank cannot be counted toward
+	// that. Self-declared and unverifiable — used to exclude, never to prove.
+	Operator    string `json:"operator,omitempty"`
+	FaultDomain string `json:"fault_domain,omitempty"`
+
+	// MaxChannels bounds how many peers this node will open with. Each channel
+	// is an on-chain transaction to open and another to close, so this is a fee
+	// budget as much as a resource limit.
+	MaxChannels int `json:"max_channels"`
+
+	// MinChannelCapacity and MaxChannelCapacity bound each channel, in the
+	// token's smallest unit. The minimum exists because a channel too small to
+	// route anything still costs two on-chain transactions.
+	MinChannelCapacity int64 `json:"min_channel_capacity"`
+	MaxChannelCapacity int64 `json:"max_channel_capacity"`
+
+	// TotalCommittedMax is the hard ceiling across ALL channels. The one number
+	// an operator most needs: it answers "how much of my money can this tie up
+	// at once" without them having to multiply the others together.
+	TotalCommittedMax int64 `json:"total_committed_max"`
+
+	// BaseFeeMilli is charged per forwarded payment, ProportionalFeePPM per
+	// unit forwarded. Both, because a tiny payment costs the same work as a
+	// large one while a large one ties up more liquidity.
+	BaseFeeMilli       int64 `json:"base_fee_milli"`
+	ProportionalFeePPM int64 `json:"proportional_fee_ppm"`
+
+	// MaxInFlight bounds concurrent locked payments. This is the channel-jamming
+	// defence: without a cap, a peer opens many small locks it never settles and
+	// this node's liquidity is stuck until they expire.
+	MaxInFlight int `json:"max_in_flight"`
+
+	// MaxHTLCValue bounds any single forwarded payment, so one large transfer
+	// cannot consume the whole outbound balance.
+	MaxHTLCValue int64 `json:"max_htlc_value"`
+
+	// MinTimelockBlocks is the safety margin demanded on an incoming lock. Too
+	// small and this node can be left unable to claim upstream after paying
+	// downstream — the one routing failure that actually loses money.
+	MinTimelockBlocks int `json:"min_timelock_blocks"`
+
+	// PrivateRoutingOnly refuses to forward payments that are not privately
+	// routed. An operator who does not want to know who is paying whom can
+	// arrange not to be able to find out.
+	PrivateRoutingOnly bool `json:"private_routing_only"`
+
+	// WatchtowerEnabled offers this node as a watchtower for others.
+	WatchtowerEnabled bool `json:"watchtower_enabled"`
+
+	// AutoRebalance lets the node move liquidity between its own channels.
+	// Off by default: rebalancing costs fees and an operator should opt into
+	// spending money automatically.
+	AutoRebalance bool `json:"auto_rebalance"`
+}
+
+// Normalise applies safe defaults without silently widening anything the
+// operator narrowed.
+func (r RouterConfig) Normalise() RouterConfig {
+	if r.MaxChannels <= 0 {
+		r.MaxChannels = 10
+	}
+	if r.MaxInFlight <= 0 {
+		r.MaxInFlight = 20
+	}
+	if r.MinTimelockBlocks <= 0 {
+		// Enough for a dispute to be noticed and answered. Deliberately not
+		// zero: a zero margin is the setting that loses money.
+		r.MinTimelockBlocks = 40
+	}
+	if r.MinChannelCapacity < 0 {
+		r.MinChannelCapacity = 0
+	}
+	return r
+}
+
+// CanRoute reports whether this node may take routing work, and why not.
+//
+// Diversity comes first because it is the answer an operator is least likely to
+// predict: a router with no operator label cannot be counted toward the three
+// independent operators a private route needs, so it would be selected for
+// nothing and never learn why.
+func (r RouterConfig) CanRoute() (bool, string) {
+	if !r.Enabled {
+		return false, "routing is switched off"
+	}
+	if r.Operator == "" {
+		return false, "set an operator name — a router that does not declare who " +
+			"runs it cannot count toward the independent operators a private route needs"
+	}
+	if r.TotalCommittedMax <= 0 {
+		return false, "set a total liquidity ceiling before routing"
+	}
+	if r.MaxChannelCapacity > 0 && r.MaxChannelCapacity > r.TotalCommittedMax {
+		return false, "a single channel may not exceed the total liquidity ceiling"
+	}
+	return true, ""
 }

@@ -47,7 +47,14 @@ const MaxHops = 3
 // SlotSize is the fixed size of every encrypted slot, before the AEAD overhead.
 // Every hop instruction is padded to exactly this, so a slot's length says
 // nothing about what it holds.
-const SlotSize = 512
+//
+// 1 KiB rather than 512 B because encoding/json renders a [32]byte as a decimal
+// ARRAY — `[161,42,...]`, up to ~160 characters for 32 bytes. Three commitment
+// fields plus a hex endpoint clear 512 comfortably. The honest fix is a compact
+// encoding rather than a bigger slot, but the size must be right first: a slot
+// too small is a payment that cannot be built at all, which is how this was
+// found.
+const SlotSize = 1024
 
 // Onion key domains, separate from the note domains so a key recovered in one
 // role cannot be used in the other.

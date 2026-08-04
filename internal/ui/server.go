@@ -100,6 +100,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.setGateway(w, r)
 	case r.URL.Path == "/config/storage" && r.Method == http.MethodPost:
 		s.setStorageSettings(w, r)
+	case r.URL.Path == "/config/router" && r.Method == http.MethodPost:
+		s.setRouter(w, r)
 	case r.URL.Path == "/config/compute" && r.Method == http.MethodPost:
 		s.setCompute(w, r)
 	case r.URL.Path == "/config/dcs" && r.Method == http.MethodPost:
@@ -464,6 +466,53 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
     <label>Registration API <input name="gateway_registration" value="{{.Cfg.Gateway.RegistrationAPI}}"></label>
     <button type="submit">Save gateway settings</button>
     <div class="eff">Effective next start.</div>
+  </form>
+</section>
+
+<section class="panel cfg">
+  <h2>Route payments for the network</h2>
+  <p class="muted">Forward other people's payments and earn a fee. This one is different
+     from the others: storage lends disk you were not using, but routing lends
+     <strong>liquidity</strong> &mdash; money locked in channels that you cannot spend
+     elsewhere while it is committed. The limits below are how you bound that
+     precisely instead of agreeing to something open-ended.</p>
+  <form method="post" action="/config/router">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <label class="chk"><input type="checkbox" name="router_enabled" value="1"{{if .Cfg.Router.Enabled}} checked{{end}}> Route payments</label>
+      <label class="chk"><input type="checkbox" name="router_private_only" value="1"{{if .Cfg.Router.PrivateRoutingOnly}} checked{{end}}> Only forward privately-routed payments</label>
+      <label class="chk"><input type="checkbox" name="router_watchtower" value="1"{{if .Cfg.Router.WatchtowerEnabled}} checked{{end}}> Act as a watchtower for others</label>
+    </div>
+    <div class="row">
+      <label>Operator name <input name="router_operator" value="{{.Cfg.Router.Operator}}" placeholder="who runs this node"></label>
+      <label>Fault domain <input name="router_fault_domain" value="{{.Cfg.Router.FaultDomain}}" placeholder="host, ASN or region"></label>
+    </div>
+    <p class="nw__note muted">A private route must cross three <em>different</em> operators.
+       Leave the operator name blank and this node cannot be counted toward that &mdash; it
+       would be passed over and never told why.</p>
+    <div class="row">
+      <label>Total liquidity ceiling <input name="router_total_max" type="number" min="0" value="{{.Cfg.Router.TotalCommittedMax}}"></label>
+      <label>Max channels <input name="router_max_channels" type="number" min="0" value="{{.Cfg.Router.MaxChannels}}"></label>
+    </div>
+    <div class="row">
+      <label>Min channel size <input name="router_min_channel" type="number" min="0" value="{{.Cfg.Router.MinChannelCapacity}}"></label>
+      <label>Max channel size <input name="router_max_channel" type="number" min="0" value="{{.Cfg.Router.MaxChannelCapacity}}"></label>
+    </div>
+    <div class="row">
+      <label>Base fee per payment <input name="router_base_fee" type="number" min="0" value="{{.Cfg.Router.BaseFeeMilli}}"></label>
+      <label>Proportional fee (ppm) <input name="router_prop_fee" type="number" min="0" value="{{.Cfg.Router.ProportionalFeePPM}}"></label>
+    </div>
+    <div class="row">
+      <label>Max payments in flight <input name="router_max_inflight" type="number" min="1" value="{{.Cfg.Router.MaxInFlight}}"></label>
+      <label>Max single payment <input name="router_max_htlc" type="number" min="0" value="{{.Cfg.Router.MaxHTLCValue}}"></label>
+      <label>Min timelock (blocks) <input name="router_min_timelock" type="number" min="0" value="{{.Cfg.Router.MinTimelockBlocks}}"></label>
+    </div>
+    <p class="nw__note muted">&ldquo;Max payments in flight&rdquo; is the jamming defence:
+       without a cap, a peer can open many small locks it never settles and your liquidity
+       is stuck until they expire. The timelock margin is the setting that actually loses
+       money if set too low &mdash; it is the room you have to claim upstream after paying
+       downstream.</p>
+    <button type="submit">Save</button>
   </form>
 </section>
 
