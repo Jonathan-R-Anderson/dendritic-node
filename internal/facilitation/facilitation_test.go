@@ -1,6 +1,7 @@
 package facilitation
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -97,5 +98,36 @@ func TestBuildRegisterIntent(t *testing.T) {
 	}
 	if len(intent.R) != 66 || len(intent.S) != 66 { // 0x + 64 hex
 		t.Fatalf("bad r/s hex length: %d/%d", len(intent.R), len(intent.S))
+	}
+}
+
+// The channel seed must not expose the wallet key. A routing node's hot key is
+// derived from this, so a leak here would cost the operator everything the node
+// has earned rather than only what is committed to channels.
+func TestChannelSeedDoesNotRevealTheWalletKey(t *testing.T) {
+	dir := t.TempDir()
+	w, err := LoadOrCreateWallet(dir + "/key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := w.ChannelSeed()
+	raw := w.priv.Serialize()
+	if bytes.Equal(seed[:], raw) {
+		t.Fatal("the channel seed IS the wallet key")
+	}
+	if bytes.Contains(seed[:], raw[:8]) {
+		t.Fatal("the channel seed leaks wallet key material")
+	}
+	// Deterministic, or the node cannot re-derive its own channel identity.
+	if again := w.ChannelSeed(); again != seed {
+		t.Fatal("channel seed derivation is not deterministic")
+	}
+}
+
+func TestDifferentWalletsGiveDifferentChannelSeeds(t *testing.T) {
+	a, _ := LoadOrCreateWallet(t.TempDir() + "/a")
+	b, _ := LoadOrCreateWallet(t.TempDir() + "/b")
+	if a.ChannelSeed() == b.ChannelSeed() {
+		t.Fatal("two wallets share a channel seed")
 	}
 }

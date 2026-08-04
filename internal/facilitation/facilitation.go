@@ -11,6 +11,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -131,6 +133,27 @@ func RegistrationDigest(chainID *big.Int, registry [20]byte, p2pPub ed25519.Publ
 
 // SignDigest returns an Ethereum-style recoverable signature (v ∈ {27,28}, r, s,
 // canonical low-s) over a 32-byte digest, compatible with Solidity ecrecover.
+// ChannelSeed derives the seed for the node's payment-channel signing key.
+//
+// The raw wallet key NEVER leaves this type. A domain-separated hash of it goes
+// out instead, so the channel package can derive its own hot key without ever
+// holding the key that owns this node's rewards.
+//
+// That separation is the point: a routing node must sign unattended, so its
+// channel key is hot by necessity. Handing out the payout key to do that would
+// make a routing compromise a total one — the operator would lose not just what
+// is committed to channels but everything the node has earned.
+//
+// One-way by construction: the channel seed cannot be walked back to the wallet
+// key, so a leaked channel key exposes channel funds and nothing else.
+func (w *Wallet) ChannelSeed() [32]byte {
+	mac := hmac.New(sha256.New, []byte("syndichan/wallet/channel-seed/v1"))
+	mac.Write(w.priv.Serialize())
+	var out [32]byte
+	copy(out[:], mac.Sum(nil))
+	return out
+}
+
 func (w *Wallet) SignDigest(digest [32]byte) (v uint8, r [32]byte, s [32]byte) {
 	sig := ecdsa.SignCompact(w.priv, digest[:], false) // [v||r||s], v = 27+recid
 	v = sig[0]
