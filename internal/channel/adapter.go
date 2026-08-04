@@ -62,7 +62,7 @@ type Preimage [32]byte
 // will eventually overdraw.
 type Balance struct {
 	Outbound Amount // what this node can still send
-	Inbound   Amount // what it can still receive
+	Inbound  Amount // what it can still receive
 	// Locked is value committed to in-flight transfers. Excluded from Outbound
 	// rather than subtracted by the caller — forgetting to subtract it is how a
 	// node signs a balance proof it cannot honour.
@@ -231,11 +231,11 @@ func (Null) Pay(context.Context, ChannelID, Amount, string) (BalanceProof, error
 func (Null) Reserve(context.Context, ChannelID, Amount, Hash, time.Time) (LockID, error) {
 	return "", ErrNoBackend
 }
-func (Null) Claim(context.Context, LockID, Preimage) error   { return ErrNoBackend }
-func (Null) Release(context.Context, LockID) error           { return ErrNoBackend }
-func (Null) Balance(ChannelID) (Balance, error)              { return Balance{}, ErrNoBackend }
-func (Null) Close(context.Context, ChannelID, bool) error    { return ErrNoBackend }
-func (Null) Capabilities() Capabilities                      { return Capabilities{} }
+func (Null) Claim(context.Context, LockID, Preimage) error { return ErrNoBackend }
+func (Null) Release(context.Context, LockID) error         { return ErrNoBackend }
+func (Null) Balance(ChannelID) (Balance, error)            { return Balance{}, ErrNoBackend }
+func (Null) Close(context.Context, ChannelID, bool) error  { return ErrNoBackend }
+func (Null) Capabilities() Capabilities                    { return Capabilities{} }
 
 // compile-time assertion that Null satisfies the interface.
 var _ Adapter = Null{}
