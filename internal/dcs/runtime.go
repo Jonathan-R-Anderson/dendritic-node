@@ -3,9 +3,11 @@ package dcs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -329,4 +331,89 @@ func (c *DockerClient) Inspect(ctx context.Context, id string) (InspectState, er
 		out.Health = raw.State.Health.Status
 	}
 	return out, nil
+}
+
+// Wait blocks until the container exits and returns its exit code.
+//
+// Used by one-shot workloads — a submitted program runs, exits, and its status
+// is the answer. Long-lived deployments poll Inspect instead; this is the case
+// where "when is it finished" is the whole question.
+func (c *DockerClient) Wait(ctx context.Context, id string) (int, error) {
+	var raw struct {
+		StatusCode int `json:"StatusCode"`
+		Error      *struct {
+			Message string `json:"Message"`
+		} `json:"Error"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/containers/"+id+"/wait", nil, &raw); err != nil {
+		return -1, err
+	}
+	if raw.Error != nil && raw.Error.Message != "" {
+		return raw.StatusCode, fmt.Errorf("dcs: container wait: %s", raw.Error.Message)
+	}
+	return raw.StatusCode, nil
+}
+
+// MaxLogBytes caps what a single container's output may occupy.
+//
+// A program that prints in a loop would otherwise fill the volunteer's disk
+// through the one channel it is allowed. The cap is not a formatting choice; it
+// is the reason collecting output is safe at all.
+const MaxLogBytes = 1 << 20 // 1 MiB
+
+// Logs returns a finished container's stdout and stderr, separated.
+//
+// Docker multiplexes both onto one stream with an 8-byte header per frame whose
+// first byte is the stream id. Concatenating the raw bytes would interleave the
+// headers into the output as binary garbage, which is why this demultiplexes
+// rather than simply reading the body.
+func (c *DockerClient) Logs(ctx context.Context, id string) (stdout, stderr []byte, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.apiBase+"/containers/"+id+"/logs?stdout=1&stderr=1", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, nil, fmt.Errorf("dcs: logs: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxLogBytes+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	return demuxDockerStream(body)
+}
+
+// demuxDockerStream splits Docker's multiplexed log framing.
+//
+// Frame: [stream_id(1)][000][size(4, big-endian)][payload]. A truncated final
+// frame is returned as what was read rather than treated as an error — the
+// output was capped on purpose, and losing the whole log because the last frame
+// was clipped would defeat the point of capping it.
+func demuxDockerStream(body []byte) (stdout, stderr []byte, err error) {
+	for len(body) >= 8 {
+		size := int(binary.BigEndian.Uint32(body[4:8]))
+		if size < 0 || 8+size > len(body) {
+			// Truncated by the cap: take what is there.
+			payload := body[8:]
+			if body[0] == 2 {
+				stderr = append(stderr, payload...)
+			} else {
+				stdout = append(stdout, payload...)
+			}
+			break
+		}
+		payload := body[8 : 8+size]
+		if body[0] == 2 {
+			stderr = append(stderr, payload...)
+		} else {
+			stdout = append(stdout, payload...)
+		}
+		body = body[8+size:]
+	}
+	return stdout, stderr, nil
 }

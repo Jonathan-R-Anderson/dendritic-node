@@ -85,6 +85,17 @@ func startDCSBridge(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 	mux.HandleFunc("/dcs/status", api.handleStatus) // POST: poll a queued deploy
 	mux.HandleFunc("/dcs/destroy", api.handleDestroy)
 
+	// Compute endpoints ride the same listener. Registered only when the
+	// operator actually lends a device — a node that lends nothing should not
+	// answer "would you take this?" at all, rather than answering "no" forever.
+	if compute := newComputeAPI(cfg, logger); compute != nil {
+		mux.HandleFunc("/compute/admit", compute.handleAdmit)
+		mux.HandleFunc("/compute/submit", compute.handleSubmit)
+		mux.HandleFunc("/compute/result", compute.handleResult)
+		logger.Printf("dcs-bridge: compute endpoints enabled (cpu=%v gpu=%v)",
+			cfg.Compute.OfferCPU, cfg.Compute.OfferGPU)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.DCS.APIListen,
 		Handler:           mux,

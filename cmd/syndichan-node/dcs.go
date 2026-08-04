@@ -218,7 +218,7 @@ func advertiseWorker(ctx context.Context, cfg config.Config, node *p2p.Node, adm
 			// compute-bound work, so logical count systematically overcommits.
 			CPUCores: profile.CPU.PhysicalCores, RAMBytes: cfg.DCS.Limits.RAMBytes,
 			Compute: &profile,
-			Slots: cfg.DCS.Limits.MaxContainers, Region: cfg.DCS.Region,
+			Slots:   cfg.DCS.Limits.MaxContainers, Region: cfg.DCS.Region,
 			Sequence: sequence, IssuedAt: now.Unix(), ExpiresAt: now.Unix() + ttl,
 		}
 		signed, err := dcs.SignWorkerRecord(node, rec)
