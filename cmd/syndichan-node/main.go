@@ -143,6 +143,7 @@ func main() {
 		// rather than two nobody sums.
 		node.SetMeter(meter)
 		node.SetMonitorEnabled(cfg.Monitor.Enabled)
+		node.SetComputeRoles(cfg.Compute.Enabled, cfg.Compute.OfferCPU, cfg.Compute.OfferGPU)
 		signer = node
 		// Opt-in: a config with no `bootstrap` section keeps the single-URL
 		// behaviour it has always had. The discovered path refuses a lone
