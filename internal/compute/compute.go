@@ -48,6 +48,13 @@ type Profile struct {
 	// reproduce. Absent if probing was asked to skip it.
 	Bench *Result `json:"bench,omitempty"`
 
+	// MicroVM is whether this machine can host an isolated guest (M2). Always
+	// present, including when unusable, because "this node cannot run isolated
+	// work and here is why" is the answer an operator needs — omitting it when
+	// false would make an unconfigured machine indistinguishable from an old
+	// node that predates the field.
+	MicroVM MicroVM `json:"microvm"`
+
 	ProbedAt int64 `json:"probed_at"`
 }
 
@@ -128,6 +135,7 @@ func Probe(opts Options) Profile {
 	profile := Profile{
 		CPU:      probeCPU(),
 		GPU:      probeGPUs(),
+		MicroVM:  probeMicroVM(),
 		ProbedAt: time.Now().Unix(),
 	}
 	if !opts.SkipBenchmark {
@@ -150,6 +158,13 @@ func (p Profile) Capabilities() []string {
 			caps = append(caps, "gpu")
 			break
 		}
+	}
+	// "isolated" is claimed on the same principle as "gpu": only when the
+	// mechanism is actually usable. Claiming it on a machine where KVM is
+	// present but unopenable would route exactly the work that most needs the
+	// boundary to a node that cannot build one.
+	if p.MicroVM.Isolated() {
+		caps = append(caps, "isolated")
 	}
 	return caps
 }
