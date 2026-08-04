@@ -40,6 +40,23 @@ import (
 type Policy struct {
 	Enabled bool `json:"enabled"`
 
+	// OfferCPU and OfferGPU are what this machine is willing to lend, and they
+	// are SEPARATE switches rather than one "compute" flag.
+	//
+	// They are different offers with different consequences. Spare cores cost
+	// their owner some heat and a slower build; a GPU is the device the owner
+	// is most likely to want back the instant they start a game, and on many
+	// machines it is also the one with a closed-source driver and a long
+	// history of privilege-escalation CVEs. An operator who wants to lend cores
+	// and not their card must be able to say exactly that — collapsing the two
+	// would make the safer choice require accepting the riskier one.
+	//
+	// Both default to false. Enabled alone lends nothing: an operator who turns
+	// compute on must still say WHAT they are lending, because "on" is not
+	// consent to a specific thing.
+	OfferCPU bool `json:"offer_cpu"`
+	OfferGPU bool `json:"offer_gpu"`
+
 	// ReserveCores are never taken, whatever else this says. Two by default:
 	// one for whatever the user is doing and one for the system, which is the
 	// difference between a machine that feels busy and one that feels broken.
@@ -122,6 +139,17 @@ func (p Policy) Normalise() Policy {
 
 // AcceptsClass reports whether this node will run a job of the given class.
 func (p Policy) AcceptsClass(class string) bool {
+	// The device switches come first, and they are a REFUSAL rather than a
+	// filter: an operator who did not offer their GPU has not offered it, and no
+	// job-class allowlist should be able to talk the node into running GPU work
+	// anyway. Checked before JobClasses for exactly that reason — an empty
+	// allowlist means "any class I offer", not "anything at all".
+	if isGPUClass(class) && !p.OfferGPU {
+		return false
+	}
+	if isCPUClass(class) && !p.OfferCPU {
+		return false
+	}
 	if len(p.JobClasses) == 0 {
 		return true
 	}
@@ -132,6 +160,20 @@ func (p Policy) AcceptsClass(class string) bool {
 	}
 	return false
 }
+
+// isGPUClass and isCPUClass map a job class onto the device it needs.
+//
+// Prefix matching on "gpu:" because the class carries the API — gpu:cuda,
+// gpu:rocm, gpu:vulkan — and an operator who declined to lend their card
+// declined all of them. An unrecognised class is treated as NEITHER, so it
+// falls through to the JobClasses allowlist rather than being silently
+// accepted as CPU work: a class this build does not know about is not one it
+// should assume is safe.
+func isGPUClass(class string) bool {
+	return class == "gpu" || strings.HasPrefix(class, "gpu:")
+}
+
+func isCPUClass(class string) bool { return class == "cpu" }
 
 // Sensors is what the governor reads. An interface so the decision logic can be
 // tested against machine states that are hard to arrange on demand — a hot

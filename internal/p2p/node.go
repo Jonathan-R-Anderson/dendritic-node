@@ -137,6 +137,13 @@ type Node struct {
 	meter *traffic.Meter
 	// monitorEnabled mirrors the config so the heartbeat can report the role.
 	monitorEnabled bool
+
+	// The operator's two compute switches, mirrored for the heartbeat. Both
+	// must be true-by-configuration AND compute enabled before the node claims
+	// the role — the same rule the gpu capability already follows, so a
+	// capability is advertised only when the mechanism behind it is real.
+	gpuCompute bool
+	cpuCompute bool
 	// challengeMu guards challengeHandler. Per-node, not package-level:
 	// a process can run more than one Node (tests do), and a shared
 	// handler would answer challenges with the wrong node's data.
@@ -664,6 +671,16 @@ func (n *Node) SetMeter(m *traffic.Meter) { n.meter = m }
 // heartbeat reports the role and the operator's map can draw it.
 func (n *Node) SetMonitorEnabled(on bool) { n.monitorEnabled = on }
 
+// SetComputeRoles records what the operator agreed to lend.
+//
+// Takes `enabled` separately and ANDs it in, so that turning compute off stops
+// the node advertising either device without silently clearing the operator's
+// per-device choices — they are still there when compute is switched back on.
+func (n *Node) SetComputeRoles(enabled, cpu, gpu bool) {
+	n.cpuCompute = enabled && cpu
+	n.gpuCompute = enabled && gpu
+}
+
 // sendHeartbeat delegates to the shared client so a storage node and a
 // dedicated gateway put exactly the same signed document on the wire.
 func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
@@ -680,6 +697,8 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 				Registration:    registration,
 				DCSWorker:       n.dcsWorker.Load(),
 				Monitor:         n.monitorEnabled,
+				GPUCompute:      n.gpuCompute,
+				CPUCompute:      n.cpuCompute,
 				I2PDestination:  n.I2PDestination(),
 			}
 			// The ONE legitimate drain. Window() resets, so a second caller

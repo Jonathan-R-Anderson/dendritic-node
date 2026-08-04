@@ -129,6 +129,36 @@ func (s *Server) setStorageSettings(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?saved=storage", http.StatusSeeOther)
 }
 
+// setCompute edits what this machine lends to the compute network.
+//
+// The two device switches are independent of Enabled, and all three are read
+// from the form rather than inferred. An operator who unticks "lend the GPU"
+// must end up with OfferGPU false even though compute is still on — inferring
+// one from the other is how a checkbox comes to mean something other than what
+// it says.
+func (s *Server) setCompute(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	err := s.cfgApply(func(c *config.Config) error {
+		c.Compute.Enabled = formBool(r, "compute_enabled")
+		c.Compute.OfferCPU = formBool(r, "offer_cpu")
+		c.Compute.OfferGPU = formBool(r, "offer_gpu")
+		c.Compute.IdleOnly = formBool(r, "compute_idle_only")
+		c.Compute.ReserveCores = formInt(r, "compute_reserve_cores", c.Compute.ReserveCores)
+		c.Compute.MaxCores = formInt(r, "compute_max_cores", c.Compute.MaxCores)
+		c.Compute.MaxTempC = formInt(r, "compute_max_temp", c.Compute.MaxTempC)
+		c.Compute.Hours = strings.TrimSpace(r.FormValue("compute_hours"))
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.logger.Printf("compute configuration updated (effective next start)")
+	http.Redirect(w, r, "/?saved=compute", http.StatusSeeOther)
+}
+
 // setDCS edits Docker facilitation: whether this node runs containers for the
 // network, its limits, and (for a website's bridge) the loopback deploy API.
 func (s *Server) setDCS(w http.ResponseWriter, r *http.Request) {

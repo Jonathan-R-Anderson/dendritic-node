@@ -100,6 +100,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.setGateway(w, r)
 	case r.URL.Path == "/config/storage" && r.Method == http.MethodPost:
 		s.setStorageSettings(w, r)
+	case r.URL.Path == "/config/compute" && r.Method == http.MethodPost:
+		s.setCompute(w, r)
 	case r.URL.Path == "/config/dcs" && r.Method == http.MethodPost:
 		s.setDCS(w, r)
 	case r.URL.Path == "/config/payout" && r.Method == http.MethodPost:
@@ -462,6 +464,34 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
     <label>Registration API <input name="gateway_registration" value="{{.Cfg.Gateway.RegistrationAPI}}"></label>
     <button type="submit">Save gateway settings</button>
     <div class="eff">Effective next start.</div>
+  </form>
+</section>
+
+<section class="panel cfg">
+  <h2>Lend spare CPU and GPU</h2>
+  <p class="muted">Run compute work units for the network on hardware you are not using.
+     These are separate switches: lending cores and lending your graphics card are
+     different offers, and turning compute on does not by itself lend either.</p>
+  <form method="post" action="/config/compute">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <label class="chk"><input type="checkbox" name="compute_enabled" value="1"{{if .Cfg.Compute.Enabled}} checked{{end}}> Enable compute</label>
+      <label class="chk"><input type="checkbox" name="offer_cpu" value="1"{{if .Cfg.Compute.OfferCPU}} checked{{end}}> Lend spare CPU cores</label>
+      <label class="chk"><input type="checkbox" name="offer_gpu" value="1"{{if .Cfg.Compute.OfferGPU}} checked{{end}}> Lend the GPU</label>
+    </div>
+    <div class="row">
+      <label class="chk"><input type="checkbox" name="compute_idle_only" value="1"{{if .Cfg.Compute.IdleOnly}} checked{{end}}> Only when the machine is idle</label>
+      <label>Cores to keep for yourself <input name="compute_reserve_cores" type="number" min="0" value="{{.Cfg.Compute.ReserveCores}}"></label>
+      <label>Never use more than (0 = no limit) <input name="compute_max_cores" type="number" min="0" value="{{.Cfg.Compute.MaxCores}}"></label>
+    </div>
+    <div class="row">
+      <label>Stop above this temperature (&deg;C, 0 = ignore) <input name="compute_max_temp" type="number" min="0" value="{{.Cfg.Compute.MaxTempC}}"></label>
+      <label>Only during these hours (blank = any) <input name="compute_hours" value="{{.Cfg.Compute.Hours}}" placeholder="01:00-07:00"></label>
+    </div>
+    <p class="muted">Work runs from a signed catalogue with no network access. Your node
+       pauses on its own when you need the machine back &mdash; pausing is not a
+       withdrawal, and the network does not treat it as one.</p>
+    <button type="submit">Save</button>
   </form>
 </section>
 

@@ -64,6 +64,12 @@ type State struct {
 	// points the status page actually has -- a page measured from one place
 	// cannot tell "the site is down" from "unreachable from that machine".
 	Monitor bool
+
+	// GPUCompute and CPUCompute are the operator's two compute switches, as
+	// configured — not whether a job happens to be running right now. See the
+	// payload fields for why availability rather than activity.
+	GPUCompute bool
+	CPUCompute bool
 	// I2PDestination is the node's own base32 garlic destination. Reported so the
 	// coordinator can hand this node out to others as a LIVE bootstrap peer,
 	// instead of the network relying on a single hardcoded one.
@@ -100,7 +106,17 @@ type request struct {
 	GatewayRegistration *gateway.Registration `json:"gateway_registration,omitempty"`
 	DCSWorker           bool                  `json:"dcs_worker"`
 	Monitor             bool                  `json:"monitor"`
-	I2PDestination      string                `json:"i2p_destination,omitempty"`
+	// What this node lends to the compute network. Reported separately because
+	// they are separate offers, and because the coordinator draws them as
+	// separate roles — a machine lending both should show as both rather than
+	// be collapsed into one "compute" dot.
+	//
+	// AVAILABLE, not busy. A node paused by its own governor because the owner
+	// started a game is still a provider, and dropping it while paused would
+	// make the network look like it collapses every evening.
+	GPUCompute     bool   `json:"gpu_compute"`
+	CPUCompute     bool   `json:"cpu_compute"`
+	I2PDestination string `json:"i2p_destination,omitempty"`
 	// Omitted entirely when the window is zero: the coordinator distinguishes
 	// "not reporting" from "reported nothing", and sending zeros would claim
 	// the second when the first is true.
@@ -179,6 +195,8 @@ func (c *Client) Send(ctx context.Context) {
 		GatewayVerified:     state.GatewayVerified,
 		GatewayRegistration: state.Registration,
 		DCSWorker:           state.DCSWorker,
+		GPUCompute:          state.GPUCompute,
+		CPUCompute:          state.CPUCompute,
 		Monitor:             state.Monitor,
 		I2PDestination:      state.I2PDestination,
 	}
