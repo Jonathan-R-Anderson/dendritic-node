@@ -540,6 +540,17 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
     <p class="muted">Work runs from a signed catalogue with no network access. Your node
        pauses on its own when you need the machine back &mdash; pausing is not a
        withdrawal, and the network does not treat it as one.</p>
+    <div class="row">
+      <label>Guest kernel (vmlinux) <input name="compute_vm_kernel" value="{{.Cfg.Compute.MicroVMKernel}}" placeholder="/srv/vmlinux"></label>
+      <label>Guest root filesystem <input name="compute_vm_rootfs" value="{{.Cfg.Compute.MicroVMRootFS}}" placeholder="/srv/rootfs.squashfs"></label>
+    </div>
+    <p class="muted"><strong>Set both to run other people&rsquo;s programs.</strong>
+       Without them your node runs signed catalogue images only. Arbitrary code is
+       permitted only inside a virtual machine &mdash; a container is not a strong
+       enough boundary for code somebody else wrote &mdash; so this needs KVM and a
+       guest image you supply. It is deliberately not downloaded for you: a node
+       that fetched and booted a kernel somebody else chose would have handed over
+       the machine in the act of protecting it.</p>
     <button type="submit">Save</button>
   </form>
 </section>

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"crypto/subtle"
+	"github.com/syndichan/maniwani/storage-client/internal/compute"
 	"net/http"
 	"strconv"
 	"strings"
@@ -186,6 +187,18 @@ func (s *Server) setCompute(w http.ResponseWriter, r *http.Request) {
 		c.Compute.MaxCores = formInt(r, "compute_max_cores", c.Compute.MaxCores)
 		c.Compute.MaxTempC = formInt(r, "compute_max_temp", c.Compute.MaxTempC)
 		c.Compute.Hours = strings.TrimSpace(r.FormValue("compute_hours"))
+		c.Compute.MicroVMKernel = strings.TrimSpace(r.FormValue("compute_vm_kernel"))
+		c.Compute.MicroVMRootFS = strings.TrimSpace(r.FormValue("compute_vm_rootfs"))
+		// Say why arbitrary code is or is not available, rather than leaving the
+		// operator to infer it from work never arriving.
+		if c.Compute.Enabled {
+			if ok, why := c.Compute.CanRunArbitrary(
+				compute.Probe(compute.Options{SkipBenchmark: true}).MicroVM.Isolated()); !ok {
+				s.logger.Printf("compute: catalogue images only — %s", why)
+			} else {
+				s.logger.Printf("compute: arbitrary code enabled (microVM isolation)")
+			}
+		}
 		return nil
 	})
 	if err != nil {
