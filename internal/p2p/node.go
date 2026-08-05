@@ -145,6 +145,12 @@ type Node struct {
 	gpuCompute bool
 	cpuCompute bool
 	microVM    bool
+
+	// computePeers is what this node knows about where compute lives, refreshed
+	// from the signed bootstrap document. Held locally so a node can ask "who
+	// else can run this" without asking the site first — otherwise the site is
+	// the network.
+	computePeers *bootstrap.ComputeRegistry
 	// challengeMu guards challengeHandler. Per-node, not package-level:
 	// a process can run more than one Node (tests do), and a shared
 	// handler would answer challenges with the wrong node's data.
@@ -327,6 +333,10 @@ func finishNode(
 		bootstrapPeers: make(map[peer.ID]struct{}), http: httpClient,
 		directHTTP: directHTTP, i2pOnly: i2pOnly,
 		replicated: make(map[string]struct{}),
+		// Empty until the first bootstrap fetch, and empty reports STALE — so a
+		// node that has not yet learned the network offers no candidates rather
+		// than silently offering none and looking healthy.
+		computePeers: bootstrap.NewComputeRegistry(),
 	}
 	// The content key persists beside the identity so the same node keeps the
 	// same address workers' grants are sealed to across restarts.
@@ -772,7 +782,26 @@ func (n *Node) refreshDiscoveredBootstrap(ctx context.Context, cfg *bootstrap.Co
 	n.keyMu.Lock()
 	n.coordKey = append(ed25519.PublicKey(nil), publicKey...)
 	n.keyMu.Unlock()
+	// Compute peers travel in the same signed document as storage peers, so a
+	// node learns where compute lives from something it already verified —
+	// rather than from a configured address, which names one machine and fails
+	// with it.
+	n.computePeers.Update(*result.Document, time.Now())
 	n.connectBootstrapPeers(ctx, result.Document.Peers)
+}
+
+// ComputePeers returns nodes currently offering a kind of work.
+//
+// Empty when the listing has expired, deliberately: a node dispatching on a
+// stale directory sends work confidently to peers that may be long gone, and
+// the failure reads as "compute is broken" rather than "my directory is old".
+func (n *Node) ComputePeers(device string, arbitrary bool) []bootstrap.ComputePeer {
+	return n.computePeers.Candidates(device, arbitrary, time.Now())
+}
+
+// ComputeSummary is what the node UI shows: counts, never the peer list.
+func (n *Node) ComputeSummary() bootstrap.Summary {
+	return n.computePeers.Summarise(time.Now())
 }
 
 func (n *Node) refreshBootstrap(ctx context.Context) {

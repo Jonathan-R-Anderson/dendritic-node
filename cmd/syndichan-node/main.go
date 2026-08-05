@@ -317,6 +317,15 @@ func main() {
 			func() int { return 0 },
 		))
 	}
+	// Where compute lives, learned from the signed bootstrap document. Wired as
+	// a closure so the UI reads the CURRENT listing rather than one captured at
+	// startup — a node that had just joined would otherwise show an empty
+	// network forever.
+	if node != nil {
+		uiServer.Handler.(*ui.Server).SetNetworkSource(func() any {
+			return node.ComputeSummary()
+		})
+	}
 	uiServer.Handler.(*ui.Server).SetConfigAccess(
 		func() config.Config { cfgMu.Lock(); defer cfgMu.Unlock(); return cfg },
 		func(mutate func(*config.Config) error) error {

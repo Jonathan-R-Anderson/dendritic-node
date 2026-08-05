@@ -48,6 +48,10 @@ type Server struct {
 	// nothing invites the reader to conclude the machine is idle when in fact
 	// nothing is measuring it.
 	meter *LoadMeter
+	// network reports compute peers this node learned from bootstrap. A func
+	// rather than a value so the UI always reads the CURRENT listing rather
+	// than one captured when the server started.
+	network func() any
 	// Config access (wired by main). Without it the config panels are absent.
 	cfgSnapshot func() config.Config
 	cfgApply    func(func(*config.Config) error) error
@@ -89,6 +93,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		_, _ = w.Write(IconPNG)
+	case r.URL.Path == "/api/network" && r.Method == http.MethodGet:
+		s.serveNetwork(w, r)
 	case r.URL.Path == "/api/load" && r.Method == http.MethodGet:
 		if s.meter != nil {
 			s.meter.ServeHTTP(w, r)
@@ -481,6 +487,15 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
 </section>
 
 <section class="panel cfg">
+  <h2>The compute network you joined</h2>
+  <p class="muted">Learned from the signed bootstrap document, not from a configured
+     address. Counts only &mdash; your node knows who the peers are and does not
+     publish that list to anyone who opens this page.</p>
+  <div class="row" id="nw-counts"><span class="muted">loading&hellip;</span></div>
+  <p class="nw__note muted" id="nw-note"></p>
+</section>
+
+<section class="panel cfg">
   <h2>What this is costing you</h2>
   <p class="muted">Live, from your own machine. The <b>grey</b> line is everything
      running &mdash; yours and the network's. The <b>coloured</b> line is what this node
@@ -716,6 +731,40 @@ setInterval(refresh,10000);
   setInterval(poll, 1000);
 })();
 </script>
+<script>
+// Counts, refreshed slowly: the listing only changes when the bootstrap document
+// does, so polling faster would ask the node the same question repeatedly.
+(function () {
+  var host = document.getElementById("nw-counts");
+  if (!host) { return; }
+  function draw(d) {
+    host.innerHTML =
+      "<b>" + d.total + "</b>&nbsp;compute node(s) &nbsp;&middot;&nbsp; " +
+      "<b>" + d.cpu + "</b>&nbsp;CPU &nbsp;&middot;&nbsp; " +
+      "<b>" + d.gpu + "</b>&nbsp;GPU &nbsp;&middot;&nbsp; " +
+      "<b>" + d.microvm + "</b>&nbsp;can run arbitrary code";
+    var note = document.getElementById("nw-note");
+    if (d.expired) {
+      // Stale is reported, not hidden: acting on an old listing dispatches to
+      // peers that may be long gone.
+      note.textContent = "This listing has expired \u2014 your node will not " +
+        "choose peers from it until it refreshes.";
+    } else if (d.total === 0) {
+      note.textContent = "No compute nodes are advertising yet.";
+    } else {
+      note.textContent = "";
+    }
+  }
+  function poll() {
+    fetch("/api/network", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d) { draw(d); } })
+      .catch(function () {});
+  }
+  poll();
+  setInterval(poll, 30000);
+})();
+</script>
 </body></html>`
 
 // SetLoadMeter wires the live load graph.
@@ -724,3 +773,25 @@ setInterval(refresh,10000);
 // no meter rather than a flat line — a graph of nothing invites the reader to
 // conclude the machine is idle when in fact nothing is measuring it.
 func (s *Server) SetLoadMeter(m *LoadMeter) { s.meter = m }
+
+// SetNetworkSource wires the compute-peer summary.
+func (s *Server) SetNetworkSource(f func() any) { s.network = f }
+
+// serveNetwork reports what compute this node knows about.
+//
+// Counts, never the peer list. A node UI that showed every peer would publish
+// the network's membership to anyone who opened it — a directory the network
+// did not agree to hand out at that granularity.
+func (s *Server) serveNetwork(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if s.network == nil {
+		// Absent rather than zeroed: "no listing" and "a listing of nothing"
+		// are different facts and a zero would read as the second.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total": 0, "cpu": 0, "gpu": 0, "microvm": 0, "expired": true,
+		})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(s.network())
+}

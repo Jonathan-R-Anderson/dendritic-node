@@ -67,12 +67,80 @@ var (
 )
 
 // Document is the published bootstrap record.
+
+// ComputePeer is one node offering compute, as published in the bootstrap
+// document.
+//
+// Carries what the node OFFERS rather than only how to reach it. A joining node
+// that had to dial every peer to ask whether it takes GPU work would spend a
+// round trip per peer over I2P to learn something already published — and on a
+// network of any size that is the difference between choosing a provider in a
+// second and in a minute.
+type ComputePeer struct {
+	NodeID      string `json:"node_id"`
+	Destination string `json:"destination"`
+	CPU         bool   `json:"cpu"`
+	GPU         bool   `json:"gpu"`
+	// MicroVM decides whether ARBITRARY code may be placed here. Published
+	// because it decides eligibility, and asking a node about its own isolation
+	// would be asking it to vouch for itself.
+	MicroVM bool `json:"microvm"`
+}
+
+// Reachable reports whether this peer can actually be dialed.
+//
+// A listing without a destination is not a provider, it is a name. Filtering
+// here means a caller never builds a plan around a peer it cannot reach.
+func (c ComputePeer) Reachable() bool {
+	return c.NodeID != "" && c.Destination != ""
+}
+
+// Offers reports whether this peer takes a given kind of work.
+//
+// `arbitrary` requires a microVM, which is the same rule the site enforces at
+// placement. Duplicated here deliberately: a node choosing its own peers must
+// not depend on the site having filtered correctly, or a compromised directory
+// could place arbitrary code on a container node.
+func (c ComputePeer) Offers(device string, arbitrary bool) bool {
+	if !c.Reachable() {
+		return false
+	}
+	if arbitrary && !c.MicroVM {
+		return false
+	}
+	if len(device) >= 3 && device[:3] == "gpu" {
+		return c.GPU
+	}
+	return c.CPU
+}
+
+// ComputePeers returns the reachable compute peers matching a requirement.
+func (d Document) ComputePeers(device string, arbitrary bool) []ComputePeer {
+	out := make([]ComputePeer, 0, len(d.Compute))
+	for _, peer := range d.Compute {
+		if peer.Offers(device, arbitrary) {
+			out = append(out, peer)
+		}
+	}
+	return out
+}
+
 type Document struct {
-	Version              int       `json:"version"`
-	Peers                []string  `json:"peers"`
-	CoordinatorPublicKey string    `json:"coordinator_public_key"`
-	ExpiresAt            time.Time `json:"expires_at"`
-	Signature            string    `json:"signature"`
+	Version int      `json:"version"`
+	Peers   []string `json:"peers"`
+	// Compute lists nodes currently offering CPU or GPU work, so a joining node
+	// learns where compute lives from the same signed document that tells it
+	// where storage lives.
+	//
+	// In the bootstrap document rather than a second service on purpose: a
+	// separate compute directory would be another thing to sign, another thing
+	// to keep fresh, and another place for the two to disagree about which
+	// nodes exist. It is also covered by the SAME signature, so a gateway
+	// serving the document cannot add compute peers of its own.
+	Compute              []ComputePeer `json:"compute,omitempty"`
+	CoordinatorPublicKey string        `json:"coordinator_public_key"`
+	ExpiresAt            time.Time     `json:"expires_at"`
+	Signature            string        `json:"signature"`
 }
 
 // Config is how a node is told to bootstrap.
