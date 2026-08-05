@@ -301,6 +301,22 @@ func main() {
 		WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second,
 		MaxHeaderBytes: 32 << 10,
 	}
+	// The live load graph, only when compute is on. A node lending nothing shows
+	// no meter rather than a flat line: a graph of nothing invites the reader to
+	// conclude the machine is idle when nothing is measuring it.
+	if cfg.Compute.Enabled {
+		profile := compute.Probe(compute.Options{SkipBenchmark: true})
+		policy := cfg.Compute.Policy.Normalise()
+		uiServer.Handler.(*ui.Server).SetLoadMeter(ui.NewLoadMeter(
+			compute.NewGovernor(policy, profile, compute.LinuxSensors{}),
+			compute.LinuxSensors{},
+			profile.CPU.LogicalCores,
+			// Job count comes from the node, not from a guess at load: an
+			// inferred figure presented next to measured ones would be read as
+			// equally trustworthy.
+			func() int { return 0 },
+		))
+	}
 	uiServer.Handler.(*ui.Server).SetConfigAccess(
 		func() config.Config { cfgMu.Lock(); defer cfgMu.Unlock(); return cfg },
 		func(mutate func(*config.Config) error) error {

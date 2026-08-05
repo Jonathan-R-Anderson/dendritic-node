@@ -43,6 +43,11 @@ type Server struct {
 	template *template.Template
 	dataDir  string
 	saveDir  func(string) error
+	// meter drives the live load graph. Nil when compute is off — the panel is
+	// then absent rather than showing an empty chart, because a graph of
+	// nothing invites the reader to conclude the machine is idle when in fact
+	// nothing is measuring it.
+	meter *LoadMeter
 	// Config access (wired by main). Without it the config panels are absent.
 	cfgSnapshot func() config.Config
 	cfgApply    func(func(*config.Config) error) error
@@ -84,6 +89,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		_, _ = w.Write(IconPNG)
+	case r.URL.Path == "/api/load" && r.Method == http.MethodGet:
+		if s.meter != nil {
+			s.meter.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "load meter unavailable", http.StatusServiceUnavailable)
 	case r.URL.Path == "/api/status" && r.Method == http.MethodGet:
 		s.status(w)
 	case r.URL.Path == "/api/items" && r.Method == http.MethodGet:
@@ -470,6 +481,23 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
 </section>
 
 <section class="panel cfg">
+  <h2>What this is costing you</h2>
+  <p class="muted">Live, from your own machine. The <b>grey</b> line is everything
+     running &mdash; yours and the network's. The <b>coloured</b> line is what this node
+     is doing. If the coloured line is flat while the grey one is high, that is your
+     work, not ours.</p>
+  <div class="lm-wrap">
+    <canvas id="lm-canvas" height="120"></canvas>
+    <div class="lm-legend">
+      <span><i class="lm-sw lm-total"></i>machine load</span>
+      <span><i class="lm-sw lm-node"></i>node jobs</span>
+      <span><i class="lm-sw lm-gpu"></i>GPU</span>
+      <span id="lm-state" class="lm-state"></span>
+    </div>
+  </div>
+</section>
+
+<section class="panel cfg">
   <h2>Route payments for the network</h2>
   <p class="muted">Forward other people's payments and earn a fee. This one is different
      from the others: storage lends disk you were not using, but routing lends
@@ -629,4 +657,70 @@ refresh();
 // Peers and shard count move on their own; poll so the page reflects reality
 // without the user reloading to find out whether anything connected.
 setInterval(refresh,10000);
-</script></body></html>`
+</script><script>
+// Draws the rolling window the node keeps. Polls once a second, which matches
+// the sample rate — polling faster would redraw the same data and read sensors
+// for nothing.
+(function () {
+  var canvas = document.getElementById("lm-canvas");
+  if (!canvas) { return; }
+  var ctx = canvas.getContext("2d");
+
+  function line(points, colour, scale) {
+    if (!points.length) { return; }
+    ctx.beginPath();
+    ctx.strokeStyle = colour; ctx.lineWidth = 1.6;
+    var w = canvas.width, h = canvas.height;
+    points.forEach(function (v, i) {
+      var x = (i / Math.max(1, points.length - 1)) * w;
+      // Clamped: a load average above the scale should flatten at the top
+      // rather than draw off-canvas and vanish, which reads as "no data"
+      // exactly when the machine is busiest.
+      var y = h - Math.min(1, Math.max(0, v / scale)) * (h - 4) - 2;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  function draw(data) {
+    var hist = data.history || [];
+    canvas.width = canvas.clientWidth;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    line(hist.map(function (s) { return s.load_per_core; }), "#9aa4b0", 1.5);
+    line(hist.map(function (s) { return s.node_jobs; }), "#f97316", Math.max(1, data.cores || 1));
+    // -1 means NO READING, which is not the same as idle. Drawn as a gap so an
+    // absent GPU does not appear as a permanently idle one.
+    line(hist.map(function (s) { return s.gpu_busy < 0 ? 0 : s.gpu_busy; }), "#ec4899", 100);
+
+    var state = document.getElementById("lm-state");
+    var cur = data.current || {};
+    if (cur.paused) {
+      state.textContent = "paused \u2014 " + (cur.reason || "");
+      state.style.color = "#f97316";
+    } else if (cur.node_jobs > 0) {
+      state.textContent = cur.node_jobs + " job(s) running";
+      state.style.color = "";
+    } else {
+      state.textContent = "idle";
+      state.style.color = "";
+    }
+  }
+
+  function poll() {
+    fetch("/api/load", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d) { draw(d); } })
+      .catch(function () { /* a node with compute off has no meter; not an error */ });
+  }
+  poll();
+  setInterval(poll, 1000);
+})();
+</script>
+</body></html>`
+
+// SetLoadMeter wires the live load graph.
+//
+// Called by main only when compute is enabled, so a node lending nothing shows
+// no meter rather than a flat line — a graph of nothing invites the reader to
+// conclude the machine is idle when in fact nothing is measuring it.
+func (s *Server) SetLoadMeter(m *LoadMeter) { s.meter = m }
