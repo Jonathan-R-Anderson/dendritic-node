@@ -34,12 +34,14 @@ import (
 // Digest pinning is left to deployment (the tag is resolved at image-build
 // time) but the KEY point is that this table is closed: a language not in it is
 // refused, so there is no path from a request to an arbitrary image.
+// Only languages an image actually exists for (see compute-images/). Listing
+// one without an image would offer a language in the UI whose jobs fail at
+// dispatch — a promise the node cannot keep, made at the point a submitter
+// commits to it.
 var catalogueImages = map[string]string{
 	"python": "registry.local/compute-python:latest",
 	"go":     "registry.local/compute-go:latest",
 	"c":      "registry.local/compute-c:latest",
-	"cpp":    "registry.local/compute-cpp:latest",
-	"rust":   "registry.local/compute-rust:latest",
 }
 
 type computeAPI struct {
