@@ -96,10 +96,8 @@ func (Pedersen) IsHomomorphic() bool { return true }
 // via CommitPoint.
 func (p Pedersen) Commit(value uint64, blinding [32]byte) Commitment {
 	pt := p.CommitPoint(value, blinding)
-	var out Commitment
-	copy(out[:], derive("syndichan/pedersen/serialize/v1",
-		pt.X.Bytes(), pt.Y.Bytes())[:])
-	return out
+	digest := derive("syndichan/pedersen/serialize/v1", pt.X.Bytes(), pt.Y.Bytes())
+	return Commitment(digest)
 }
 
 // CommitPoint returns the commitment as a curve point, for summing.
