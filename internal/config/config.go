@@ -241,6 +241,36 @@ type ComputeConfig struct {
 	// Policy fields are inlined so the config file reads as one block rather
 	// than compute.policy.enabled.
 	compute.Policy
+
+	// MicroVMKernel and MicroVMRootFS are the guest artifacts. Both are
+	// required before this node will run ARBITRARY code: without them there is
+	// no VM to run it in, and the container fallback is exactly the boundary
+	// the arbitrary-code rule refuses.
+	//
+	// Supplied by the operator rather than downloaded automatically. A node
+	// that fetched and booted a kernel somebody else chose would have handed
+	// over the machine in the act of protecting it.
+	MicroVMKernel string `json:"microvm_kernel,omitempty"`
+	MicroVMRootFS string `json:"microvm_rootfs,omitempty"`
+}
+
+// CanRunArbitrary reports whether this node may accept arbitrary code.
+//
+// Requires BOTH the measured capability and the artifacts. A node with KVM but
+// no kernel image would advertise isolation it cannot actually provide, and the
+// first arbitrary job placed on it would fail at boot — after the submitter had
+// been told it was accepted.
+func (c ComputeConfig) CanRunArbitrary(probeUsable bool) (bool, string) {
+	if !c.Enabled {
+		return false, "compute is switched off"
+	}
+	if !probeUsable {
+		return false, "this machine cannot host a microVM (see the compute panel for why)"
+	}
+	if c.MicroVMKernel == "" || c.MicroVMRootFS == "" {
+		return false, "no guest kernel or root filesystem configured — set both to run arbitrary code"
+	}
+	return true, ""
 }
 
 type DCSLimits struct {

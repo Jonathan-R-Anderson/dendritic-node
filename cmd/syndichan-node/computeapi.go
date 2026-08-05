@@ -26,6 +26,7 @@ import (
 	"github.com/syndichan/maniwani/storage-client/internal/computeworker"
 	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/dcs"
+	"github.com/syndichan/maniwani/storage-client/internal/microvm"
 )
 
 // catalogueImages maps a language to the image that runs it.
@@ -43,6 +44,12 @@ var catalogueImages = map[string]string{
 
 type computeAPI struct {
 	worker *computeworker.Worker
+	// micro runs ARBITRARY code. Nil when this node cannot — which is the
+	// common case, and why every arbitrary request checks it rather than
+	// assuming a fallback exists.
+	micro *computeworker.MicroVMExecutor
+	// isolation is what this node honestly offers.
+	isolation computeworker.Isolation
 
 	mu      sync.Mutex
 	results map[string]computeworker.Result
@@ -57,6 +64,10 @@ type computeSubmitRequest struct {
 	Files      map[string]string `json:"files"`
 	Stdin      string            `json:"stdin"`
 	TimeoutSec int               `json:"timeout_seconds"`
+	// Arbitrary means the submitter sent CODE, not data for a catalogue image.
+	// The whole safety question, so it is explicit rather than inferred.
+	Arbitrary bool `json:"arbitrary"`
+	NeedsGPU  bool `json:"needs_gpu"`
 }
 
 // handleAdmit answers "would you take this?" without running anything.
@@ -101,13 +112,38 @@ func (c *computeAPI) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "job_id is required")
 		return
 	}
-	image, known := catalogueImages[req.Language]
-	if !known {
-		// Closed table: an unknown language is refused, never forwarded as an
-		// image name.
-		writeErr(w, http.StatusBadRequest, "unsupported language: "+req.Language)
+	// The isolation rule, checked before anything else about the job. A node
+	// without a microVM must refuse arbitrary code rather than fall back to a
+	// container — the fallback is precisely what the rule forbids.
+	payload := computeworker.Payload{
+		Arbitrary: req.Arbitrary, Files: req.Files,
+		Entrypoint: req.Entrypoint, NeedsGPU: req.NeedsGPU,
+	}
+	if !req.Arbitrary {
+		image, known := catalogueImages[req.Language]
+		if !known {
+			// Closed table: an unknown language is refused, never forwarded as
+			// an image name.
+			writeErr(w, http.StatusBadRequest, "unsupported language: "+req.Language)
+			return
+		}
+		payload.CatalogueImage = image
+	}
+	if err := computeworker.Admit(payload, c.isolation, false); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"admitted": false, "reason": err.Error(), "retryable": false,
+		})
 		return
 	}
+	if req.Arbitrary && c.micro == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"admitted":  false,
+			"reason":    "this node has no configured guest image, so it cannot run arbitrary code",
+			"retryable": false,
+		})
+		return
+	}
+	image := payload.CatalogueImage
 	if err := c.worker.Admit(req.Device); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"admitted":  false,
@@ -136,11 +172,19 @@ func (c *computeAPI) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		Env:     []string{"ENTRYPOINT=" + req.Entrypoint},
 	}
 
+	arbitrary := req.Arbitrary
 	go func() {
 		// Background context, not the request's: the HTTP response has already
 		// been sent, so cancelling with the request would kill every job the
 		// instant the site stopped waiting.
-		result, err := c.worker.Run(context.Background(), job)
+		var result computeworker.Result
+		var err error
+		if arbitrary {
+			// Arbitrary code goes to the VM, never the container path.
+			result, _, err = c.micro.Run(context.Background(), job)
+		} else {
+			result, err = c.worker.Run(context.Background(), job)
+		}
 		if err != nil && result.Error == "" {
 			result.Error = err.Error()
 		}
@@ -227,9 +271,29 @@ func newComputeAPI(cfg config.Config, logger *log.Logger) *computeAPI {
 	policy := cfg.Compute.Policy.Normalise()
 	governor := compute.NewGovernor(policy, compute.Probe(compute.Options{SkipBenchmark: true}),
 		compute.LinuxSensors{})
-	return &computeAPI{
-		worker:  computeworker.New(docker, governor, policy),
-		results: map[string]computeworker.Result{},
-		running: map[string]bool{},
+	probe := compute.Probe(compute.Options{SkipBenchmark: true})
+	api := &computeAPI{
+		worker:    computeworker.New(docker, governor, policy),
+		isolation: computeworker.IsolationOf(probe),
+		results:   map[string]computeworker.Result{},
+		running:   map[string]bool{},
 	}
+	// Arbitrary code needs BOTH the capability and the artifacts. Reported
+	// rather than silently absent, so an operator who set one and not the other
+	// learns why their node is not taking that work.
+	if ok, why := cfg.Compute.CanRunArbitrary(probe.MicroVM.Isolated()); ok {
+		if runner, err := microvm.NewRunner(); err == nil {
+			api.micro = &computeworker.MicroVMExecutor{
+				Runner:     runner,
+				KernelPath: cfg.Compute.MicroVMKernel,
+				RootFSPath: cfg.Compute.MicroVMRootFS,
+			}
+			logger.Printf("compute: arbitrary code enabled (microVM isolation)")
+		} else {
+			logger.Printf("compute: firecracker unavailable (%v); arbitrary code disabled", err)
+		}
+	} else {
+		logger.Printf("compute: catalogue images only — %s", why)
+	}
+	return api
 }
