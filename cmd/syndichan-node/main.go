@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/syndichan/maniwani/storage-client/internal/compute"
 	"log"
 	"net"
 	"net/http"
@@ -144,6 +145,10 @@ func main() {
 		node.SetMeter(meter)
 		node.SetMonitorEnabled(cfg.Monitor.Enabled)
 		node.SetComputeRoles(cfg.Compute.Enabled, cfg.Compute.OfferCPU, cfg.Compute.OfferGPU)
+		// Measured, not configured. Only advertised when compute is actually
+		// offered: isolation this node will not lend is not a capability.
+		node.SetMicroVM(cfg.Compute.Enabled &&
+			compute.Probe(compute.Options{SkipBenchmark: true}).MicroVM.Isolated())
 		signer = node
 		// Opt-in: a config with no `bootstrap` section keeps the single-URL
 		// behaviour it has always had. The discovered path refuses a lone

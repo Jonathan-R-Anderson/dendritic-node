@@ -144,6 +144,7 @@ type Node struct {
 	// capability is advertised only when the mechanism behind it is real.
 	gpuCompute bool
 	cpuCompute bool
+	microVM    bool
 	// challengeMu guards challengeHandler. Per-node, not package-level:
 	// a process can run more than one Node (tests do), and a shared
 	// handler would answer challenges with the wrong node's data.
@@ -681,6 +682,13 @@ func (n *Node) SetComputeRoles(enabled, cpu, gpu bool) {
 	n.gpuCompute = enabled && gpu
 }
 
+// SetMicroVM records MEASURED hardware isolation.
+//
+// Takes the probe's verdict, not a config flag: an operator cannot declare
+// isolation they do not have, because the whole point is that arbitrary code is
+// placed only where the boundary is real.
+func (n *Node) SetMicroVM(usable bool) { n.microVM = usable }
+
 // sendHeartbeat delegates to the shared client so a storage node and a
 // dedicated gateway put exactly the same signed document on the wire.
 func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
@@ -699,6 +707,7 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 				Monitor:         n.monitorEnabled,
 				GPUCompute:      n.gpuCompute,
 				CPUCompute:      n.cpuCompute,
+				MicroVM:         n.microVM,
 				I2PDestination:  n.I2PDestination(),
 			}
 			// The ONE legitimate drain. Window() resets, so a second caller

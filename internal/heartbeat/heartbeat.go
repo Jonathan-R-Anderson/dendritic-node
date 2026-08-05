@@ -70,6 +70,9 @@ type State struct {
 	// payload fields for why availability rather than activity.
 	GPUCompute bool
 	CPUCompute bool
+	// MicroVM is measured, never configured: an operator cannot declare
+	// hardware isolation they do not have.
+	MicroVM bool
 	// I2PDestination is the node's own base32 garlic destination. Reported so the
 	// coordinator can hand this node out to others as a LIVE bootstrap peer,
 	// instead of the network relying on a single hardcoded one.
@@ -114,8 +117,12 @@ type request struct {
 	// AVAILABLE, not busy. A node paused by its own governor because the owner
 	// started a game is still a provider, and dropping it while paused would
 	// make the network look like it collapses every evening.
-	GPUCompute     bool   `json:"gpu_compute"`
-	CPUCompute     bool   `json:"cpu_compute"`
+	GPUCompute bool `json:"gpu_compute"`
+	CPUCompute bool `json:"cpu_compute"`
+	// MicroVM decides whether ARBITRARY submitted code may be placed here. A
+	// container node runs signed catalogue images only, and spare capacity does
+	// not change that — so it is a capability, not a compute detail.
+	MicroVM        bool   `json:"microvm"`
 	I2PDestination string `json:"i2p_destination,omitempty"`
 	// Omitted entirely when the window is zero: the coordinator distinguishes
 	// "not reporting" from "reported nothing", and sending zeros would claim
@@ -197,6 +204,7 @@ func (c *Client) Send(ctx context.Context) {
 		DCSWorker:           state.DCSWorker,
 		GPUCompute:          state.GPUCompute,
 		CPUCompute:          state.CPUCompute,
+		MicroVM:             state.MicroVM,
 		Monitor:             state.Monitor,
 		I2PDestination:      state.I2PDestination,
 	}
