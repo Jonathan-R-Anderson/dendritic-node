@@ -83,3 +83,36 @@ func TestGPUPrefixIsNotMatchedLoosely(t *testing.T) {
 		t.Error("an unrelated class was refused as if it were GPU work")
 	}
 }
+
+// Workload consent and device consent are two switches answering two questions,
+// and neither may stand in for the other. An operator who lends CPU has not
+// thereby agreed to every workload the catalogue grows, and one who opted into a
+// workload has not offered a device they declined.
+func TestWorkloadConsentIsSeparateFromDeviceConsent(t *testing.T) {
+	cpuAndEmbed := Policy{
+		Enabled: true, OfferCPU: true, OfferGPU: false,
+		Workloads: []string{"embed"},
+	}
+	if !cpuAndEmbed.AcceptsClass("cpu") {
+		t.Error("a workload allowlist suppressed the device the operator lent")
+	}
+	if cpuAndEmbed.AcceptsClass("gpu:cuda") {
+		t.Error("a workload allowlist talked the node into GPU work")
+	}
+	if !cpuAndEmbed.AcceptsWorkload("embed") {
+		t.Error("refused the workload the operator listed")
+	}
+	if cpuAndEmbed.AcceptsWorkload("render") {
+		t.Error("accepted a workload the operator never listed")
+	}
+
+	// AcceptsWorkload consults ONLY the workload list — a node that lends
+	// nothing still answers the workload question the same way, because that
+	// question is about purpose and the device switches are about hardware.
+	// (What stops such a node running anything is the device check, which the
+	// caller asks separately.)
+	lendsNothing := Policy{Enabled: true, Workloads: []string{"embed"}}
+	if !lendsNothing.AcceptsWorkload("embed") {
+		t.Error("AcceptsWorkload started consulting something other than the workload list")
+	}
+}

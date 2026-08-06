@@ -96,6 +96,23 @@ type Policy struct {
 	// "science". Empty means all. This is the governance lever from the
 	// roadmap's threat 4: legal code, toxic purpose.
 	JobClasses []string `json:"job_classes,omitempty"`
+
+	// Workloads this node will run from the M10 catalogue, by NAME ("embed").
+	// Empty means every catalogue workload.
+	//
+	// A SEPARATE LIST FROM JobClasses, DELIBERATELY. It is tempting to reuse the
+	// class allowlist and put "embed" in it — it is one field fewer and both are
+	// "things I will run". It would also break the node completely, silently:
+	// AcceptsClass is called with a DEVICE string ("cpu", "gpu:cuda") by
+	// computeworker's Admit, so the first workload name added to JobClasses
+	// turns an empty (= accept anything I offer) list into a non-empty allowlist
+	// that no device is a member of. Every device check then falls through to
+	// the loop, matches nothing, and the node refuses ALL work with
+	// retryable:false — a permanent refusal, from a config change that reads
+	// like an opt-in.
+	//
+	// Two lists that answer two questions is the cost of not having that bug.
+	Workloads []string `json:"workloads,omitempty"`
 }
 
 // Defaults chosen so an operator who enables the node and reads nothing else
@@ -155,6 +172,27 @@ func (p Policy) AcceptsClass(class string) bool {
 	}
 	for _, allowed := range p.JobClasses {
 		if allowed == class {
+			return true
+		}
+	}
+	return false
+}
+
+// AcceptsWorkload reports whether this node will run a named catalogue
+// workload. Empty list means every workload in the catalogue.
+//
+// Consults ONLY Policy.Workloads. It does not consult the device switches, and
+// it must not: a workload name is not a device, and a node that offers CPU
+// answers "may I run embed" and "may I run cpu work" with two different checks
+// against two different facts. The caller asks both — the workload gate here,
+// and AcceptsClass on the device — because collapsing them is how a workload
+// name ends up being tested as a device (see Workloads above).
+func (p Policy) AcceptsWorkload(name string) bool {
+	if len(p.Workloads) == 0 {
+		return true
+	}
+	for _, allowed := range p.Workloads {
+		if allowed == name {
 			return true
 		}
 	}

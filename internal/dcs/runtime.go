@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -97,8 +98,27 @@ type ContainerSpec struct {
 	MemoryLimitBytes int64
 	NanoCPUs         int64
 	PidsLimit        int64
-	ReadOnlyRootfs   bool
-	TmpfsMounts      map[string]string
+	// WritableRootfs turns the read-only root filesystem OFF for this one
+	// container. The zero value is the hardened setting, so a caller that omits
+	// the field gets a read-only root rather than a writable one — the mistake
+	// this way round is a broken container, not a silently weakened sandbox.
+	//
+	// It exists for exactly one reason: the Docker daemon REFUSES
+	// PUT /containers/{id}/archive on a container whose rootfs is marked
+	// read-only ("container rootfs is marked read-only"), running or stopped.
+	// A workload that must be HANDED a data file therefore cannot also have a
+	// read-only root, and the alternative — a tmpfs at the delivery path — is
+	// worse than useless: the archive endpoint writes through the image layer,
+	// which the tmpfs then masks, so the files exist and the program cannot see
+	// them. Both behaviours were verified against Docker 29 rather than assumed.
+	//
+	// Everything else in the profile still applies: no network, all capabilities
+	// dropped, no-new-privileges, an unprivileged uid, a pids limit and a memory
+	// limit, and the container is destroyed after one job. What is lost is the
+	// disk bound: a program can now fill the container's own layer, where before
+	// it could only fill a size-capped tmpfs.
+	WritableRootfs bool
+	TmpfsMounts    map[string]string
 	// Lab marks a deliberately vulnerable workload. It tightens the profile
 	// further; it never loosens it.
 	Lab bool
@@ -167,7 +187,9 @@ func hardened(spec ContainerSpec) dockerCreateBody {
 			SecurityOpt: []string{
 				"no-new-privileges:true",
 			},
-			ReadonlyRootfs: true,
+			// Read-only unless the caller explicitly asked otherwise, so the
+			// default of every present and future call site is the hard one.
+			ReadonlyRootfs: !spec.WritableRootfs,
 			Tmpfs:          tmpfs,
 			NetworkMode:    "none",
 			Privileged:     false,
@@ -263,6 +285,132 @@ func (c *DockerClient) Remove(ctx context.Context, id string, force bool) error 
 		path += "&force=1"
 	}
 	return c.do(ctx, http.MethodDelete, path, nil, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Getting bytes in and out of a container
+// ---------------------------------------------------------------------------
+//
+// A compute job is data in, data out. The container itself has no network (the
+// hardened profile disables it outright), no bind mount and no volume, which
+// leaves exactly one channel in each direction: Docker's archive endpoint,
+// which extracts a tar into a container and reads one back out.
+//
+// This is deliberately the ONLY file channel. A bind mount would hand a
+// submitted program a path on the volunteer's disk; a volume would outlive the
+// job. A tar extracted into a per-job container that is destroyed afterwards
+// leaves nothing behind and touches nothing outside itself.
+
+// MaxArchiveBytes bounds a single retrieval.
+//
+// The container is the untrusted party here: it chooses the size of the file it
+// writes, and the node reads that file into memory. Without a bound, a program
+// that writes until the disk is full hands the node an out-of-memory kill as its
+// result. The cap is the reason reading output is safe at all.
+const MaxArchiveBytes = 16 << 20 // 16 MiB
+
+var (
+	// ErrArchiveMissing means the path does not exist in the container.
+	//
+	// Separate from a transport failure on purpose: "the job produced no output
+	// file" is a normal, reportable outcome, while "the daemon did not answer"
+	// is a broken node. A caller that cannot tell them apart either fails jobs
+	// that legitimately wrote nothing, or reports a dead daemon as an empty
+	// result.
+	ErrArchiveMissing = errors.New("dcs: no such path in container")
+	// ErrArchiveTooLarge means the container's file exceeded MaxArchiveBytes.
+	// Also distinct: the job ran, and its output is simply too big to carry.
+	ErrArchiveTooLarge = errors.New("dcs: container archive exceeds the maximum size")
+)
+
+// archivePath builds the endpoint URL. The container id and the in-container
+// path both come from a caller that may be relaying a submitter's request, so
+// both are escaped rather than concatenated — a path of "/work/x?foo=bar" must
+// not become a second query parameter.
+func (c *DockerClient) archivePath(id, containerPath string) string {
+	return c.apiBase + "/containers/" + url.PathEscape(id) + "/archive?" +
+		url.Values{"path": {containerPath}}.Encode()
+}
+
+// archiveErr turns a non-2xx archive response into a typed error.
+func archiveErr(resp *http.Response, method, target string) error {
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("%w: %s", ErrArchiveMissing, target)
+	}
+	var msg struct {
+		Message string `json:"message"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 8<<10)).Decode(&msg)
+	return fmt.Errorf("dcs: docker %s archive %s: HTTP %d: %s",
+		method, target, resp.StatusCode, msg.Message)
+}
+
+// PutArchive extracts a tar into destDir inside the container.
+//
+// Called between Create and Start, which is the same window the agent uses to
+// attach a network identity: the files are in place before the program's first
+// instruction, so there is no window in which it could observe a half-delivered
+// input and no race to lose.
+//
+// TWO DAEMON BEHAVIOURS CONSTRAIN THE CALLER, both verified against Docker 29
+// rather than inferred from the documentation:
+//
+//   - the daemon refuses this call outright when the container's rootfs is
+//     read-only, so the spec must set WritableRootfs;
+//   - the tar is written through the image layer, NOT into the container's
+//     mount namespace, so anything mounted over destDir at start (a tmpfs, for
+//     instance) hides every file delivered here.
+//
+// Both failures are silent from the program's point of view — it simply finds
+// no input — which is why they are written down at the call site.
+func (c *DockerClient) PutArchive(ctx context.Context, id, destDir string, tarBytes []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		c.archivePath(id, destDir), bytes.NewReader(tarBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("dcs: docker put archive %s: %w", destDir, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return archiveErr(resp, "put", destDir)
+	}
+	return nil
+}
+
+// GetArchive reads a path out of the container as a tar.
+//
+// Works on an exited container, which is the case that matters: a one-shot job
+// writes its result and stops, and the file must still be retrievable
+// afterwards. It reads the container's filesystem layer, so a file written to a
+// tmpfs is gone by then — output has to land somewhere on the layer.
+func (c *DockerClient) GetArchive(ctx context.Context, id, containerPath string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.archivePath(id, containerPath), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("dcs: docker get archive %s: %w", containerPath, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, archiveErr(resp, "get", containerPath)
+	}
+	// One byte past the cap, so "exactly at the limit" is accepted and anything
+	// larger is refused rather than silently truncated into a corrupt tar.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxArchiveBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > MaxArchiveBytes {
+		return nil, fmt.Errorf("%w: %s", ErrArchiveTooLarge, containerPath)
+	}
+	return body, nil
 }
 
 // InspectState is the redacted projection. The raw Docker inspect response

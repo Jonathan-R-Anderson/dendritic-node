@@ -268,3 +268,61 @@ func TestAGrantSaysWhatItGave(t *testing.T) {
 		t.Fatalf("a granting decision should say what was kept back: %q", grant.Reason)
 	}
 }
+
+// --- M10: per-workload consent ---
+
+func TestAnEmptyWorkloadListAcceptsEveryCatalogueWorkload(t *testing.T) {
+	// The default has to be "everything in the catalogue", because the
+	// catalogue is already the thing the operator consented to when they
+	// enabled compute. An empty list meaning "nothing" would silently switch
+	// off every existing node the day this field shipped.
+	policy := enabled().Normalise()
+	for _, name := range []string{"embed", "anything-added-later"} {
+		if !policy.AcceptsWorkload(name) {
+			t.Errorf("an empty workload list refused %q", name)
+		}
+	}
+}
+
+func TestAWorkloadListIsAnAllowlist(t *testing.T) {
+	policy := enabled()
+	policy.Workloads = []string{"embed"}
+	policy = policy.Normalise()
+	if !policy.AcceptsWorkload("embed") {
+		t.Fatal("refused a workload the operator listed")
+	}
+	if policy.AcceptsWorkload("render") {
+		t.Fatal("accepted a workload the operator did not list")
+	}
+}
+
+// THE REGRESSION THIS FILE EXISTS TO PREVENT.
+//
+// computeworker's Admit calls AcceptsClass with a DEVICE string. If workload
+// names were routed through JobClasses instead of their own list, the first
+// operator to opt into a workload would turn an empty class list into a
+// non-empty allowlist containing no device — and every device check would fall
+// through it and refuse ALL work, permanently, with retryable:false.
+func TestAWorkloadListDoesNotStopDeviceWork(t *testing.T) {
+	policy := Policy{Enabled: true, OfferCPU: true, Workloads: []string{"embed"}}.Normalise()
+	if !policy.AcceptsClass("cpu") {
+		t.Fatal("opting into a workload refused the device the operator lent")
+	}
+	// And the whole node, not just the class check: a governor with this policy
+	// must still grant cores.
+	governor := &Governor{Policy: policy, Profile: eightCores(), Sensors: idleMachine()}
+	if grant := governor.Decide(0); !grant.Allowed() {
+		t.Fatalf("a node that opted into a workload stopped working: %q", grant.Reason)
+	}
+}
+
+// The same value in the WRONG list, kept as a demonstration of why there are
+// two. This is not a bug being asserted — it is AcceptsClass behaving exactly
+// as documented for a value that is not a device, which is precisely why a
+// workload name must never be put here.
+func TestAWorkloadNameInTheClassListWouldRefuseEveryDevice(t *testing.T) {
+	miswired := Policy{Enabled: true, OfferCPU: true, JobClasses: []string{"embed"}}.Normalise()
+	if miswired.AcceptsClass("cpu") {
+		t.Fatal("AcceptsClass changed meaning; the reason Workloads is a separate field no longer holds")
+	}
+}

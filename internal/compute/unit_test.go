@@ -309,3 +309,64 @@ func TestReplicasLeaveASpare(t *testing.T) {
 		t.Fatalf("replicas %d, want quorum(2)+1", got)
 	}
 }
+
+// --- M10: the two pinning models Runtime accepts ---
+
+func TestACatalogueReferenceIsAcceptedAsARuntime(t *testing.T) {
+	// The relaxation M10 needs: catalogue images are built and tagged locally,
+	// so there is no digest to pin until build.sh records one. Narrow on
+	// purpose — see the runtime rules test below.
+	embed, ok := LookupWorkload("embed")
+	if !ok {
+		t.Fatal("no embed workload to test against")
+	}
+	u := cpuUnit()
+	u.Runtime = embed.Image
+	if err := u.Validate(); err != nil {
+		t.Fatalf("refused the catalogue's own image: %v", err)
+	}
+}
+
+func TestASha256PrefixedDigestIsAcceptedAsARuntime(t *testing.T) {
+	// What a digest-pinned catalogue will carry once images are pinned by
+	// content. Accepting it now is what lets that change be a one-line edit to
+	// the table rather than a format change.
+	u := cpuUnit()
+	u.Runtime = "sha256:" + strings.Repeat("c", 64)
+	if err := u.Validate(); err != nil {
+		t.Fatalf("refused a sha256-prefixed digest: %v", err)
+	}
+}
+
+func TestAnArbitraryImageNameIsStillRefused(t *testing.T) {
+	// The rule the relaxation must not have broken. Only the exact strings in
+	// the catalogue pass; anything else that merely LOOKS like a reference is
+	// still a submitter naming code, which is what the digest rule prevented.
+	for _, runtime := range []string{
+		"ubuntu:latest",
+		"registry.local/compute-embed",
+		"registry.local/anything:latest",
+		"docker.io/library/alpine@sha256:" + strings.Repeat("d", 64),
+		"sha256:short",
+		"sha256:" + strings.Repeat("z", 64),
+	} {
+		u := cpuUnit()
+		u.Runtime = runtime
+		if err := u.Validate(); err == nil {
+			t.Errorf("accepted runtime %q", runtime)
+		}
+	}
+}
+
+func TestInputsAreStillStrictlyContentDigests(t *testing.T) {
+	// Only Runtime was relaxed. An input is fetched from a content-addressed
+	// store, which has nothing to resolve a name against — a named input is
+	// unfetchable rather than merely imprecise.
+	embed, _ := LookupWorkload("embed")
+	u := cpuUnit()
+	u.Runtime = embed.Image
+	u.Inputs = []string{embed.Image}
+	if err := u.Validate(); err == nil {
+		t.Fatal("accepted an image reference as an input blob")
+	}
+}

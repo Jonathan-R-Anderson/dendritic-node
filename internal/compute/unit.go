@@ -51,12 +51,41 @@ import (
 // identity, so any change makes it a different unit rather than a new version
 // of this one.
 type Unit struct {
-	// Runtime is the content digest of a signed catalogue image. NOT a name and
-	// NOT a URL — the submitter chooses from the catalogue and cannot supply
-	// code. This single field is the difference between running
+	// Runtime identifies the signed catalogue image. NOT submitter-supplied —
+	// the submitter chooses a workload NAME from the closed table and the node
+	// fills this in. That single fact is the difference between running
 	// operator-chosen code on attacker-chosen data and running attacker-chosen
-	// code in a sandbox, and nearly every sandbox escape starts from the
-	// latter.
+	// code in a sandbox, and nearly every sandbox escape starts from the latter.
+	//
+	// TWO PINNING MODELS LIVE IN THIS FIELD, AND THEY DISAGREE
+	// --------------------------------------------------------
+	// Validate accepts either of two shapes, and it is worth being honest about
+	// why there are two:
+	//
+	//  1. A CONTENT DIGEST — bare 64-hex, or "sha256:<64hex>". Self-describing:
+	//     a verifier fetching the unit knows exactly which bytes ran, and two
+	//     nodes cannot resolve it to different code. This is what the format was
+	//     designed for.
+	//
+	//  2. A CATALOGUE REFERENCE — the exact pinned reference of a workload in
+	//     catalogue.go, e.g. "registry.local/compute-embed:latest". This is a
+	//     TAG, and a tag is mutable. Two nodes that pulled it a week apart can be
+	//     running different code while agreeing about the unit's digest, and M5
+	//     would score their honest disagreement as a fault.
+	//
+	// The second is admitted because the catalogue images are built and tagged
+	// locally (compute-images/build.sh) and no digest exists to pin until they
+	// are. It is narrow on purpose: only strings that appear verbatim in the
+	// catalogue table pass, so "ubuntu:latest" is refused exactly as before —
+	// what is relaxed is which OPERATOR-CHOSEN images may be named, never
+	// whether a submitter may name one.
+	//
+	// WHAT WOULD CLOSE THE GAP: have build.sh record each image's repo digest
+	// and store "sha256:<hex>" in Workloads[...].Image. Validate needs no change
+	// for that — the digest branch already accepts it — and the mutable-tag hole
+	// closes the day the catalogue carries digests. Until then a node runs
+	// whatever its own registry holds under that tag, which is a trust
+	// assumption about the operator's machine rather than about the submitter.
 	Runtime string `json:"runtime"`
 
 	// Inputs are blob digests, fetched BY THE NODE before the container starts.
@@ -186,12 +215,36 @@ func (u Unit) Validate() error {
 	if !knownNeeds[u.Needs] {
 		return fmt.Errorf("%w: %q", ErrBadNeeds, u.Needs)
 	}
-	for _, digest := range append([]string{u.Runtime}, u.Inputs...) {
+	// Runtime and Inputs are checked SEPARATELY, and only Runtime is relaxed.
+	// Inputs are blobs the node fetches from the store, which is content
+	// addressed and has nothing to resolve a name against — a non-digest input
+	// is unfetchable rather than merely imprecise.
+	if !looksLikeRuntimeRef(u.Runtime) {
+		return fmt.Errorf("compute: %q is neither a content digest nor a catalogue image", u.Runtime)
+	}
+	for _, digest := range u.Inputs {
 		if !looksLikeDigest(digest) {
 			return fmt.Errorf("compute: %q is not a content digest", digest)
 		}
 	}
 	return nil
+}
+
+// looksLikeRuntimeRef implements the two pinning models documented on
+// Unit.Runtime: a content digest (bare or sha256-prefixed), or the verbatim
+// pinned reference of a workload in the closed catalogue table.
+//
+// The catalogue branch is membership, not pattern matching. A regex for
+// "looks like a registry reference" would accept every image on the volunteer's
+// machine, which is the whole thing the digest rule was there to prevent.
+func looksLikeRuntimeRef(s string) bool {
+	if looksLikeDigest(s) {
+		return true
+	}
+	if rest, found := strings.CutPrefix(s, "sha256:"); found {
+		return looksLikeDigest(rest)
+	}
+	return IsCatalogueRuntime(s)
 }
 
 func looksLikeDigest(s string) bool {
