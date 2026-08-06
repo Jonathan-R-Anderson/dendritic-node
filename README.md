@@ -21,11 +21,18 @@ and what to open on your router if you want to run a gateway from home.
 
 ## Build it
 
-You need [Go](https://go.dev/dl/) 1.25.12 or newer. Nothing else — the build
-uses `CGO_ENABLED=0`, so one machine can cross-compile every target.
+Everything below runs **from the root of this repository** — the folder holding
+`go.mod`, `cmd/` and `internal/`. There is no nested source directory to step
+into first. If `ls go.mod` shows the file, you are in the right place.
+
+You need [Go](https://go.dev/dl/). `go.mod` asks for **1.25.12**, but an older
+toolchain from 1.21 onwards works too: Go reads that line and downloads the
+required toolchain on its own, so `go version` reporting something older is not
+a problem and needs no action. Nothing else is required — the build sets
+`CGO_ENABLED=0`, so one machine can cross-compile every target and the result
+has no C library to match at run time.
 
 ```sh
-cd storage-client
 go mod download
 go test ./...
 ```
@@ -35,6 +42,33 @@ Build for the computer you're on:
 ```sh
 go build -trimpath -o syndichan-node ./cmd/syndichan-node
 ```
+
+That leaves a `syndichan-node` binary in the current directory. Run it with
+`./syndichan-node`. It reads (and on first run writes) its configuration at
+`~/.config/Syndichan/storage-node/config.json` on Linux, and prints the path it
+chose on the first line of its output.
+
+**A freshly built node needs an I2P router already running**, because it dials a
+SAM bridge at `127.0.0.1:7656` during startup and exits if nothing answers:
+
+```
+connect to local I2P SAM bridge at 127.0.0.1:7656: dial tcp ... connection refused
+```
+
+That message means the router is not up *yet*, not that the build is broken.
+SAM often lags the router by up to two minutes — the console on `:7657` comes up
+almost immediately while `:7656` stays closed — so check the port rather than
+the service:
+
+```sh
+ss -lnt | grep 7656        # nothing yet? wait, then look again
+```
+
+See *Install it* for getting a router running in the first place.
+
+If startup instead fails with a bare `timeout`, another `syndichan-node` is
+already running against the same data directory and holding its database lock.
+Only one instance may use a data directory at a time.
 
 Or build every release binary into `dist/`:
 
@@ -56,6 +90,49 @@ That produces:
 
 These are unsigned binaries. macOS Gatekeeper and Windows SmartScreen will warn
 about a build you downloaded rather than compiled yourself.
+
+### The other things you may need to build
+
+The binary is not the whole node. Two of these matter only if you lend compute,
+but they are easy to miss because nothing fails until a job is already running.
+
+**A container image, to run the node under Kubernetes or Docker:**
+
+```sh
+docker build -t registry.local/syndichan-node:latest .
+```
+
+`registry.local` is **not a real registry** — nothing can pull from it. Under
+k3s the image has to be handed to containerd directly, or the pod sits in
+`ImagePullBackOff`:
+
+```sh
+docker save registry.local/syndichan-node:latest -o node.tar
+sudo k3s ctr images import node.tar
+```
+
+**Catalogue images, if this node lends compute.** These live in the site
+repository under `compute-images/`, and the same "no real registry" rule applies
+— *every machine that runs compute jobs must build them locally*:
+
+```sh
+./compute-images/build.sh            # python, c, go and embed
+./compute-images/build.sh embed      # just one
+```
+
+A node missing a catalogue image does not refuse the job. It accepts it, returns
+a ticket, and then fails with `No such image` — which the network reads as a
+failed *execution* rather than a missing prerequisite, so it keeps being chosen.
+Build them before enabling compute.
+
+**A microVM rootfs, if you are running arbitrary submitted code:**
+
+```sh
+./compute-images/rootfs/build-rootfs.sh <dockerfile-dir> rootfs.ext4
+```
+
+This prints the image's SHA-256, which is its address on the network. Needs
+`mke2fs` (`e2fsprogs`).
 
 ## Run it as a storage node
 
