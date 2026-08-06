@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -44,14 +45,36 @@ const (
 const shardFetchTimeout = 3 * time.Minute
 
 type Store struct {
-	dir           string
-	db            *bolt.DB
-	dataShards    int
-	parityShards  int
-	chunkBytes    int
-	capacity      int64
-	mu            sync.RWMutex
-	allocationMu  sync.Mutex
+	dir          string
+	db           *bolt.DB
+	dataShards   int
+	parityShards int
+	chunkBytes   int
+	capacity     int64
+	mu           sync.RWMutex
+	allocationMu sync.Mutex
+	// usedBytes is the running total of stored shard bytes, maintained
+	// incrementally so the write path never measures the tree. Guarded by
+	// allocationMu, together with usedLoaded and inflight.
+	//
+	// It exists because ensureCapacity used to call UsedBytes() -- a
+	// filepath.Walk + lstat over every shard -- once per NEW shard, inside the
+	// global allocation lock. On a node holding ~100k shards that was ~0.7s per
+	// shard and, at 6 data + 3 parity shards per MiB, nine full walks per MiB of
+	// unique data: measured unique-write throughput of ~170 KiB/s, degrading as
+	// the tree grew, with concurrent PUTs serialised behind the lock. Uploads
+	// then outran the client's socket timeout and surfaced as connection errors.
+	usedBytes  int64
+	usedLoaded bool
+	// inflight counts writers currently materialising each shard ID. The last
+	// one to leave folds the shard's size into usedBytes exactly once; see
+	// finishShardWrite.
+	inflight map[string]int
+	// walks counts completed tree measurements. Read atomically; it is the hook
+	// the regression test uses to assert writes do not walk.
+	walks         int64
+	closeOnce     sync.Once
+	closed        chan struct{}
 	fetchShard    func(context.Context, string) ([]byte, error)
 	fetchManifest func(bucket, key string) (*Manifest, error)
 	advertise     func(string)
@@ -77,6 +100,7 @@ func Open(dir string, dataShards, parityShards, chunkBytes int, capacity int64) 
 	s := &Store{
 		dir: dir, db: db, dataShards: dataShards,
 		parityShards: parityShards, chunkBytes: chunkBytes, capacity: capacity,
+		inflight: make(map[string]int), closed: make(chan struct{}),
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{
@@ -101,10 +125,20 @@ func Open(dir string, dataShards, parityShards, chunkBytes int, capacity int64) 
 		db.Close()
 		return nil, err
 	}
+	// Measure once at startup so the first write does not pay for it, then keep
+	// the number honest in the background rather than on the write path. A
+	// failed measurement is not fatal -- Open never used to touch the shard
+	// tree, so refusing to start on it would be a new way to lose a node; the
+	// counter simply stays unloaded and the next reader measures it.
+	_ = s.reconcileUsedBytes()
+	go s.reconcileLoop(usageReconcileInterval)
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return s.db.Close()
+}
 
 func (s *Store) SetShardFetcher(fetcher func(context.Context, string) ([]byte, error)) {
 	s.mu.Lock()
@@ -347,14 +381,55 @@ func (s *Store) writeShard(id string, value []byte) error {
 		return errors.New("invalid shard digest")
 	}
 	path := s.shardPath(id)
+
+	// Only the dedup check and the capacity decision need the global lock. The
+	// file work below (mkdir, temp file, write, fsync, rename) runs unlocked so
+	// concurrent PUTs overlap on I/O instead of queueing behind one another.
+	//
+	// Releasing the lock before the rename is safe because the store is
+	// content-addressed: two writers of the same ID write to distinct temp files
+	// and rename byte-identical content onto the same final name, so whichever
+	// rename lands last leaves the correct bytes in place.
+	//
+	// The accounting is what needs care, since both writers see "absent" at the
+	// stat and both go on to rename. Resolved with the inflight refcount: each
+	// admitted writer claims a slot under the lock, and the LAST writer for that
+	// ID to finish re-stats the final path under the lock and adds the size once
+	// (finishShardWrite). A writer arriving after the rename takes the dedup
+	// early-return above and adds nothing, so every stored shard is counted
+	// exactly once regardless of how the racing writers interleave or which of
+	// them failed.
 	s.allocationMu.Lock()
-	defer s.allocationMu.Unlock()
 	if _, err := os.Stat(path); err == nil {
+		s.allocationMu.Unlock()
 		return nil
 	}
-	if err := s.ensureCapacity(int64(len(value))); err != nil {
+	if err := s.ensureCapacityLocked(int64(len(value))); err != nil {
+		s.allocationMu.Unlock()
 		return err
 	}
+	s.inflight[id]++
+	s.allocationMu.Unlock()
+
+	err := materializeShard(path, value)
+	s.finishShardWrite(id, path)
+	if err != nil {
+		return err
+	}
+
+	s.mu.RLock()
+	advertiser := s.advertise
+	s.mu.RUnlock()
+	if advertiser != nil {
+		go advertiser(id)
+	}
+	return nil
+}
+
+// materializeShard writes value to path durably and atomically. It holds no
+// store lock: it touches only this writer's own temp file plus a rename onto a
+// content-addressed name.
+func materializeShard(path string, value []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
@@ -379,20 +454,35 @@ func (s *Store) writeShard(id string, value []byte) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tempName, path); err != nil {
-		return err
-	}
-	s.mu.RLock()
-	advertiser := s.advertise
-	s.mu.RUnlock()
-	if advertiser != nil {
-		go advertiser(id)
-	}
-	return nil
+	return os.Rename(tempName, path)
 }
 
-func (s *Store) ensureCapacity(incoming int64) error {
-	used, err := s.UsedBytes()
+// finishShardWrite releases this writer's claim on id. The last writer out
+// decides the accounting from what is actually on disk, so a shard that any of
+// the racing writers managed to store is counted once and a shard none of them
+// stored is not counted at all.
+func (s *Store) finishShardWrite(id, path string) {
+	s.allocationMu.Lock()
+	defer s.allocationMu.Unlock()
+	s.inflight[id]--
+	if s.inflight[id] > 0 {
+		return
+	}
+	delete(s.inflight, id)
+	if !s.usedLoaded {
+		// Never measured, so there is no counter to keep current; the next
+		// measurement will pick the shard up.
+		return
+	}
+	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		s.usedBytes += info.Size()
+	}
+}
+
+// ensureCapacityLocked reports whether incoming bytes still fit. The caller must
+// hold allocationMu.
+func (s *Store) ensureCapacityLocked(incoming int64) error {
+	used, err := s.usedBytesLocked()
 	if err != nil {
 		return err
 	}
@@ -420,7 +510,7 @@ func (s *Store) SetCapacity(capacity int64) error {
 	}
 	s.allocationMu.Lock()
 	defer s.allocationMu.Unlock()
-	used, err := s.UsedBytes()
+	used, err := s.usedBytesLocked()
 	if err != nil {
 		return err
 	}
@@ -442,18 +532,120 @@ func encodeInt64(value int64) []byte {
 	return encoded
 }
 
+// UsedBytes reports stored shard bytes. It is a counter read, not a measurement:
+// callers poll it (the management UI, the capacity advertisement, the placement
+// admission check) and each poll used to walk the whole shard tree.
 func (s *Store) UsedBytes() (int64, error) {
+	s.allocationMu.Lock()
+	defer s.allocationMu.Unlock()
+	return s.usedBytesLocked()
+}
+
+// usedBytesLocked returns the cached usage, measuring the tree only if it has
+// never been measured. The caller must hold allocationMu.
+func (s *Store) usedBytesLocked() (int64, error) {
+	if s.usedLoaded {
+		return s.usedBytes, nil
+	}
+	total, err := s.measureUsedBytes()
+	if err != nil {
+		return 0, err
+	}
+	s.usedBytes = total
+	s.usedLoaded = true
+	return total, nil
+}
+
+// measureUsedBytes walks the shard tree and lstats every entry. This is the
+// expensive operation the cache exists to keep off the write path: seconds on a
+// node holding hundreds of thousands of shards. Call it from Open and from the
+// reconcile loop only.
+func (s *Store) measureUsedBytes() (int64, error) {
 	var total int64
 	err := filepath.Walk(filepath.Join(s.dir, "shards"), func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
+			// A shard deleted while the walk is in progress used to abort the
+			// whole measurement, and that error propagated out of writeShard and
+			// failed an unrelated upload. A vanished entry simply contributes
+			// nothing.
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
-		if info.Mode().IsRegular() {
+		// Count only content-addressed shard names, matching what the
+		// incremental accounting adds and subtracts. In particular this skips
+		// the .incoming-* temp files of writes in flight, which would otherwise
+		// be counted here and then counted again as shards after their rename.
+		if info.Mode().IsRegular() && len(info.Name()) == 64 {
 			total += info.Size()
 		}
 		return nil
 	})
-	return total, err
+	if err != nil {
+		return 0, err
+	}
+	atomic.AddInt64(&s.walks, 1)
+	return total, nil
+}
+
+// walkCount reports how many full tree measurements have run. Test hook.
+func (s *Store) walkCount() int64 { return atomic.LoadInt64(&s.walks) }
+
+// usageReconcileInterval is how often the cached usage is re-derived from disk.
+// Low frequency on purpose: incremental accounting is exact for every path that
+// goes through this package, and the reconcile is only there to absorb what does
+// not -- a crash between rename and accounting, a delete that lands on a shard
+// while it is still being written, or files an operator moved. Those all drift
+// the counter DOWN, the safe direction: an under-count never refuses a write on
+// a store that has room, and the next reconcile restores the truth.
+const usageReconcileInterval = time.Hour
+
+func (s *Store) reconcileLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-ticker.C:
+			_ = s.reconcileUsedBytes()
+		}
+	}
+}
+
+// reconcileUsedBytes re-derives the cached usage by measuring the tree. The walk
+// runs without allocationMu held so an hourly multi-second measurement does not
+// stall writers; the result is adopted only if no write is in flight, because a
+// shard renamed after the walk passed its directory would be counted by its
+// writer and missed by the walk. A skipped reconcile just waits for the next
+// tick -- drift correction is not time critical.
+func (s *Store) reconcileUsedBytes() error {
+	total, err := s.measureUsedBytes()
+	if err != nil {
+		return err
+	}
+	s.allocationMu.Lock()
+	defer s.allocationMu.Unlock()
+	if len(s.inflight) > 0 {
+		return nil
+	}
+	s.usedBytes = total
+	s.usedLoaded = true
+	return nil
+}
+
+// releaseUsedBytes discounts a shard that has just been removed from disk.
+func (s *Store) releaseUsedBytes(size int64) {
+	s.allocationMu.Lock()
+	defer s.allocationMu.Unlock()
+	if !s.usedLoaded {
+		return
+	}
+	s.usedBytes -= size
+	if s.usedBytes < 0 {
+		s.usedBytes = 0
+	}
 }
 
 func (s *Store) getManifest(bucket, key string) (*Manifest, error) {
@@ -711,14 +903,29 @@ func manifestShardIDs(manifest Manifest) []string {
 	return result
 }
 
+// removeUnreferenced deletes shards no manifest still points at. It is the only
+// place shard files are removed -- RejectAndRemove and DeleteObject both come
+// through here -- so it is also the only place that has to discount them. A
+// removal that is not discounted drifts the counter upward forever and
+// eventually refuses writes on a store that has room.
 func (s *Store) removeUnreferenced(candidates []string) error {
 	for _, shardID := range candidates {
 		referenced, err := s.shardReferenced(shardID)
 		if err != nil {
 			return err
 		}
-		if !referenced {
-			_ = os.Remove(s.shardPath(shardID))
+		if referenced {
+			continue
+		}
+		path := s.shardPath(shardID)
+		// Size has to be read before the unlink; afterwards there is nothing
+		// left to ask.
+		info, statErr := os.Stat(path)
+		if err := os.Remove(path); err != nil {
+			continue
+		}
+		if statErr == nil && info.Mode().IsRegular() {
+			s.releaseUsedBytes(info.Size())
 		}
 	}
 	return nil

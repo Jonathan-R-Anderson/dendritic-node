@@ -2,9 +2,20 @@ package store
 
 import (
 	"bytes"
+	"fmt"
+	"math/rand"
 	"os"
+	"sync"
 	"testing"
 )
+
+// distinctBytes returns deterministic pseudo-random content, so that shards of
+// different objects are genuinely different and never dedup into one another.
+func distinctBytes(seed int64, size int) []byte {
+	buf := make([]byte, size)
+	rand.New(rand.NewSource(seed)).Read(buf)
+	return buf
+}
 
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -87,6 +98,162 @@ func TestRejectRemovesAndDeniesObject(t *testing.T) {
 				t.Fatalf("shard %s remains after rejection", ref.ID)
 			}
 		}
+	}
+	// Rejection removes shards through removeUnreferenced, so it must give the
+	// bytes back to the usage counter as well.
+	used, err := storage.UsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != 0 {
+		t.Fatalf("usage is %d bytes after rejecting the only object, want 0", used)
+	}
+}
+
+// TestWritingManyShardsDoesNotWalkTheTree pins the property the fix is for:
+// storing new shards must not measure the shard tree. ensureCapacity used to
+// call UsedBytes() -- a filepath.Walk over every stored shard -- once per new
+// shard, inside the global allocation lock, which is what made unique writes
+// slow enough to outlive the client's socket timeout.
+func TestWritingManyShardsDoesNotWalkTheTree(t *testing.T) {
+	storage := openTestStore(t)
+	walksBefore := storage.walkCount()
+
+	shardSizes := make(map[string]int64)
+	for i := 0; i < 8; i++ {
+		manifest, err := storage.PutObject(
+			"test-bucket", fmt.Sprintf("object-%d.bin", i), "application/octet-stream",
+			bytes.NewReader(distinctBytes(int64(i)+1, 200<<10)),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, chunk := range manifest.Chunks {
+			for _, ref := range chunk.Shards {
+				shardSizes[ref.ID] = int64(ref.Size)
+			}
+		}
+	}
+	if len(shardSizes) < 100 {
+		t.Fatalf("test wrote only %d distinct shards; it is not exercising the path", len(shardSizes))
+	}
+	if walks := storage.walkCount() - walksBefore; walks != 0 {
+		t.Fatalf("writing %d distinct shards performed %d tree walks, want 0", len(shardSizes), walks)
+	}
+
+	var expected int64
+	for _, size := range shardSizes {
+		expected += size
+	}
+	used, err := storage.UsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != expected {
+		t.Fatalf("cached usage is %d bytes, want %d", used, expected)
+	}
+	if walks := storage.walkCount() - walksBefore; walks != 0 {
+		t.Fatalf("UsedBytes performed %d tree walks, want 0: polling callers must be cheap", walks)
+	}
+	// The cheap counter still has to agree with the expensive truth.
+	measured, err := storage.measureUsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if measured != used {
+		t.Fatalf("counter says %d bytes, disk says %d", used, measured)
+	}
+}
+
+func TestUsedBytesTracksWritesAndDeletes(t *testing.T) {
+	storage := openTestStore(t)
+	if used, err := storage.UsedBytes(); err != nil || used != 0 {
+		t.Fatalf("fresh store reports %d bytes (err %v), want 0", used, err)
+	}
+	if _, err := storage.PutObject(
+		"test-bucket", "keep.bin", "application/octet-stream",
+		bytes.NewReader(distinctBytes(11, 128<<10)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := storage.UsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.PutObject(
+		"test-bucket", "drop.bin", "application/octet-stream",
+		bytes.NewReader(distinctBytes(12, 128<<10)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	both, err := storage.UsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if both <= kept {
+		t.Fatalf("usage did not grow for the second object: %d then %d", kept, both)
+	}
+
+	if err := storage.DeleteObject("test-bucket", "drop.bin"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := storage.UsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != kept {
+		t.Fatalf("usage is %d bytes after deleting the second object, want %d", after, kept)
+	}
+	measured, err := storage.measureUsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if measured != after {
+		t.Fatalf("counter says %d bytes after a delete, disk says %d", after, measured)
+	}
+
+	if err := storage.DeleteObject("test-bucket", "keep.bin"); err != nil {
+		t.Fatal(err)
+	}
+	if empty, err := storage.UsedBytes(); err != nil || empty != 0 {
+		t.Fatalf("usage is %d bytes (err %v) after deleting everything, want 0", empty, err)
+	}
+}
+
+// TestConcurrentWritersOfOneShardCountItOnce covers the accounting race opened
+// up by writing outside the allocation lock: several writers of the same
+// content-addressed shard all see it absent, all rename identical bytes onto
+// the same name, and exactly one of them may charge for it.
+func TestConcurrentWritersOfOneShardCountItOnce(t *testing.T) {
+	storage := openTestStore(t)
+	value := distinctBytes(99, 32<<10)
+	id := digest(value)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := storage.writeShard(id, value); err != nil {
+				t.Errorf("writeShard: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	used, err := storage.UsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != int64(len(value)) {
+		t.Fatalf("16 writers of one shard accounted for %d bytes, want %d", used, len(value))
+	}
+	measured, err := storage.measureUsedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if measured != used {
+		t.Fatalf("counter says %d bytes, disk says %d", used, measured)
 	}
 }
 
