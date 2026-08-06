@@ -122,8 +122,24 @@ type Config struct {
 	DataDir  string `json:"data_dir"`
 	S3Listen string `json:"s3_listen"`
 	// CacheOnly: serve our own content but host nothing for other peers.
-	CacheOnly     bool     `json:"cache_only"`
-	UIListen      string   `json:"ui_listen"`
+	CacheOnly bool   `json:"cache_only"`
+	UIListen  string `json:"ui_listen"`
+	// UIUsername / UIPassword guard the management dashboard. They are only
+	// consulted -- and only REQUIRED -- when ui_listen is not loopback, because
+	// a loopback page is already limited to whoever is sitting at the machine.
+	// The moment the page is reachable from the local network it can change the
+	// payout address, the storage paths and the compute switches for anyone who
+	// finds the port, so a credential stops being optional.
+	//
+	// The password is stored as typed, in a file that is already mode 0600 and
+	// already holds secret_key. Hashing it would protect nothing here: anyone
+	// who can read this file can read the S3 secret, or simply write a password
+	// of their own and restart the node. What it would cost is a key-derivation
+	// run on every request -- HTTP Basic re-sends the credential on each poll of
+	// /api/status, so a KDF would hand any unauthenticated LAN host a cheap way
+	// to burn this node's CPU. Use a password you do not use anywhere else.
+	UIUsername    string   `json:"ui_username,omitempty"`
+	UIPassword    string   `json:"ui_password,omitempty"`
 	P2PListen     []string `json:"p2p_listen"`
 	I2PSAM        string   `json:"i2p_sam"`
 	I2PHTTPProxy  string   `json:"i2p_http_proxy"`
@@ -604,6 +620,13 @@ func (c Config) ValidateForRole(role Role) error {
 	if err := c.validateRole(role); err != nil {
 		return err
 	}
+	// Checked for EVERY role, not only storage: main starts the management page
+	// in every mode -- it is where a gateway-only node is configured at all --
+	// so a gateway host that binds it to the world is exactly as exposed as a
+	// storage host that does.
+	if err := c.validateDashboard(); err != nil {
+		return err
+	}
 	if role.NeedsStorage() {
 		if err := c.validateStorage(); err != nil {
 			return err
@@ -632,10 +655,97 @@ func (c Config) validateRole(role Role) error {
 	}
 }
 
+// DefaultDashboardUsername is the Basic-auth user the management page asks for
+// when ui_username is left blank. The username is not the secret; naming it
+// saves the operator from having to guess what to type into the browser.
+const DefaultDashboardUsername = "admin"
+
+// minDashboardPasswordLength is deliberately longer than a person's habitual
+// password. The page is reachable from a whole network the moment it leaves
+// loopback, there is no lockout, and a short password on an admin panel is
+// found by a script long before it is found by a person.
+const minDashboardPasswordLength = 12
+
+// DashboardUsername is the credential the dashboard actually demands, with the
+// default filled in. Read this rather than UIUsername so the config file and
+// the running server can never disagree about who may log in.
+func (c Config) DashboardUsername() string {
+	if name := strings.TrimSpace(c.UIUsername); name != "" {
+		return name
+	}
+	return DefaultDashboardUsername
+}
+
+// ListenIsLoopback reports whether a host:port listen address is reachable only
+// from this machine. An address it cannot parse is reported as NOT loopback:
+// every caller uses this to decide whether to demand a password, and the safe
+// answer to "I do not know where this is bound" is "ask for the password".
+func ListenIsLoopback(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return false
+	}
+	return isLoopback(host)
+}
+
+// validateDashboard covers ui_listen and the credential that guards it.
+//
+// The management page can change the payout address, the storage paths and the
+// compute switches, so the question is never "may it be reachable" on its own
+// but "reachable by whom, and holding what". Three rules answer that:
+//
+//   - Loopback stays exactly as it was, credential-free. Whoever reaches it is
+//     already sitting at the machine, and every existing config keeps working.
+//   - Off (empty ui_listen) stays valid. A rented server administered over SSH
+//     should be able to not run the page at all rather than run something the
+//     operator cannot reach and would not want reachable.
+//   - Anything else must be a private address AND carry a password.
+func (c Config) validateDashboard() error {
+	if c.UIListen == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(c.UIListen)
+	if err != nil {
+		return fmt.Errorf("invalid listen address %q: %w", c.UIListen, err)
+	}
+	if isLoopback(host) {
+		return nil
+	}
+	// 0.0.0.0 and :: are refused even though they are the obvious thing to
+	// type, and refused BEFORE the password rule so the operator is told the
+	// real problem. They bind every interface this machine has now or acquires
+	// later: the LAN address that was wanted, but also the public address of a
+	// rented server and the café Wi-Fi a laptop joins next week. A password
+	// would still be asked for, but a password over cleartext HTTP is not what
+	// should stand between an admin panel and the open internet. Naming the
+	// address makes the blast radius a decision instead of a side effect of
+	// however this machine happens to be routed today.
+	if address := net.ParseIP(strings.Trim(host, "[]")); address != nil && address.IsUnspecified() {
+		return fmt.Errorf("ui_listen %q binds every interface, including any public one; "+
+			"name the private address you mean instead (for example \"192.168.1.50:9090\")",
+			c.UIListen)
+	}
+	if !isLANOnly(host) {
+		return fmt.Errorf("ui_listen %q is publicly routable; the management dashboard may only "+
+			"be bound to loopback or a private address (10.x, 172.16-31.x, 192.168.x, "+
+			"169.254.x, or an IPv6 unique-local fc00::/7 address)", c.UIListen)
+	}
+	if strings.ContainsAny(c.UIUsername, ":\r\n") {
+		return errors.New("ui_username must not contain a colon or a newline")
+	}
+	if len(c.UIPassword) < minDashboardPasswordLength {
+		return fmt.Errorf("ui_listen %q makes the management dashboard reachable from your local "+
+			"network, so it must have a password: set \"ui_password\" in the config file to at "+
+			"least %d characters (\"ui_username\" is optional and defaults to %q)",
+			c.UIListen, minDashboardPasswordLength, DefaultDashboardUsername)
+	}
+	return nil
+}
+
 // validateStorage covers every setting that only a storage node consumes: the
 // loopback S3 gateway and its credentials, the erasure layout, the donated
-// capacity, the dashboard, and the I2P control endpoints. A gateway-only or
-// probe-only process starts none of these and must never reach this function.
+// capacity, and the I2P control endpoints. A gateway-only or probe-only process
+// starts none of these and must never reach this function.
 func (c Config) validateStorage() error {
 	if c.AccessKey == "" || len(c.SecretKey) < 32 {
 		return errors.New("S3 credentials are missing or too short")
@@ -651,20 +761,6 @@ func (c Config) validateStorage() error {
 	}
 	if c.CapacityBytes > 8<<50 {
 		return errors.New("capacity_bytes must not exceed 8 PiB")
-	}
-	// An empty ui_listen turns the dashboard OFF. That is the right posture for
-	// a rented server: the page has no authentication (it is loopback-only for
-	// exactly that reason), so an operator who administers over SSH should be
-	// able to not run it at all rather than run something they cannot reach and
-	// would not want reachable.
-	if c.UIListen != "" {
-		uiHost, _, err := net.SplitHostPort(c.UIListen)
-		if err != nil {
-			return fmt.Errorf("invalid listen address %q: %w", c.UIListen, err)
-		}
-		if !isLoopback(uiHost) {
-			return errors.New("the management dashboard must remain bound to loopback")
-		}
 	}
 	s3Host, _, err := net.SplitHostPort(c.S3Listen)
 	if err != nil {
@@ -931,6 +1027,24 @@ func isPrivateOrLocalHost(host string) bool {
 func isLoopback(host string) bool {
 	host = strings.Trim(host, "[]")
 	return host == "localhost" || net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
+}
+
+// isLANOnly extends isLoopback to the rest of the operator's own network:
+// RFC1918, IPv4 link-local and IPv6 unique-local. A packet addressed to one of
+// these cannot be routed to this machine from the internet, so binding here
+// widens the audience from "this machine" to "this network" and no further.
+//
+// 100.64.0.0/10 is deliberately NOT included. Some readers know it as their
+// Tailscale range, but it is carrier-grade NAT space, and on an ISP that uses
+// it the "local network" is every other subscriber on that carrier. When the
+// two meanings cannot be told apart from the address, the one that would be
+// embarrassing to be wrong about wins.
+func isLANOnly(host string) bool {
+	if isLoopback(host) {
+		return true
+	}
+	address := net.ParseIP(strings.Trim(host, "[]"))
+	return address != nil && (address.IsPrivate() || address.IsLinkLocalUnicast())
 }
 
 func randomToken(bytes int) string {

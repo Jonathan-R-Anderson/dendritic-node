@@ -43,8 +43,16 @@ nonce-replay, size, and per-minute limits, and binds each lease to one recipient
 
 Configuration, identity, metadata, and master-key files use owner-only
 permissions. Plaintext is encrypted while streaming into storage and is never
-staged in a temporary file. The dashboard is loopback-only and validates its
-Host header. The S3 API defaults to loopback; public binding requires TLS.
+staged in a temporary file. The dashboard defaults to loopback and validates its
+Host header. It may be moved to a private address (RFC1918, IPv4 link-local, or
+IPv6 unique-local) so it can be reached from the operator's own network; that
+requires `ui_password` of at least 12 characters, which is then demanded by HTTP
+Basic auth on every request and compared in constant time. `0.0.0.0` and `::`
+are refused with or without a password, because they also bind whatever public
+interface the machine has now or acquires later, and publicly routable addresses
+are refused outright. A non-loopback dashboard with no password configured
+serves 503 rather than opening. The S3 API defaults to loopback; public binding
+requires TLS.
 
 The libp2p host registers only the custom I2P transport and advertises only
 `/garlic32` multiaddresses. Bootstrap and provider records containing IP, DNS,

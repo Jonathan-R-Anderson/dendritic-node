@@ -17,13 +17,19 @@ func validTestConfig(t *testing.T) Config {
 	return cfg
 }
 
-func TestDashboardMustRemainLoopback(t *testing.T) {
-	cfg := validTestConfig(t)
-	cfg.UIListen = "0.0.0.0:9090"
-	cfg.TLSCert = "cert.pem"
-	cfg.TLSKey = "key.pem"
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("public dashboard binding was accepted")
+// The dashboard may reach the operator's own network but never the internet,
+// and TLS on the S3 gateway does not buy it an exception: the two ports answer
+// to different rules because they answer to different people.
+func TestDashboardMustNotBecomePublic(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:9090", "[::]:9090", "198.51.100.10:9090"} {
+		cfg := validTestConfig(t)
+		cfg.UIListen = address
+		cfg.UIPassword = "correct-horse-battery-staple"
+		cfg.TLSCert = "cert.pem"
+		cfg.TLSKey = "key.pem"
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("public dashboard binding %s was accepted", address)
+		}
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	_ "embed"
 
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -55,6 +56,88 @@ type Server struct {
 	// Config access (wired by main). Without it the config panels are absent.
 	cfgSnapshot func() config.Config
 	cfgApply    func(func(*config.Config) error) error
+	// listen is the address this page is served on, and it is what decides
+	// whether a password is demanded -- the server asks where it is bound
+	// rather than being told whether to authenticate. The two cannot then
+	// disagree: there is no way to wire up a LAN-reachable dashboard and forget
+	// to turn authentication on.
+	listen string
+	// SHA-256 of the expected credential. Digests rather than the strings
+	// themselves so the comparison is over fixed-length values: a byte-wise
+	// compare of the raw password would take a length-dependent amount of time
+	// and leak how long the password is even when constant-time within a
+	// length. authSet distinguishes "no password configured" from "the password
+	// is the empty string", which must never be accepted.
+	authUser, authPass [sha256.Size]byte
+	authSet            bool
+}
+
+// SetAccessControl tells the dashboard where it is bound and what credential to
+// demand. Bound to loopback, the credential is ignored and the page behaves as
+// it always has. Bound anywhere else, every request must carry it -- and if
+// none was configured the page refuses to serve at all rather than opening the
+// node's settings to the network. Kept off New() so existing callers and tests
+// are unaffected; a Server nobody called this on is loopback-only.
+func (s *Server) SetAccessControl(listen, username, password string) {
+	s.listen = listen
+	s.authSet = password != ""
+	s.authUser = sha256.Sum256([]byte(username))
+	s.authPass = sha256.Sum256([]byte(password))
+}
+
+// reachableFromNetwork reports whether this page is served anywhere other than
+// loopback. An empty listen address means the caller never said, which happens
+// only in tests and in-process uses that are loopback by construction.
+func (s *Server) reachableFromNetwork() bool {
+	return s.listen != "" && !config.ListenIsLoopback(s.listen)
+}
+
+// authorize gates every request when the page is not on loopback.
+//
+// It runs before anything else, including the host check, so that a caller
+// without the password cannot learn anything from the difference between one
+// rejection and another.
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if !s.reachableFromNetwork() {
+		return true
+	}
+	if !s.authSet {
+		// Config validation refuses this combination, so reaching here means
+		// something bypassed it. Fail closed: an admin page with no password on
+		// a network is worse than no admin page.
+		http.Error(w, "the management dashboard is bound to a network address but no "+
+			"ui_password is set; it will not serve until one is configured",
+			http.StatusServiceUnavailable)
+		return false
+	}
+	user, password, ok := r.BasicAuth()
+	if ok {
+		userDigest := sha256.Sum256([]byte(user))
+		passwordDigest := sha256.Sum256([]byte(password))
+		// Bitwise & rather than && so both comparisons always run: a
+		// short-circuit here would answer a wrong username faster than a wrong
+		// password and turn the username into something worth probing for.
+		match := subtle.ConstantTimeCompare(userDigest[:], s.authUser[:]) &
+			subtle.ConstantTimeCompare(passwordDigest[:], s.authPass[:])
+		if match == 1 {
+			return true
+		}
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="Syndichan node", charset="UTF-8"`)
+	http.Error(w, "the management dashboard requires the ui_username and ui_password "+
+		"from this node's config file", http.StatusUnauthorized)
+	return false
+}
+
+// validRequestHost is validDashboardHost plus the address this page was
+// deliberately bound to. The rebinding defence is unchanged in substance: an
+// attacker's domain still does not match, because the check is an exact match
+// against a literal address the operator chose, never a name lookup.
+func (s *Server) validRequestHost(value string) bool {
+	if validDashboardHost(value) {
+		return true
+	}
+	return s.listen != "" && strings.EqualFold(value, s.listen)
 }
 
 // SetStoragePaths tells the dashboard where shards live and how to persist a
@@ -77,7 +160,10 @@ func New(storage *store.Store, node NodeInfo, logger *log.Logger) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !validDashboardHost(r.Host) {
+	if !s.authorize(w, r) {
+		return
+	}
+	if !s.validRequestHost(r.Host) {
 		http.Error(w, "invalid dashboard host", http.StatusMisdirectedRequest)
 		return
 	}
@@ -130,6 +216,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// validDashboardHost is the DNS-rebinding defence: a page that only ever
+// answers to a literal local address cannot be reached by a hostile site that
+// points its own domain at this machine.
 func validDashboardHost(value string) bool {
 	host, _, err := net.SplitHostPort(value)
 	if err != nil {

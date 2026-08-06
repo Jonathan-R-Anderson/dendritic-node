@@ -43,8 +43,6 @@ var storageRemovals = []struct {
 }{
 	{"missing S3 credentials", func(c *Config) { c.AccessKey, c.SecretKey = "", "" }},
 	{"short S3 secret", func(c *Config) { c.SecretKey = "too-short" }},
-	{"malformed dashboard address", func(c *Config) { c.UIListen = "not-an-address" }},
-	{"public dashboard address", func(c *Config) { c.UIListen = "0.0.0.0:9090" }},
 	{"missing S3 listen address", func(c *Config) { c.S3Listen = "" }},
 	{"missing storage capacity", func(c *Config) { c.CapacityBytes = 0 }},
 	{"missing erasure layout", func(c *Config) { c.DataShards, c.ParityShards = 0, 0 }},
@@ -57,6 +55,107 @@ var storageRemovals = []struct {
 		c.I2PSAM, c.I2PHTTPProxy = "", ""
 		c.CapacityBytes, c.DataShards, c.ParityShards, c.ChunkBytes = 0, 0, 0, 0
 	}},
+}
+
+// dashboardRules are NOT storage settings even though they used to be checked
+// with them. main starts the management page in every mode -- it is the only
+// way a gateway-only node is configured at all -- so a gateway host that binds
+// it to the world is exactly as exposed as a storage host that does, and every
+// role is held to the same rules.
+var dashboardRules = []struct {
+	name   string
+	mutate func(*Config)
+}{
+	{"malformed dashboard address", func(c *Config) { c.UIListen = "not-an-address" }},
+	{"dashboard on every interface", func(c *Config) { c.UIListen = "0.0.0.0:9090" }},
+	{"dashboard on every IPv6 interface", func(c *Config) { c.UIListen = "[::]:9090" }},
+	{"dashboard on a public address", func(c *Config) { c.UIListen = "198.51.100.10:9090" }},
+	{"dashboard on a LAN address with no password", func(c *Config) {
+		c.UIListen = "192.168.1.50:9090"
+	}},
+	{"dashboard on a LAN address with a guessable password", func(c *Config) {
+		c.UIListen, c.UIPassword = "192.168.1.50:9090", "hunter2"
+	}},
+	{"dashboard username smuggling a second field", func(c *Config) {
+		c.UIListen = "192.168.1.50:9090"
+		c.UIUsername, c.UIPassword = "admin:extra", "a-long-enough-password"
+	}},
+}
+
+func TestDashboardRulesApplyToEveryRole(t *testing.T) {
+	// RoleManagement included deliberately: it is the role that WRITES the
+	// config file, so it is the one that must not be able to persist a
+	// dashboard the other roles would refuse to start.
+	roles := []Role{RoleStorage, RoleGatewayOnly, RoleProbeOnly, RoleManagement}
+	for _, rule := range dashboardRules {
+		for _, role := range roles {
+			t.Run(rule.name+"/"+string(role), func(t *testing.T) {
+				cfg := probeCandidateConfig(t)
+				if role != RoleProbeOnly {
+					cfg = gatewayCandidateConfig(t)
+				}
+				rule.mutate(&cfg)
+				if err := cfg.ValidateForRole(role); err == nil {
+					t.Fatalf("%s accepted an exposed management dashboard", role)
+				}
+			})
+		}
+	}
+}
+
+// The capability the whole change exists for: the dashboard may move to the
+// operator's own network, but only there, and only behind a password.
+func TestDashboardOnPrivateAddressRequiresAPassword(t *testing.T) {
+	private := []string{
+		"192.168.1.50:9090", "10.0.0.4:9090", "172.16.3.9:9090",
+		"169.254.7.7:9090", "[fd00::1]:9090",
+	}
+	for _, address := range private {
+		cfg := gatewayCandidateConfig(t)
+		cfg.UIListen = address
+
+		cfg.UIPassword = ""
+		if err := cfg.ValidateForRole(RoleStorage); err == nil {
+			t.Fatalf("%s was accepted with no password", address)
+		} else if !strings.Contains(err.Error(), "ui_password") {
+			t.Fatalf("%s: error does not say what to set: %v", address, err)
+		}
+
+		cfg.UIPassword = "correct-horse-battery-staple"
+		if err := cfg.ValidateForRole(RoleStorage); err != nil {
+			t.Fatalf("%s with a password was rejected: %v", address, err)
+		}
+	}
+}
+
+// Nothing changes for the people already running it: loopback needs no
+// credential, and never asks for one.
+func TestLoopbackDashboardNeedsNoPassword(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:9090", "localhost:9090", "[::1]:9090"} {
+		cfg := gatewayCandidateConfig(t)
+		cfg.UIListen, cfg.UIUsername, cfg.UIPassword = address, "", ""
+		if err := cfg.ValidateForRole(RoleStorage); err != nil {
+			t.Fatalf("loopback dashboard %s was rejected: %v", address, err)
+		}
+	}
+}
+
+// 0.0.0.0 is the obvious thing to type and the wrong thing to accept: a
+// password does not make an admin page on every interface -- including the
+// public one of a rented server -- a good idea. The refusal must name the real
+// problem rather than sending the operator off to invent a password.
+func TestAnyInterfaceDashboardIsRefusedEvenWithAPassword(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:9090", "[::]:9090"} {
+		cfg := gatewayCandidateConfig(t)
+		cfg.UIListen, cfg.UIPassword = address, "correct-horse-battery-staple"
+		err := cfg.ValidateForRole(RoleStorage)
+		if err == nil {
+			t.Fatalf("%s was accepted", address)
+		}
+		if !strings.Contains(err.Error(), "every interface") {
+			t.Fatalf("%s: refusal does not explain itself: %v", address, err)
+		}
+	}
 }
 
 func TestGatewayOnlyIgnoresStorageConfiguration(t *testing.T) {
@@ -389,8 +488,9 @@ func TestPlaceholderACMEEmailIsRejected(t *testing.T) {
 }
 
 // An empty ui_listen means "no dashboard", which is a valid posture for a
-// server administered over SSH: the page is loopback-only and unauthenticated,
-// so an operator who cannot reach it should be able to not run it at all.
+// public server administered over SSH: the page may only be bound to loopback
+// or the operator's own private network, so someone who cannot reach it either
+// way should be able to not run it at all.
 func TestEmptyDashboardAddressDisablesItRatherThanFailing(t *testing.T) {
 	cfg := gatewayCandidateConfig(t)
 	cfg.UIListen = ""

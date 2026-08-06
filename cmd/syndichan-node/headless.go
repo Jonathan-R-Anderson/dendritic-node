@@ -13,9 +13,9 @@ import (
 // Running without a browser.
 //
 // The management page is convenient on a laptop and useless on a rented server:
-// it binds loopback only (deliberately — it has no authentication, so exposing
-// it would hand the node to anyone who found the port), which means an operator
-// with only SSH cannot reach it at all.
+// it binds loopback by default and may only be moved to a PRIVATE address, and
+// only with a ui_password (see config.validateDashboard) — so an operator with
+// only SSH into a public host cannot reach it at all, and should not want to.
 //
 // So every setting lives in the config JSON and can be edited with any text
 // editor, and the handful that people actually change on first run have flags.
@@ -101,12 +101,16 @@ func applyHeadlessFlags(f *headlessFlags, cfg *config.Config, path string) (bool
 	return false, nil
 }
 
-// redactedConfig blanks the S3 secret before printing. `--show-config` is the
-// thing an operator pastes into a support thread, and the secret authenticates
-// their storage gateway.
+// redactedConfig blanks the secrets before printing. `--show-config` is the
+// thing an operator pastes into a support thread, and these authenticate their
+// storage gateway and — when the dashboard is on a LAN address — every setting
+// on this node.
 func redactedConfig(cfg config.Config) config.Config {
 	if cfg.SecretKey != "" {
 		cfg.SecretKey = "(hidden — see the config file)"
+	}
+	if cfg.UIPassword != "" {
+		cfg.UIPassword = "(hidden — see the config file)"
 	}
 	return cfg
 }
@@ -119,8 +123,11 @@ func headlessSummary(cfg config.Config, path string) string {
 		payout = "NOT SET — this node will earn nothing (use --payout 0x…)"
 	}
 	ui := cfg.UIListen
-	if ui == "" {
+	switch {
+	case ui == "":
 		ui = "disabled"
+	case !config.ListenIsLoopback(ui):
+		ui += " (reachable from your local network, password required)"
 	}
 	return fmt.Sprintf("config %s | payout %s | dashboard %s", path, payout, ui)
 }

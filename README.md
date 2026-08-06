@@ -105,8 +105,10 @@ Out of the box you get:
 | Disk donated | 20 GiB |
 
 Open the dashboard to see what you're storing, change how much disk you donate,
-and reject anything you don't want to host. Both ports are loopback-only and
-should stay that way.
+and reject anything you don't want to host. Both ports are loopback by default.
+The S3 port should stay that way; the dashboard can be moved to your own LAN if
+you want to reach it from another machine — see
+[Reaching the dashboard from another machine on your network](#reaching-the-dashboard-from-another-machine-on-your-network).
 
 **Everything is configured in the config file, and the management page is one
 way to edit it.** Open `http://127.0.0.1:9090` and from there you can:
@@ -121,10 +123,49 @@ way to edit it.** Open `http://127.0.0.1:9090` and from there you can:
 Changes are written to the config file and most take effect the next time the
 node starts.
 
+### Reaching the dashboard from another machine on your network
+
+By default the page answers only on `127.0.0.1`, so it is limited to whoever is
+sitting at the machine. To open it from your laptop while the node runs on the
+box in the cupboard, point `ui_listen` at that machine's **LAN address** and set
+a password:
+
+```json
+{
+  "ui_listen": "192.168.1.50:9090",
+  "ui_username": "admin",
+  "ui_password": "a-long-password-you-use-nowhere-else"
+}
+```
+
+Then browse to `http://192.168.1.50:9090/` and the browser will ask for that
+username and password.
+
+Three rules are enforced, and the node refuses to start rather than bend them:
+
+- **A private address only.** `10.x`, `172.16–31.x`, `192.168.x`, `169.254.x`,
+  or an IPv6 unique-local `fc00::/7` address. A publicly routable address is
+  refused: this page can change your payout address.
+- **`0.0.0.0` and `::` are refused**, even with a password. They bind *every*
+  interface the machine has now or acquires later — the LAN one you meant, and
+  also the public one on a rented server, and the café Wi-Fi a laptop joins next
+  week. Name the address you actually mean.
+- **A password of at least 12 characters** whenever the address is not loopback.
+  There is no lockout, and anyone on the network can try. `ui_username` is
+  optional and defaults to `admin`.
+
+The password is stored as typed in the mode-0600 config file — the same file
+that already holds your S3 secret key — so **use one you do not use anywhere
+else**. It is hidden from `-show-config` output. It travels over plain HTTP on
+your LAN, which is why this is limited to networks you control.
+
+Leaving `ui_listen` on loopback needs no password and changes nothing.
+
 **On a server with no browser, use the flags instead.** The management page
-binds loopback only — deliberately, since it has no password — so an operator
-with only SSH cannot reach it at all. Every setting lives in the JSON and can be
-edited with any text editor; these are the handful people change on first run:
+binds loopback by default, and can only be moved to a private address (never a
+public one), so an operator with only SSH into a public host cannot reach it.
+Every setting lives in the JSON and can be edited with any text editor; these
+are the handful people change on first run:
 
 | Flag | What it does |
 | --- | --- |
@@ -749,6 +790,13 @@ failure recovery, the security model, and the roadmap — is in [`DCS.md`](DCS.m
   change the address in `config.json`.
 - **The dashboard won't let you lower your donated space** — you're storing
   more than the new limit. Remove some content first.
+- **`ui_listen … makes the management dashboard reachable from your local
+  network`** — you moved the dashboard off loopback, so it needs a password.
+  Set `ui_password` (12+ characters) in the config file, or put `ui_listen`
+  back to `127.0.0.1:9090`.
+- **`ui_listen … binds every interface` / `is publicly routable`** — the
+  dashboard may only be bound to loopback or a private LAN address. Use the
+  machine's actual `192.168.x` / `10.x` address rather than `0.0.0.0`.
 - **The gateway works locally but never gets verified** — it's a reachability
   problem, not a config problem. Work through the ports section above and test
   from another network.

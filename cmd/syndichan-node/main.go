@@ -301,6 +301,12 @@ func main() {
 		WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second,
 		MaxHeaderBytes: 32 << 10,
 	}
+	// Told where it is bound, so the page decides for itself whether to demand
+	// a password. Wired here, next to the server it belongs to, rather than in
+	// the start-up block further down: the handler must never exist in a state
+	// where it is reachable from the network and does not know it.
+	uiServer.Handler.(*ui.Server).SetAccessControl(
+		cfg.UIListen, cfg.DashboardUsername(), cfg.UIPassword)
 	// The live load graph, only when compute is on. A node lending nothing shows
 	// no meter rather than a flat line: a graph of nothing invites the reader to
 	// conclude the machine is idle when nothing is measuring it.
@@ -774,7 +780,18 @@ func main() {
 	// A headless server administered over SSH cannot reach a loopback page
 	// anyway, and running an unauthenticated one it never uses is pure surface.
 	if cfg.UIListen != "" {
-		logger.Printf("starting management page on http://%s/", cfg.UIListen)
+		if config.ListenIsLoopback(cfg.UIListen) {
+			logger.Printf("starting management page on http://%s/ (this machine only)", cfg.UIListen)
+		} else {
+			// Said plainly, and said at every start rather than only at the one
+			// where it was configured. An operator who did this by accident --
+			// or inherited a config that did -- finds out from the log the
+			// first time they read it, not from whoever finds the port.
+			logger.Printf("starting management page on http://%s/ — REACHABLE FROM YOUR LOCAL "+
+				"NETWORK, not just this machine. It asks for the ui_username (%q) and "+
+				"ui_password from %s. Set ui_listen to 127.0.0.1:9090 to make it local again.",
+				cfg.UIListen, cfg.DashboardUsername(), path)
+		}
 		go serve(uiServer, cfg, logger, "management page")
 	} else {
 		uiServer = nil
