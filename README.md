@@ -136,9 +136,28 @@ This prints the image's SHA-256, which is its address on the network. Needs
 
 ## Install it
 
-`scripts/install.sh` does the whole Linux setup: it finds what is missing,
-installs it, and leaves the node running as a non-root service that comes back
-after a reboot.
+**One line, on Linux:**
+
+```sh
+curl -fsSL https://syndichan.org/install.sh | sh
+```
+
+That fetches a prebuilt binary for this machine's architecture, verifies its
+published SHA-256 before running anything, installs an I2P router if SAM is not
+already answering, and leaves the node running as a non-root systemd service
+that comes back after a reboot. It prints the plan and asks before it changes
+anything; `| sh -s -- --check` prints the plan and stops. The script is served
+as plain text — open <https://syndichan.org/install.sh> and read it first.
+
+Its source is `backend/static/install.sh` in the site repository, because the
+file the site serves and the file that was reviewed have to be the same file.
+
+**From source**, which is what the rest of this section covers:
+`scripts/install.sh` does the whole Linux setup — it finds what is missing,
+installs it, builds the binary here, and leaves the node running as a non-root
+service that comes back after a reboot. Use it when you want the compute/DCS
+role, an OpenRC machine, or a binary you compiled yourself; the one-liner does
+none of those.
 
 **Start with `--check`.** It runs every detection and changes nothing:
 

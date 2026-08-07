@@ -288,8 +288,17 @@ func TestBackfillPushesShardsStoredWhilePeerless(t *testing.T) {
 	// With no peers there is nowhere to push, so the pass must be a no-op --
 	// in particular it must not mark the object done and skip it forever.
 	source.replicateOnce(ctx)
-	if len(source.replicated) != 0 {
-		t.Fatal("backfill marked objects replicated while no peer was connected")
+	peerless, err := sourceStore.LoadObjectPlacement(manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !peerless.LastAttempt.IsZero() {
+		t.Fatal("backfill attempted an object while no peer was connected")
+	}
+	for _, shard := range peerless.Shards {
+		if len(shard.Holders) != 0 {
+			t.Fatalf("shard %s claims holders %v with no peer connected", shard.ShardID, shard.Holders)
+		}
 	}
 
 	// Coordinator stand-in: leases whatever the source asks for.
@@ -340,9 +349,39 @@ func TestBackfillPushesShardsStoredWhilePeerless(t *testing.T) {
 	if !bytes.Equal(stored, expected) {
 		t.Fatal("backfilled shard differs from the original")
 	}
-	// And a second pass does not push it all over again.
-	if _, done := source.replicated[manifest.ObjectID]; !done {
-		t.Fatal("object was not recorded as replicated")
+	// The peer that took it is recorded, so a reader can find it and the repair
+	// loop can later notice if it stops answering.
+	row, err := sourceStore.LoadObjectPlacement(manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holders := 0
+	for _, shard := range row.Shards {
+		if shard.ShardID == ref.ID {
+			holders = len(shard.Holders)
+			if holders == 1 && shard.Holders[0] != target.ID() {
+				t.Fatalf("shard recorded against %s, not the peer that took it", shard.Holders[0])
+			}
+		}
+	}
+	if holders != 1 {
+		t.Fatalf("shard has %d recorded holders, want 1", holders)
+	}
+
+	// And it is NOT retired from the queue. One peer cannot hold three distinct
+	// shards of a 3+2 chunk without stacking siblings on one host, so the object
+	// is still unrecoverable if this node dies. The old code marked it done here
+	// regardless of what landed -- which is exactly why the production counter
+	// drained while every volunteer's shard directory stayed empty.
+	if !row.UnderReplicated() {
+		t.Fatal("an object with one remote shard of three claimed to be durable")
+	}
+	queued, err := sourceStore.DispersalCandidates(10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != 1 || queued[0].ObjectID != manifest.ObjectID {
+		t.Fatal("object was retired from the queue with only 1 of 3 shards off-node")
 	}
 }
 

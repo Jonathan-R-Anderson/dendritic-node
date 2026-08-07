@@ -44,6 +44,7 @@ import (
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
 	"github.com/syndichan/maniwani/storage-client/internal/heartbeat"
 	syndii2p "github.com/syndichan/maniwani/storage-client/internal/i2p"
+	"github.com/syndichan/maniwani/storage-client/internal/placement"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 	"github.com/syndichan/maniwani/storage-client/internal/traffic"
 )
@@ -173,8 +174,16 @@ type Node struct {
 	peerMu          sync.RWMutex
 	bootstrapPeers  map[peer.ID]struct{}
 	i2pOnly         bool
-	replicaMu       sync.Mutex
-	replicated      map[string]struct{}
+	// candidateCache holds the storage peers the last discovery found, so one
+	// dispersal pass does not issue a DHT capacity query per chunk.
+	candidateMu    sync.Mutex
+	candidateCache []placement.Candidate
+	candidateAt    time.Time
+	// repairing is the single-flight set for repair. Keyed by shard id, so two
+	// passes -- or a pass overlapping the one before it -- can never regenerate
+	// and re-place the same shard twice at once. See repair.go.
+	repairMu  sync.Mutex
+	repairing map[string]struct{}
 	// cacheOnly nodes serve their own content but host nothing for anyone
 	// else; see the "store" branch of handleStream.
 	cacheOnly           bool
@@ -332,7 +341,7 @@ func finishNode(
 		host: h, dht: kad, store: storage, logger: logger, bootstrap: config.BootstrapURL,
 		bootstrapPeers: make(map[peer.ID]struct{}), http: httpClient,
 		directHTTP: directHTTP, i2pOnly: i2pOnly,
-		replicated: make(map[string]struct{}),
+		repairing: make(map[string]struct{}),
 		// Empty until the first bootstrap fetch, and empty reports STALE — so a
 		// node that has not yet learned the network offers no candidates rather
 		// than silently offering none and looking healthy.
@@ -367,6 +376,9 @@ func finishNode(
 	}
 	if storageEnabled {
 		go n.ReplicateStored(ctx)
+		// Dispersal makes an object redundant once. Repair keeps it that way
+		// when a holder goes away, which is the half that did not exist at all.
+		go n.RepairStored(ctx)
 	}
 	return n, nil
 }
@@ -1097,98 +1109,88 @@ func (n *Node) ReplicateStored(ctx context.Context) {
 	}
 }
 
+// dispersalCooldown is the minimum gap between dispersal attempts on the same
+// object. It is what makes the pass ROTATE instead of grinding: the queue is
+// ordered by last attempt, so five objects are tried, stamped, and stand aside
+// while the next five come forward. Without it a batch of five under-replicated
+// objects that never reach durability would be retried forever and the other
+// 11,635 would never be looked at once.
+const dispersalCooldown = 30 * time.Minute
+
+// enrolBatch bounds how many pre-ledger objects are enrolled per pass. One bolt
+// transaction, so the cost is one fsync rather than one per object.
+const enrolBatch = 1000
+
 func (n *Node) replicateOnce(ctx context.Context) {
 	if len(n.host.Network().Peers()) == 0 {
 		return
 	}
-	buckets, err := n.store.ListBuckets()
+	// Objects written before the ledger existed have no row, so they are
+	// invisible to the queue. Give them one.
+	if enrolled, pending, err := n.store.EnrolMissingPlacements(enrolBatch); err != nil {
+		n.logger.Printf("replicate: cannot enrol objects in the placement ledger: %v", err)
+	} else if enrolled > 0 {
+		n.logger.Printf("replicate: enrolled %d object(s) in the placement ledger, %d still to enrol",
+			enrolled, pending)
+	}
+
+	// The queue is now the LEDGER, not a rescan of every manifest in bolt
+	// filtered through an in-memory set. Two things change as a result: the
+	// order is least-recently-attempted first, so nothing starves; and the
+	// "done" state survives a restart, so a process bounce no longer replays
+	// the entire catalogue from the top of bolt key order.
+	candidates, err := n.store.DispersalCandidates(replicateBatch, dispersalCooldown)
 	if err != nil {
-		n.logger.Printf("replicate: cannot list buckets: %v", err)
+		n.logger.Printf("replicate: cannot read the placement ledger: %v", err)
 		return
 	}
-	pushed, remaining := 0, 0
-	for _, bucket := range buckets {
-		manifests, err := n.store.ListObjects(bucket, "")
+	pushed, underReplicated := 0, 0
+	for _, row := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		manifest, err := n.store.HeadObject(row.Bucket, row.Key)
 		if err != nil {
+			_ = n.store.ForgetPlacement(row.ObjectID)
 			continue
 		}
-		for _, manifest := range manifests {
-			if ctx.Err() != nil {
-				return
-			}
-			n.replicaMu.Lock()
-			_, already := n.replicated[manifest.ObjectID]
-			n.replicaMu.Unlock()
-			if already {
-				continue
-			}
-			// Bounded per pass. Every shard costs a coordinator lease fetched
-			// over the I2P outproxy plus a stream to the peer, so draining a
-			// large backlog in one pass would stall the node for hours and bury
-			// the lease service. Count the rest so the backlog is visible.
-			if pushed >= replicateBatch {
-				remaining++
-				continue
-			}
-			n.DistributeManifest(ctx, manifest)
-			n.replicaMu.Lock()
-			n.replicated[manifest.ObjectID] = struct{}{}
-			n.replicaMu.Unlock()
-			pushed++
+		result := n.DisperseObject(ctx, *manifest)
+		// ONLY a durable result retires the object.
+		//
+		// Whether the object is retired from the queue is now decided ONLY by
+		// the ledger: DispersalCandidates skips a row once every shard has a
+		// confirmed holder, and nothing else can take an object out.
+		//
+		// There used to be an in-memory `replicated` set, marked after a
+		// DistributeManifest that returned nothing and merely logged its
+		// failures -- so an object whose every push was refused went into it
+		// anyway, and stayed there for the life of the process. That is the
+		// whole explanation for the production symptom: "pushed 5 object(s),
+		// 11640 awaiting backfill" draining steadily while every volunteer's
+		// shard directory held zero files. "pushed" counted attempts, and
+		// "awaiting backfill" was a per-pass skip count over that set, so it
+		// fell by exactly replicateBatch every pass no matter what happened on
+		// the wire. Neither number ever referred to bytes arriving anywhere.
+		// The set is gone; the queue is durable and success-only.
+		if !result.Durable {
+			underReplicated++
 		}
+		pushed++
 	}
-	if pushed > 0 || remaining > 0 {
-		n.logger.Printf("replicate: pushed %d object(s), %d awaiting backfill", pushed, remaining)
-	}
-}
-
-func (n *Node) DistributeManifest(ctx context.Context, manifest store.Manifest) {
-	// Publish the chunk->shard map to the DHT first, so a DIFFERENT node (a DCS
-	// worker fetching the build context) can locate and reassemble this object by
-	// bucket+key. Best-effort: a young network may have nowhere to put it yet.
-	if err := n.PublishManifest(ctx, manifest); err != nil {
-		n.logger.Printf("could not publish manifest for %s: %v", manifest.ObjectID[:12], err)
-	}
-	peers := n.host.Network().Peers()
-	if len(peers) == 0 {
-		n.logger.Printf("object %s retained locally; no storage peers are connected", manifest.ObjectID[:12])
+	summary, summaryErr := n.store.PlacementStatus()
+	if pushed == 0 && summaryErr == nil && summary.UnderReplicated == 0 {
 		return
 	}
-	limit := make(chan struct{}, 4)
-	var wg sync.WaitGroup
-	shardNumber := 0
-	for _, chunk := range manifest.Chunks {
-		for _, ref := range chunk.Shards {
-			target := peers[shardNumber%len(peers)]
-			shardNumber++
-			if target == n.host.ID() {
-				continue
-			}
-			wg.Add(1)
-			go func(target peer.ID, ref store.ShardRef) {
-				defer wg.Done()
-				select {
-				case limit <- struct{}{}:
-					defer func() { <-limit }()
-				case <-ctx.Done():
-					return
-				}
-				value, err := n.store.ReadShard(ref.ID)
-				if err != nil {
-					return
-				}
-				lease, err := n.requestLease(ctx, target, manifest.ObjectID, ref.ID, int64(len(value)))
-				if err != nil {
-					n.logger.Printf("coordinator did not lease shard %s: %v", ref.ID[:12], err)
-					return
-				}
-				if err := n.storeOnPeer(ctx, target, manifest.ObjectID, ref.ID, value, lease); err != nil {
-					n.logger.Printf("peer %s rejected shard %s: %v", target, ref.ID[:12], err)
-				}
-			}(target, ref)
-		}
+	n.logger.Printf("replicate: %d object(s) attempted, %d still under-replicated afterwards",
+		pushed, underReplicated)
+	if summaryErr == nil {
+		// The only honest headline number. Every one of these is measured from
+		// confirmed holders, so an object counted as fully dispersed is one that
+		// dataShards+parityShards distinct peers each acknowledged a shard of.
+		n.logger.Printf(
+			"placement: %d object(s) tracked, %d under-replicated, %d with no remote copy at all, %d fully dispersed",
+			summary.Objects, summary.UnderReplicated, summary.LocalOnly, summary.FullyDispersed)
 	}
-	wg.Wait()
 }
 
 func (n *Node) requestLease(ctx context.Context, target peer.ID, objectID, shardID string, size int64) (*Lease, error) {
@@ -1297,11 +1299,35 @@ func (n *Node) storeOnPeer(ctx context.Context, target peer.ID, objectID, shardI
 	return nil
 }
 
-func (n *Node) FetchShard(ctx context.Context, shardID string) ([]byte, error) {
+// FetchShard retrieves a shard, trying the peers most likely to have it first.
+//
+// hints are the holders the placement ledger recorded for this shard. They come
+// first, ahead of the bootstrap set, and that ordering matters more than it
+// looks: n.bootstrapPeers is append-only and never pruned, and this file says
+// so itself ("it only records that a dial once succeeded... it cannot be used to
+// decide whether the node still has a network"). Every stale entry in it is a
+// fresh I2P dial worth up to i2pDialTimeout (2 minutes) charged against the
+// caller's 3-minute budget, so the provider lookup that actually knows the
+// answer was regularly never reached. A recorded holder is a node that
+// confirmed these exact bytes, which is the strongest evidence available.
+func (n *Node) FetchShard(ctx context.Context, shardID string, hints []string) ([]byte, error) {
 	if value, err := n.store.ReadShard(shardID); err == nil {
 		return value, nil
 	}
 	seen := make(map[peer.ID]struct{})
+	for _, hint := range hints {
+		candidate, err := peer.Decode(hint)
+		if err != nil || candidate == n.host.ID() {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if value, err := n.fetchFromPeer(ctx, candidate, shardID); err == nil {
+			return value, nil
+		}
+	}
 	n.peerMu.RLock()
 	var trusted []peer.ID
 	for candidate := range n.bootstrapPeers {
@@ -1309,6 +1335,9 @@ func (n *Node) FetchShard(ctx context.Context, shardID string) ([]byte, error) {
 	}
 	n.peerMu.RUnlock()
 	for _, candidate := range trusted {
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
 		seen[candidate] = struct{}{}
 		if value, err := n.fetchFromPeer(ctx, candidate, shardID); err == nil {
 			return value, nil

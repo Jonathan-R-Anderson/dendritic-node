@@ -75,7 +75,7 @@ type Store struct {
 	walks         int64
 	closeOnce     sync.Once
 	closed        chan struct{}
-	fetchShard    func(context.Context, string) ([]byte, error)
+	fetchShard    func(ctx context.Context, shardID string, hints []string) ([]byte, error)
 	fetchManifest func(bucket, key string) (*Manifest, error)
 	advertise     func(string)
 	distribute    func(Manifest)
@@ -105,7 +105,7 @@ func Open(dir string, dataShards, parityShards, chunkBytes int, capacity int64) 
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{
 			bucketBuckets, bucketObjects, bucketDenied, bucketRemote,
-			bucketSettings, bucketPolicies,
+			bucketSettings, bucketPolicies, bucketPlacement, bucketPlacementIndex,
 		} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
@@ -140,7 +140,14 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) SetShardFetcher(fetcher func(context.Context, string) ([]byte, error)) {
+// SetShardFetcher supplies the cross-node shard read.
+//
+// The fetcher takes holder HINTS: peer IDs the placement ledger recorded as
+// having confirmed the shard. Without them a miss degrades into a search --
+// every peer that ever connected, tried serially, each one worth a cold I2P
+// dial -- and the DHT provider lookup that actually knows the answer is
+// consulted last, frequently after the budget is already spent.
+func (s *Store) SetShardFetcher(fetcher func(ctx context.Context, shardID string, hints []string) ([]byte, error)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fetchShard = fetcher
@@ -351,6 +358,26 @@ func (s *Store) putObject(bucket, key, contentType string, r io.Reader, expected
 	})
 	if err == nil {
 		s.removeUnreferenced(oldShards)
+		if distribute {
+			// Enrol the object in the durable dispersal queue BEFORE handing it
+			// to the distributor, and in the same synchronous breath as the
+			// manifest commit. The queue used to be an in-memory set marked on
+			// ATTEMPT, so a process that died between the commit and the push
+			// left an object nothing would ever look at again.
+			//
+			// The write is acked here, with nine shards on local disk and zero
+			// confirmed remote holders. That is deliberate: a peer push needs a
+			// coordinator lease over an I2P outproxy and a cold I2P dial takes
+			// 20-60s, so blocking the S3 PUT on six confirmed remote shards
+			// would put minutes on the site's upload path and would fail
+			// outright whenever the network is young. What must never happen is
+			// claiming a durability that does not exist, which is why the row
+			// starts life under-replicated and only DurableRemoteShards
+			// confirmed holders clear it.
+			if placementErr := s.RecordObjectPlacement(*manifest); placementErr != nil {
+				return manifest, placementErr
+			}
+		}
 		s.mu.RLock()
 		distributor := s.distribute
 		s.mu.RUnlock()
@@ -696,28 +723,9 @@ func (s *Store) GetObject(bucket, key string, w io.Writer) (*Manifest, error) {
 	}
 	verifyHash := sha256.New()
 	for _, chunk := range manifest.Chunks {
-		shards := make([][]byte, manifest.DataShards+manifest.ParityShards)
-		for _, ref := range chunk.Shards {
-			value, err := os.ReadFile(s.shardPath(ref.ID))
-			if err != nil {
-				s.mu.RLock()
-				fetcher := s.fetchShard
-				s.mu.RUnlock()
-				if fetcher != nil {
-					// Budget above a cold I2P dial (i2pDialTimeout, 2m): a
-					// missing shard means discovering and dialling a provider
-					// over I2P, and a 20s ceiling expired mid-dial.
-					ctx, cancel := context.WithTimeout(context.Background(), shardFetchTimeout)
-					value, err = fetcher(ctx, ref.ID)
-					cancel()
-					if err == nil && digest(value) == ref.ID {
-						_ = s.writeShard(ref.ID, value)
-					}
-				}
-			}
-			if err == nil && digest(value) == ref.ID {
-				shards[ref.Index] = value
-			}
+		shards, err := s.gatherChunk(*manifest, chunk)
+		if err != nil {
+			return nil, err
 		}
 		if err := encoder.Reconstruct(shards); err != nil {
 			return nil, fmt.Errorf("reconstruct chunk %d: %w", chunk.Index, err)
@@ -738,6 +746,118 @@ func (s *Store) GetObject(bucket, key string, w io.Writer) (*Manifest, error) {
 		return nil, errors.New("stored object digest mismatch")
 	}
 	return manifest, nil
+}
+
+// gatherChunk collects enough shards of one chunk for Reed-Solomon to rebuild
+// it, reading local disk first and the network only for what is missing.
+//
+// WHY THIS IS NOT THE OLD LOOP
+// ----------------------------
+// The old loop fetched all dataShards+parityShards refs, serially, taking the
+// full shardFetchTimeout (3 minutes) on every miss. That was free while the
+// origin kept all nine shards locally and the remote branch was dead code. The
+// moment shards actually live on other nodes it is the hot path, and the
+// arithmetic does not survive contact: a 40 MB object is 39 chunks x 9 = 351
+// acquisitions, and at an optimistic 2s per I2P fetch that is 11.7 minutes
+// against the S3 server's 10-minute WriteTimeout -- over budget before a single
+// failure, and one dead peer alone costs 3 minutes.
+//
+// So: read every local copy first (cheap, and usually enough), stop the instant
+// dataShards distinct indexes are in hand, and fetch the remainder CONCURRENTLY
+// with a shared context that is cancelled as soon as the quorum is met. Fetching
+// 9 when 6 decode is 50% wasted network on every read.
+func (s *Store) gatherChunk(manifest Manifest, chunk ChunkManifest) ([][]byte, error) {
+	total := manifest.DataShards + manifest.ParityShards
+	if total <= 0 || manifest.DataShards <= 0 {
+		return nil, fmt.Errorf("chunk %d: invalid erasure layout %d+%d",
+			chunk.Index, manifest.DataShards, manifest.ParityShards)
+	}
+	shards := make([][]byte, total)
+	var missing []ShardRef
+	present := 0
+	for _, ref := range chunk.Shards {
+		// A manifest can arrive from the DHT, where records are deliberately
+		// unsigned and the validator checks only version, non-empty chunks and
+		// key derivation. An out-of-range Index would panic on the assignment
+		// below, which is a remote crash primitive, not a bad read.
+		if ref.Index < 0 || ref.Index >= total {
+			return nil, fmt.Errorf("chunk %d: shard index %d outside 0..%d",
+				chunk.Index, ref.Index, total-1)
+		}
+		if shards[ref.Index] != nil {
+			continue
+		}
+		value, err := os.ReadFile(s.shardPath(ref.ID))
+		if err == nil && digest(value) == ref.ID {
+			shards[ref.Index] = value
+			present++
+			continue
+		}
+		// Reached either because the file is absent or because it is present
+		// and rotted. The old code only fetched on a read ERROR, so a corrupt
+		// but readable shard was silently dropped and never repaired from a
+		// peer holding a good copy one hop away.
+		missing = append(missing, ref)
+	}
+	if present >= manifest.DataShards || len(missing) == 0 {
+		return shards, nil
+	}
+
+	s.mu.RLock()
+	fetcher := s.fetchShard
+	s.mu.RUnlock()
+	if fetcher == nil {
+		return shards, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), shardFetchTimeout)
+	defer cancel()
+	type result struct {
+		ref   ShardRef
+		value []byte
+	}
+	results := make(chan result, len(missing))
+	var wg sync.WaitGroup
+	for _, ref := range missing {
+		wg.Add(1)
+		go func(ref ShardRef) {
+			defer wg.Done()
+			if ctx.Err() != nil {
+				return
+			}
+			value, err := fetcher(ctx, ref.ID, s.HoldersForShard(ref.ID))
+			if err != nil || digest(value) != ref.ID {
+				return
+			}
+			select {
+			case results <- result{ref: ref, value: value}:
+			case <-ctx.Done():
+			}
+		}(ref)
+	}
+	go func() { wg.Wait(); close(results) }()
+
+	for item := range results {
+		if shards[item.ref.Index] == nil {
+			shards[item.ref.Index] = item.value
+			present++
+			// Keep a copy so the next read of this object is local. This is a
+			// cache, and it is why the origin refills itself on read: there is
+			// no eviction anywhere in this package, so a node that reads foreign
+			// objects grows forever. Left as-is deliberately -- adding eviction
+			// here without a reference model would delete shards this node is
+			// the only holder of.
+			_ = s.writeShard(item.ref.ID, item.value)
+		}
+		if present >= manifest.DataShards {
+			// Quorum. Cancel the stragglers rather than paying for them.
+			cancel()
+			break
+		}
+	}
+	// No sender can block: results is buffered to len(missing), so breaking out
+	// of the range above strands nothing.
+	return shards, nil
 }
 
 func (s *Store) ListObjects(bucket, prefix string) ([]Manifest, error) {
@@ -762,6 +882,7 @@ func (s *Store) ListObjects(bucket, prefix string) ([]Manifest, error) {
 
 func (s *Store) DeleteObject(bucket, key string) error {
 	var candidates []string
+	var objectID string
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		value := tx.Bucket(bucketObjects).Get(objectKey(bucket, key))
 		if value != nil {
@@ -770,11 +891,17 @@ func (s *Store) DeleteObject(bucket, key string) error {
 				return err
 			}
 			candidates = manifestShardIDs(manifest)
+			objectID = manifest.ObjectID
 		}
 		return tx.Bucket(bucketObjects).Delete(objectKey(bucket, key))
 	})
 	if err == nil {
 		s.removeUnreferenced(candidates)
+		if objectID != "" {
+			// Otherwise the dispersal pass keeps trying to place shards of an
+			// object that no longer exists, forever.
+			_ = s.forgetPlacement(objectID)
+		}
 	}
 	return err
 }
@@ -884,6 +1011,9 @@ func (s *Store) RejectAndRemove(kind, id string) error {
 	})
 	if err != nil {
 		return err
+	}
+	if kind == "object" {
+		_ = s.forgetPlacement(id)
 	}
 	for _, shardID := range candidates {
 		if err := s.removeUnreferenced([]string{shardID}); err != nil {
