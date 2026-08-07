@@ -35,10 +35,16 @@
 #   DO_BOOTSTRAP_GO     -> Go toolchain          -> bootstrap_go
 #   DO_BUILD_BINARY     -> syndichan-node binary -> build_binary
 #   DO_CREATE_USER      -> service account       -> create_user_and_dirs
-#   DO_ADD_DOCKER_GROUP -> docker group          -> install_compute_dropin
+#   DO_ADD_DOCKER_GROUP -> docker group          -> add_docker_group,
+#                                                    install_compute_dropin
 #   INSTALL_SERVICE     -> boot service, SAM readiness helper, data directory
 #
 # Add an action, add its row. A --check that under-promises is a lie.
+#
+# The same rule covers VALUES, not just actions: --check prints the data_dir it
+# resolved and the exact ReadWritePaths= line the unit will carry. A plan that
+# names one directory while the unit sandboxes another is the same lie in a
+# shape nobody thinks to check.
 
 # Deliberately NOT `set -o pipefail`. Detection is full of pipelines whose
 # reader exits early on purpose (`| grep -q`, `| grep -m1`), sending SIGPIPE to
@@ -145,7 +151,13 @@ Options:
   --yes, -y            Do not prompt for consent.
   --no-service         Do not create/enable the boot service. Boot-start is the
                        DEFAULT; this is the opt-out.
-  --with-compute       Also prepare Docker for the compute/DCS role.
+  --with-compute       Also prepare Docker (and the microVM path) for the
+                       compute/DCS role. Not needed just to make an EXISTING
+                       config work: if config.json already sets dcs.enabled
+                       (with dcs.role.worker) or compute.enabled, the installer
+                       sees that and fixes the service account's Docker access
+                       on its own -- it just will not INSTALL Docker unless you
+                       ask here.
   --binary PATH        Use this binary instead of discovering or building one.
   --data-dir PATH      Node data directory (default: /var/lib/syndichan). Must
                        be >=2 components deep, outside system directories, and
@@ -208,25 +220,37 @@ done
 #      either EMPTY or ALREADY OWNED by the service account -- the rule that
 #      makes "--data-dir /home/alice" impossible rather than discouraged.
 # The chown is never recursive, so a mistake past all four touches one inode.
-case "$DATA_DIR" in
-  /*) ;;
-  *) usage_error "--data-dir must be an absolute path" ;;
-esac
-case "$DATA_DIR" in
-  *"/../"*|*"/.."|*"/") usage_error "--data-dir must be a plain absolute path, no '..', no trailing slash" ;;
-esac
-# systemd cannot express these safely: % starts a specifier, and quotes and
-# backslashes break Exec parsing. A SPACE is fine, and is quoted everywhere.
-case "$DATA_DIR" in
-  *[!A-Za-z0-9._/+:@" "-]*)
-    usage_error "--data-dir may contain only letters, digits, spaces and . _ - + : @ /" ;;
-esac
-[ "$(dirname "$DATA_DIR")" = "/" ] &&
-  usage_error "--data-dir must be at least two components deep (e.g. /srv/syndichan, not $DATA_DIR)"
-case "$DATA_DIR" in
-  /usr|/usr/*|/etc|/etc/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run|/run/*|/root|/root/*)
-    usage_error "refusing a data directory inside a system path: $DATA_DIR" ;;
-esac
+#
+# Rules 1-3 are a function rather than a run of `case`s because a SECOND path
+# has to pass them: the data_dir read out of a config file that already exists
+# (see resolve_runtime_data_dir). One copy of the rules means the config path
+# can never be held to a weaker standard than the flag.
+data_dir_problem() { # -> the reason this path is unusable, or nothing
+  case "$1" in
+    /*) ;;
+    *) echo "must be an absolute path"; return 0 ;;
+  esac
+  case "$1" in
+    *"/../"*|*"/.."|*"/")
+      echo "must be a plain absolute path, no '..', no trailing slash"; return 0 ;;
+  esac
+  # systemd cannot express these safely: % starts a specifier, and quotes and
+  # backslashes break Exec parsing. A SPACE is fine, and is quoted everywhere.
+  case "$1" in
+    *[!A-Za-z0-9._/+:@" "-]*)
+      echo "may contain only letters, digits, spaces and . _ - + : @ /"; return 0 ;;
+  esac
+  [ "$(dirname "$1")" = "/" ] &&
+    { echo "must be at least two components deep (e.g. /srv/syndichan)"; return 0; }
+  case "$1" in
+    /usr|/usr/*|/etc|/etc/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run|/run/*|/root|/root/*)
+      echo "is inside a system path"; return 0 ;;
+  esac
+  return 0
+}
+
+DATA_DIR_PROBLEM="$(data_dir_problem "$DATA_DIR")"
+[ -n "$DATA_DIR_PROBLEM" ] && usage_error "--data-dir $DATA_DIR_PROBLEM (got: $DATA_DIR)"
 
 case "$CAPACITY_GIB" in
   "") ;;
@@ -752,6 +776,202 @@ detect_go() {
   return 0
 }
 
+# --- the configuration that will actually run -------------------------------
+#
+# ReadWritePaths= and the docker-group decision are properties of the CONFIG THE
+# SERVICE WILL LOAD, not of this script's defaults -- and the two stop agreeing
+# the moment a config already exists. A node whose config.json says
+# "data_dir": "/mnt/backup/website" started, then died with
+#
+#     open /mnt/backup/website/storage/metadata.db: read-only file system
+#
+# on a mount that was demonstrably rw, because ProtectSystem=strict makes
+# EVERYTHING read-only except ReadWritePaths, and ReadWritePaths named the
+# directory this installer had planned to create instead. The error names the
+# filesystem, so it sends the operator to check mounts and permissions; nothing
+# in it points at systemd. That is what these functions exist to prevent.
+#
+# NO jq. It is absent on most fresh servers, and an installer that needs a
+# JSON parser installed before it can read a config file is not an installer.
+# This is a one-pass awk scanner instead: POSIX awk only (Alpine has busybox
+# awk, not gawk), no recursion, no regexp cleverness.
+
+CONFIG_STATE="absent"     # absent | parsed | unreadable | unparsable | notools
+CONFIG_SCAN=""            # cached "dotted.key<TAB>value" lines
+CONFIG_DATA_DIR=""        # data_dir exactly as an existing config states it
+RUNTIME_DATA_DIR=""       # where the node will ACTUALLY write. What matters.
+RUNTIME_DATA_DIR_WHY=""   # one line for the plan, and for the operator
+RUNTIME_DATA_DIR_UNKNOWN=0 # 1 when the config's data_dir could not be honoured
+RW_PATHS=""               # the exact text of the unit's ReadWritePaths=
+
+# json_scan FILE -- one "dotted.key<TAB>value" line per scalar, objects only.
+#
+# Deliberately not a full JSON parser: it decodes ONLY the escape that cannot
+# change the meaning of a path (\/ -> /) and leaves every other escape as the
+# two literal characters it found. So a value that truly needed unescaping still
+# contains a backslash, which data_dir_problem then rejects -- the installer
+# refuses to guess rather than writing a path it half-understood. A literal
+# newline inside a string (invalid JSON, but files get hand-edited) is turned
+# into a visible \n for the same reason: it must not silently split a record.
+#
+# Values inside arrays are skipped, and a key is only reported when every level
+# above it is an object, so `[{"data_dir": "..."}]` cannot masquerade as a
+# top-level key.
+json_scan() {
+  awk '
+    function jpath(d,   p, t) {
+      p = ""
+      for (t = 1; t <= d; t++) { if (p != "") p = p "."; p = p key[t] }
+      return p
+    }
+    function emit(d, v,   t) {
+      if (d < 1 || key[d] == "") return
+      for (t = 1; t <= d; t++) if (kind[t] != "o") return
+      print jpath(d) "\t" v
+    }
+    { buf = buf $0 "\n" }
+    END {
+      n = length(buf); i = 1; depth = 0
+      while (i <= n) {
+        c = substr(buf, i, 1)
+        if (c == "\"") {
+          val = ""; i++
+          while (i <= n) {
+            ch = substr(buf, i, 1)
+            if (ch == "\\") {
+              nx = substr(buf, i + 1, 1)
+              if (nx == "/") val = val "/"; else val = val ch nx
+              i += 2; continue
+            }
+            if (ch == "\"") { i++; break }
+            if (ch == "\n") { val = val "\\n"; i++; continue }
+            val = val ch; i++
+          }
+          # A string is a KEY only if the next non-space character is a colon.
+          j = i
+          while (j <= n && index(" \t\r\n", substr(buf, j, 1)) > 0) j++
+          if (substr(buf, j, 1) == ":") {
+            if (kind[depth] == "o") key[depth] = val
+            i = j + 1
+            continue
+          }
+          emit(depth, val)
+          continue
+        }
+        if (c == "{" || c == "[") {
+          depth++
+          kind[depth] = (c == "{") ? "o" : "a"
+          key[depth] = ""
+          i++
+          continue
+        }
+        if (c == "}" || c == "]") { if (depth > 0) depth--; i++; continue }
+        if (index("-0123456789tfn", c) > 0) {   # number, true, false, null
+          val = ""
+          while (i <= n) {
+            ch = substr(buf, i, 1)
+            if (index("-+.eE0123456789abcdefglnrstu", ch) == 0) break
+            val = val ch; i++
+          }
+          emit(depth, val)
+          continue
+        }
+        i++
+      }
+    }
+  ' "$1"
+  return 0
+}
+
+config_field() { # config_field dotted.key -- empty when absent
+  [ -n "$CONFIG_SCAN" ] || return 0
+  printf '%s\n' "$CONFIG_SCAN" |
+    awk -F '\t' -v k="$1" '$1 == k { print substr($0, length($1) + 2); exit }'
+  return 0
+}
+
+read_effective_config() {
+  CONFIG_SCAN=""
+  if [ "$INSTALL_SERVICE" = "0" ]; then CONFIG_STATE="absent"; return 0; fi
+  if [ -r "$CONFIG_FILE" ]; then
+    :
+  elif [ -e "$CONFIG_FILE" ]; then
+    CONFIG_STATE="unreadable"; return 0
+  elif [ -d "$DATA_DIR" ] && [ ! -x "$DATA_DIR" ]; then
+    # 0700 and not ours: a config may well be in there and we cannot even stat
+    # it. Reporting "no configuration" here would be a guess presented as a fact.
+    CONFIG_STATE="unreadable"; return 0
+  else
+    CONFIG_STATE="absent"; return 0
+  fi
+  if ! have awk; then CONFIG_STATE="notools"; return 0; fi
+  CONFIG_SCAN="$(json_scan "$CONFIG_FILE" 2>/dev/null)" || CONFIG_SCAN=""
+  if [ -z "$CONFIG_SCAN" ]; then
+    # An empty scan is either a file that is not JSON at all or a JSON object
+    # with nothing in it -- "{}" is a perfectly good config, the node fills the
+    # rest in. Only the first is a reason to stop trusting the file.
+    if head -c 4096 "$CONFIG_FILE" 2>/dev/null | tr -d ' \t\r\n' | grep -q '^{'; then
+      CONFIG_STATE="parsed"
+    else
+      CONFIG_STATE="unparsable"
+    fi
+    return 0
+  fi
+  CONFIG_STATE="parsed"
+  CONFIG_DATA_DIR="$(config_field data_dir)"
+  return 0
+}
+
+# Sets RUNTIME_DATA_DIR (the one directory that MUST be writable) and RW_PATHS.
+# Both are reported by --check, because a plan that says one thing and a unit
+# that says another is how the failure above stayed confusing for so long.
+resolve_runtime_data_dir() {
+  read_effective_config
+  RUNTIME_DATA_DIR="$DATA_DIR"
+  RUNTIME_DATA_DIR_UNKNOWN=0
+  case "$CONFIG_STATE" in
+    absent)
+      RUNTIME_DATA_DIR_WHY="no config yet; the node will create one and use $DATA_DIR" ;;
+    unreadable)
+      RUNTIME_DATA_DIR_UNKNOWN=1
+      RUNTIME_DATA_DIR_WHY="CANNOT READ $CONFIG_FILE as $(id -un 2>/dev/null || echo "this user"), so its data_dir is UNKNOWN; re-run --check as root to resolve it" ;;
+    notools)
+      RUNTIME_DATA_DIR_UNKNOWN=1
+      RUNTIME_DATA_DIR_WHY="no awk on this machine, so $CONFIG_FILE could not be read; its data_dir is UNKNOWN" ;;
+    unparsable)
+      RUNTIME_DATA_DIR_UNKNOWN=1
+      RUNTIME_DATA_DIR_WHY="$CONFIG_FILE is not readable as JSON, so its data_dir is UNKNOWN" ;;
+    parsed)
+      if [ -z "$CONFIG_DATA_DIR" ]; then
+        # Absent key: config.Default() already filled DataDir in, and the unit
+        # sets HOME=$DATA_DIR, so os.UserConfigDir() lands UNDER the data dir.
+        RUNTIME_DATA_DIR_WHY="$CONFIG_FILE has no data_dir key; the node falls back to \$HOME/.config/Syndichan/storage-node, i.e. inside $DATA_DIR"
+      else
+        local problem; problem="$(data_dir_problem "$CONFIG_DATA_DIR")"
+        if [ -n "$problem" ]; then
+          # Refusing beats guessing: this is the one place where writing a path
+          # we do not trust would hand systemd a directory nobody vetted.
+          RUNTIME_DATA_DIR_UNKNOWN=1
+          RUNTIME_DATA_DIR_WHY="data_dir in $CONFIG_FILE $problem, so it will NOT be put in ReadWritePaths (it reads: $CONFIG_DATA_DIR)"
+        else
+          RUNTIME_DATA_DIR="$CONFIG_DATA_DIR"
+          RUNTIME_DATA_DIR_WHY="from data_dir in $CONFIG_FILE"
+        fi
+      fi ;;
+  esac
+
+  # The data dir ITSELF, never <data_dir>/storage: p2p.key, i2p.destination and
+  # content.key are written BESIDE storage/, not inside it. Widening to the
+  # storage subdirectory is exactly how this bug survived its first fix.
+  #
+  # $DATA_DIR stays in the list whatever the config says: config.json lives
+  # there, config.Save() rewrites it from the management page, and HOME points
+  # at it.
+  RW_PATHS="\"$DATA_DIR\""
+  [ "$RUNTIME_DATA_DIR" != "$DATA_DIR" ] && RW_PATHS="$RW_PATHS \"$RUNTIME_DATA_DIR\""
+  return 0
+}
+
 # --- service account, data directory, unit ----------------------------------
 
 detect_service_user() {
@@ -802,6 +1022,8 @@ detect_service_user() {
 }
 
 detect_data_dir() {
+  resolve_runtime_data_dir
+
   # Rule 4 of the data-directory contract: an existing directory is adopted only
   # if it is empty or already ours. That is what makes the chown safe rather
   # than merely guarded.
@@ -821,33 +1043,100 @@ detect_data_dir() {
     plan fix "data directory" "storage" "will create $DATA_DIR owned by $NODE_USER, mode 0700"
   fi
 
+  detect_runtime_data_dir
+
   # capacity_bytes defaults to 20 GiB and NOTHING in the node compares it to
-  # the disk.
+  # the disk. Measured on the RUNTIME data dir: that is the filesystem the
+  # shards land on, and it is routinely a different disk from the one holding
+  # config.json -- which is the whole reason a node gets pointed elsewhere.
   local avail want
-  avail="$(free_mib "$DATA_DIR")"
+  avail="$(free_mib "$RUNTIME_DATA_DIR")"
   want="$(( ${CAPACITY_GIB:-20} * 1024 ))"
   if [ -n "$avail" ]; then
     if [ "$avail" -lt "$want" ]; then
-      plan manual "free disk" "storage" "$((avail / 1024)) GiB free where $DATA_DIR will live, but the node would donate $((want / 1024)) GiB; pass --capacity-gib N"
+      plan manual "free disk" "storage" "$((avail / 1024)) GiB free where $RUNTIME_DATA_DIR will live, but the node would donate $((want / 1024)) GiB; pass --capacity-gib N"
     else
-      plan ok "free disk" "storage" "$((avail / 1024)) GiB free for a $((want / 1024)) GiB donation"
+      plan ok "free disk" "storage" "$((avail / 1024)) GiB free on $RUNTIME_DATA_DIR for a $((want / 1024)) GiB donation"
+    fi
+  fi
+  return 0
+}
+
+# The row this installer used not to have, and the unit line it produces. Both
+# are printed even when they are boring, because the operator's only defence
+# against a sandbox that silently excludes the data directory is being told
+# which directory the sandbox will actually allow.
+detect_runtime_data_dir() {
+  [ "$INSTALL_SERVICE" = "1" ] || return 0
+
+  if [ "$RUNTIME_DATA_DIR_UNKNOWN" = "1" ]; then
+    plan manual "node data_dir" "storage" \
+      "$RUNTIME_DATA_DIR_WHY. ReadWritePaths will name $DATA_DIR only; if the config points data_dir somewhere else, the node will fail to write there and blame the filesystem"
+  elif [ "$RUNTIME_DATA_DIR" != "$DATA_DIR" ]; then
+    plan ok "node data_dir" "storage" \
+      "$RUNTIME_DATA_DIR ($RUNTIME_DATA_DIR_WHY) -- the node writes storage/, p2p.key, i2p.destination and content.key THERE, not in $DATA_DIR"
+  elif [ "$CONFIG_STATE" = "parsed" ] && [ -z "$CONFIG_DATA_DIR" ]; then
+    plan manual "node data_dir" "storage" "$RUNTIME_DATA_DIR_WHY"
+  else
+    plan ok "node data_dir" "storage" "$RUNTIME_DATA_DIR ($RUNTIME_DATA_DIR_WHY)"
+  fi
+
+  [ "$SERVICE_MGR" = "systemd" ] || return 0
+  plan ok "ReadWritePaths" "boot service" \
+    "ReadWritePaths=$RW_PATHS -- ProtectSystem=strict makes every other path read-only TO THE SERVICE, whatever the mount says"
+
+  # A directory the config names but nobody has created yet is not a hazard on
+  # its own -- create_user_and_dirs makes it, because nothing can be taken over
+  # by creating it. It is worth a row because it also explains the chown.
+  if [ "$RUNTIME_DATA_DIR" != "$DATA_DIR" ] && [ "$CONFIG_STATE" = "parsed" ]; then
+    if [ -L "$RUNTIME_DATA_DIR" ]; then
+      plan manual "node data_dir owner" "storage" \
+        "$RUNTIME_DATA_DIR is a SYMLINK; it will be left alone (never chowned through), and listed in ReadWritePaths as it stands"
+    elif [ -e "$RUNTIME_DATA_DIR" ] && [ ! -d "$RUNTIME_DATA_DIR" ]; then
+      blocker "node data_dir owner" "storage" \
+        "$RUNTIME_DATA_DIR (data_dir in $CONFIG_FILE) exists and is not a directory"
+    elif [ ! -e "$RUNTIME_DATA_DIR" ]; then
+      plan fix "node data_dir owner" "storage" \
+        "will create $RUNTIME_DATA_DIR owned by $NODE_USER, mode 0700 (it does not exist, so nothing is being taken over)"
+    else
+      local owner; owner="$(stat -c '%U' "$RUNTIME_DATA_DIR" 2>/dev/null || echo "?")"
+      if [ "$owner" = "$NODE_USER" ]; then
+        plan ok "node data_dir owner" "storage" "$RUNTIME_DATA_DIR already belongs to $NODE_USER"
+      elif [ -z "$(ls -A "$RUNTIME_DATA_DIR" 2>/dev/null)" ]; then
+        plan fix "node data_dir owner" "storage" \
+          "$RUNTIME_DATA_DIR is empty; will be chowned to $NODE_USER (the leaf only, never recursively)"
+      else
+        # The same guard --data-dir gets, and it is NOT relaxed just because the
+        # path came from a config file. Left alone, said out loud.
+        plan manual "node data_dir owner" "storage" \
+          "$RUNTIME_DATA_DIR is NOT EMPTY and is owned by '$owner', not '$NODE_USER': it will NOT be chowned. It is in ReadWritePaths, so systemd permits writes -- but check that $NODE_USER can write there, or the node dies at startup"
+      fi
     fi
   fi
   return 0
 }
 
 detect_state_conflicts() {
-  if [ "$INSTALL_SERVICE" = "0" ]; then
-    plan skip "configuration" "all" "--no-service: the node creates its own on first run (~/.config/Syndichan/storage-node)"
-  elif [ -f "$CONFIG_FILE" ]; then
-    plan ok "configuration" "all" "$CONFIG_FILE exists; only the flags you passed will be applied to it"
-  else
-    plan fix "configuration" "all" "will be created BY THE NODE, running as $NODE_USER, at $CONFIG_FILE"
-  fi
+  case "$CONFIG_STATE" in
+    absent)
+      if [ "$INSTALL_SERVICE" = "0" ]; then
+        plan skip "configuration" "all" "--no-service: the node creates its own on first run (~/.config/Syndichan/storage-node)"
+      else
+        plan fix "configuration" "all" "will be created BY THE NODE, running as $NODE_USER, at $CONFIG_FILE"
+      fi ;;
+    parsed)
+      plan ok "configuration" "all" "$CONFIG_FILE exists and was read; only the flags you passed will be applied to it" ;;
+    unreadable)
+      # Said plainly rather than reported as "no configuration": everything
+      # below that depends on the config is a guess while this is true.
+      plan manual "configuration" "all" "$CONFIG_FILE (or $DATA_DIR) cannot be read by $(id -un 2>/dev/null || echo "this user"); re-run --check as root to see what the service will actually load" ;;
+    *)
+      plan manual "configuration" "all" "$CONFIG_FILE exists but could not be parsed here ($CONFIG_STATE); the node stays authoritative, but this script cannot read its data_dir" ;;
+  esac
   # Two instances on one data_dir collide on the bbolt flock in
   # <data_dir>/storage/metadata.db.
   if have pgrep && pgrep -f '[s]yndichan-node' >/dev/null 2>&1; then
-    plan manual "running node" "all" "a syndichan-node process is already running; make sure it is not using $DATA_DIR"
+    plan manual "running node" "all" "a syndichan-node process is already running; make sure it is not using $RUNTIME_DATA_DIR"
   fi
   # serve() calls logger.Fatalf, so a taken port takes down the WHOLE node.
   local port
@@ -877,9 +1166,46 @@ detect_state_conflicts() {
 # --- compute (opt-in) -------------------------------------------------------
 
 DOCKER_OK=0
+DOCKER_SOCK="/var/run/docker.sock"
+DOCKER_GROUP="docker"   # replaced by the group that actually owns the socket
+NEEDS_DOCKER=0
+DOCKER_FROM_CONFIG=0
+
+# The flag alone is not enough, and that is BUG-shaped rather than pedantic.
+# Whether the node talks to Docker is decided by its CONFIG -- dcs.enabled with
+# dcs.role.worker, or compute.enabled -- and an operator who switches DCS on
+# from the management page a month after installing never re-runs anything with
+# --with-compute. That node logs
+#
+#   dcs: Docker is not reachable at unix:///var/run/docker.sock
+#   (dial unix /var/run/docker.sock: connect: permission denied);
+#   worker not started. The node continues as a storage node.
+#
+# exactly once, at startup, and then quietly stores shards forever. So the
+# config is asked as well as the flag.
+config_wants_docker() {
+  [ "$CONFIG_STATE" = "parsed" ] || return 1
+  [ "$(config_field compute.enabled)" = "true" ] && return 0
+  [ "$(config_field dcs.enabled)" = "true" ] &&
+    [ "$(config_field dcs.role.worker)" = "true" ] && return 0
+  return 1
+}
+
 detect_docker() {
-  if [ "$WANT_COMPUTE" = "0" ]; then
-    plan skip "Docker Engine" "compute, DCS" "not requested (--with-compute)"
+  if [ "$WANT_COMPUTE" = "1" ]; then
+    NEEDS_DOCKER=1
+  elif config_wants_docker; then
+    NEEDS_DOCKER=1
+    DOCKER_FROM_CONFIG=1
+  fi
+  if [ "$NEEDS_DOCKER" = "0" ]; then
+    local basis="not requested (--with-compute)"
+    case "$CONFIG_STATE" in
+      parsed) basis="$basis, and $CONFIG_FILE leaves dcs.enabled/compute.enabled off" ;;
+      unreadable|notools|unparsable)
+        basis="$basis; $CONFIG_FILE could not be read here, so if it DOES enable DCS this node will log 'Docker is not reachable' once and run storage-only" ;;
+    esac
+    plan skip "Docker Engine" "compute, DCS" "$basis"
     return 0
   fi
   # The node CANNOT be trusted to detect this. internal/dcs/runtime.go
@@ -888,13 +1214,43 @@ detect_docker() {
   # cleanly; the COMPUTE path never pings, so a machine with no daemon stands up
   # the compute endpoints, answers "admitted" to jobs, then fails every one of
   # them at container creation.
-  local sock="/var/run/docker.sock"
+  local sock="$DOCKER_SOCK"
   if service_exists docker; then DOCKER_UNIT="$SERVICE_FOUND"; fi
+
+  # The group that owns the socket, not the name "docker" assumed. Rootless and
+  # hand-rolled daemons hand it to something else, and adding the service
+  # account to a group that does not gate the socket is a fix that changes
+  # nothing while looking like it worked.
+  if [ -S "$sock" ] && have stat; then
+    local g; g="$(stat -c '%G' "$sock" 2>/dev/null || echo "")"
+    case "$g" in
+      ""|UNKNOWN) ;;
+      root) DOCKER_GROUP="" ;;   # no membership can open it; only root can
+      *) DOCKER_GROUP="$g" ;;
+    esac
+  fi
+
+  local why="you passed --with-compute"
+  [ "$DOCKER_FROM_CONFIG" = "1" ] && why="$CONFIG_FILE switches DCS/compute on"
 
   if [ -S "$sock" ] && { { have curl && curl -s -o /dev/null --max-time 5 --unix-socket "$sock" http://localhost/_ping; } ||
                          { have docker && docker info >/dev/null 2>&1; }; }; then
     DOCKER_OK=1
-    plan ok "Docker Engine" "compute" "$sock answered"
+    plan ok "Docker Engine" "compute" "$sock answered ($why)"
+    detect_docker_group
+    return 0
+  fi
+
+  # Docker is INSTALLED only when it was asked for. A config that enables DCS is
+  # a statement about this node's role, not consent to install a container
+  # runtime on somebody's machine -- and --check must not fail over a dependency
+  # nobody asked this script to provide, because the node runs fine without it.
+  if [ "$DOCKER_FROM_CONFIG" = "1" ]; then
+    if [ ! -S "$sock" ]; then
+      plan manual "Docker Engine" "compute" "$why, but there is no $sock. Install Docker, or re-run with --with-compute; until then the node stays storage-only"
+    else
+      plan manual "Docker Engine" "compute" "$sock exists but did not answer /_ping as $(id -un 2>/dev/null || echo "this user") -- either the daemon is down, or this is the permission problem the docker group row below fixes"
+    fi
     detect_docker_group
     return 0
   fi
@@ -922,24 +1278,35 @@ detect_docker() {
   return 0
 }
 
+# Its own row because it is not a small thing (the docker group is
+# root-equivalent by design) and because it is the step whose ABSENCE is
+# invisible: nothing in the node's log says "the service user is not in the
+# docker group", only that the socket said permission denied.
 detect_docker_group() {
-  [ "$WANT_COMPUTE" = "1" ] || return 0
+  [ "$NEEDS_DOCKER" = "1" ] || return 0
   [ "$INSTALL_SERVICE" = "1" ] || return 0
-  # Its own row because it is not a small thing: the docker group is
-  # root-equivalent by design.
-  if ! have getent || ! getent group docker >/dev/null 2>&1; then
-    plan manual "docker group" "compute" "no docker group on this machine yet; re-run --check after Docker is installed"
+  if [ -z "$DOCKER_GROUP" ]; then
+    plan manual "docker group" "compute" \
+      "$DOCKER_SOCK is owned by group root, so NO group membership can open it. Give the socket a group (dockerd --group) or run the node as root -- this installer will do neither"
     return 0
   fi
-  if id -nG "$NODE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-    plan ok "docker group" "compute" "$NODE_USER is already in the docker group"
+  if ! have getent || ! getent group "$DOCKER_GROUP" >/dev/null 2>&1; then
+    plan manual "docker group" "compute" "no '$DOCKER_GROUP' group on this machine yet; re-run --check after Docker is installed"
+    return 0
+  fi
+  if id -nG "$NODE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$DOCKER_GROUP"; then
+    plan ok "docker group" "compute" "$NODE_USER is already in the '$DOCKER_GROUP' group"
     return 0
   fi
   DO_ADD_DOCKER_GROUP=1
+  local relax=""
+  [ "$WANT_COMPUTE" = "1" ] && relax=", which also turns off PrivateDevices and MemoryDenyWriteExecute for the microVM path"
   if [ "$SERVICE_MGR" = "systemd" ]; then
-    plan fix "docker group" "compute" "will add $NODE_USER to the docker group (ROOT-EQUIVALENT) and write $UNIT_DROPIN, which turns off PrivateDevices and MemoryDenyWriteExecute"
+    plan fix "docker group" "compute" \
+      "$NODE_USER is NOT in '$DOCKER_GROUP' -- this is what 'Docker is not reachable ... permission denied' in the journal means. Will add it (ROOT-EQUIVALENT) and write $UNIT_DROPIN with SupplementaryGroups=$DOCKER_GROUP$relax"
   else
-    plan fix "docker group" "compute" "will add $NODE_USER to the docker group (ROOT-EQUIVALENT)"
+    plan fix "docker group" "compute" \
+      "$NODE_USER is NOT in '$DOCKER_GROUP' -- this is what 'Docker is not reachable ... permission denied' in the journal means. Will add it (ROOT-EQUIVALENT)"
   fi
   return 0
 }
@@ -1010,12 +1377,18 @@ detect_kvm() {
 # ---------------------------------------------------------------------------
 
 print_plan() {
-  local i status label
-  printf '\n%sDependency report%s  (compute=%s, boot service=%s, data dir=%s)\n\n' \
+  local i status label wrote="" compute="no"
+  # The second path is printed only when it differs, and it differs exactly when
+  # somebody would otherwise be reading the wrong directory off this line.
+  [ -n "$RUNTIME_DATA_DIR" ] && [ "$RUNTIME_DATA_DIR" != "$DATA_DIR" ] &&
+    wrote=", node writes to=$RUNTIME_DATA_DIR"
+  [ "$WANT_COMPUTE" = "1" ] && compute="yes"
+  [ "$DOCKER_FROM_CONFIG" = "1" ] && compute="no, but the config enables DCS"
+  printf '\n%sDependency report%s  (compute=%s, boot service=%s, data dir=%s%s)\n\n' \
     "$C_BOLD" "$C_RESET" \
-    "$([ "$WANT_COMPUTE" = 1 ] && echo yes || echo no)" \
+    "$compute" \
     "$([ "$INSTALL_SERVICE" = 1 ] && echo yes || echo no)" \
-    "$DATA_DIR"
+    "$DATA_DIR" "$wrote"
   printf '  %-8s %-22s %-24s %s\n' "STATUS" "DEPENDENCY" "NEEDED FOR" "DETAIL"
   printf '  %-8s %-22s %-24s %s\n' "------" "----------" "----------" "------"
   i=0
@@ -1393,6 +1766,43 @@ create_user_and_dirs() {
   # No `--`: busybox install does not accept it, and DATA_DIR is absolute.
   run install -d -m 0700 "$DATA_DIR"
   run chown "$NODE_USER:$NODE_GROUP" "$DATA_DIR"
+
+  # The directory an EXISTING config points data_dir at. It is about to be named
+  # in ReadWritePaths, so it has to exist -- a ReadWritePaths= entry that does
+  # not exist makes systemd refuse to start the unit at all.
+  #
+  # It gets the SAME guards $DATA_DIR gets, not weaker ones. The difference is
+  # what happens when it fails them: this path is the operator's, chosen before
+  # this installer ran, usually with the node's own data already in it, so
+  # failing a guard means "leave it exactly as it is and say so", not "abort the
+  # install". Nothing here is ever chowned recursively either.
+  if [ -z "$RUNTIME_DATA_DIR" ] || [ "$RUNTIME_DATA_DIR" = "$DATA_DIR" ]; then
+    return 0
+  fi
+  if [ -L "$RUNTIME_DATA_DIR" ]; then
+    warn "data_dir in $CONFIG_FILE ($RUNTIME_DATA_DIR) is a SYMLINK; refusing to chown through it, leaving it alone"
+  elif [ -e "$RUNTIME_DATA_DIR" ] && [ ! -d "$RUNTIME_DATA_DIR" ]; then
+    die "data_dir in $CONFIG_FILE ($RUNTIME_DATA_DIR) exists and is not a directory"
+  elif [ ! -e "$RUNTIME_DATA_DIR" ]; then
+    step "Preparing $RUNTIME_DATA_DIR (data_dir from $CONFIG_FILE)"
+    run mkdir -p -- "$(dirname "$RUNTIME_DATA_DIR")"
+    run install -d -m 0700 "$RUNTIME_DATA_DIR"
+    run chown "$NODE_USER:$NODE_GROUP" "$RUNTIME_DATA_DIR"
+  else
+    local rowner; rowner="$(stat -c '%U' "$RUNTIME_DATA_DIR" 2>/dev/null || echo "?")"
+    if [ "$rowner" = "$NODE_USER" ]; then
+      note "$RUNTIME_DATA_DIR (data_dir from $CONFIG_FILE) already belongs to $NODE_USER"
+    elif [ -z "$(ls -A "$RUNTIME_DATA_DIR" 2>/dev/null)" ]; then
+      step "Taking ownership of the empty $RUNTIME_DATA_DIR (data_dir from $CONFIG_FILE)"
+      run chown "$NODE_USER:$NODE_GROUP" "$RUNTIME_DATA_DIR"
+    else
+      # Mode left alone as well: 0700 on a directory somebody else populated is
+      # a change they did not ask for and cannot easily notice.
+      warn "$RUNTIME_DATA_DIR (data_dir in $CONFIG_FILE) is not empty and is owned by '$rowner', not '$NODE_USER': NOT chowning it."
+      note "it IS in the unit's ReadWritePaths, so systemd will allow writes there."
+      note "make sure $NODE_USER can write to it: runuser -u $NODE_USER -- test -w '$RUNTIME_DATA_DIR'"
+    fi
+  fi
   return 0
 }
 
@@ -1486,6 +1896,21 @@ HELPER
 generate_unit() {
   local wants="network-online.target"
   [ -n "$ROUTER_UNIT" ] && wants="$wants $ROUTER_UNIT"
+  # Defensive: every path in here is one resolve_runtime_data_dir already
+  # checked, and a unit rendered without it would silently re-create the exact
+  # bug the ReadWritePaths comment below describes.
+  local rw="$RW_PATHS" warning=""
+  [ -n "$rw" ] || rw="\"$DATA_DIR\""
+  if [ "$RUNTIME_DATA_DIR_UNKNOWN" = "1" ]; then
+    warning="# WARNING: the data_dir in $CONFIG_FILE could not be
+# used when this unit was written ($CONFIG_STATE). If it is NOT $DATA_DIR,
+# the node will fail to write with a \"read-only file system\" error that names
+# the filesystem and never mentions this sandbox. Fix it with a drop-in rather
+# than by editing this file (which the installer would then refuse to refresh):
+#   systemctl edit syndichan-node   ->   [Service]
+#                                        ReadWritePaths=<the data_dir>
+"
+  fi
   cat <<EOF
 [Unit]
 Description=Syndichan encrypted volunteer storage and edge node
@@ -1536,7 +1961,14 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-ReadWritePaths="$DATA_DIR"
+# ProtectSystem=strict makes the WHOLE filesystem read-only to this service,
+# mount options be damned, so this list is the only thing that lets the node
+# write at all. It names the DATA DIRECTORIES THEMSELVES, never <dir>/storage:
+# i2p.destination, p2p.key and content.key are written BESIDE storage/, and a
+# unit that lists only the subdirectory fails on the second file instead of the
+# first. The first entry holds config.json (which the management page rewrites)
+# and is \$HOME; the second, when present, is the data_dir the config names.
+${warning}ReadWritePaths=$rw
 
 [Install]
 WantedBy=multi-user.target
@@ -1547,32 +1979,54 @@ EOF
 generate_compute_dropin() {
   # SupplementaryGroups= naming a group that does not exist makes systemd REFUSE
   # TO START the unit, so the list is built from the groups this machine has.
-  local groups="" g
-  for g in docker kvm; do
+  # The docker group is whatever owns the socket here, not the name "docker"
+  # taken on faith.
+  local groups="" g wanted="$DOCKER_GROUP"
+  # kvm only for the microVM path. A node that merely runs containers has no use
+  # for /dev/kvm, and a supplementary group it never needs is privilege granted
+  # for the sake of symmetry.
+  [ "$WANT_COMPUTE" = "1" ] && wanted="$wanted kvm"
+  for g in $wanted; do
+    [ -n "$g" ] || continue
     getent group "$g" >/dev/null 2>&1 && groups="$groups $g"
   done
   groups="${groups# }"
   cat <<EOF
-# Compute/DCS relaxations for syndichan-node.
-#
-# The hardened unit silently disables the features being turned on:
-# PrivateDevices=true gives a private /dev with no /dev/kvm, so microVM
-# isolation can never be advertised.
+# Compute/DCS access for syndichan-node.
 #
 # HARDENING GIVEN UP HERE, out loud:
-#   - PrivateDevices: the service can now see the real /dev.
-#   - MemoryDenyWriteExecute: firecracker children need W^X relaxed.
 #   - the docker group is root-equivalent by design. A node that lends compute
 #     is trusting the container runtime with the machine; that is the deal.
+#
+# SupplementaryGroups= is belt AND braces: the installer also adds the service
+# account to the group, but that only takes effect at the next exec, and a unit
+# whose access depends on somebody remembering to restart it is the kind of
+# thing that comes back as "compute silently stopped working".
 [Service]
+${groups:+SupplementaryGroups=$groups}
+# ProtectSystem=strict leaves /run read-only. Connecting to a unix socket is not
+# a filesystem write -- the kernel exempts sockets from the read-only-mount check
+# (sb_permission only refuses REG/DIR/LNK), so this line is not what makes the
+# socket reachable; group membership is. It is here because "should be fine" is
+# not how an operator wants to find out.
+#
+# The leading '-' is load-bearing: a ReadWritePaths= entry that does not exist
+# makes systemd REFUSE TO START the whole unit, and a node that will not boot
+# because Docker is not installed yet is a far worse failure than a compute role
+# that is switched off. /run/docker.sock, not /var/run/docker.sock: systemd
+# resolves the path itself and /var/run is the symlink.
+ReadWritePaths=-/run/docker.sock
+EOF
+  # Only the microVM path needs these, and each one is a real reduction in
+  # isolation, so they are not written for a node that merely runs containers.
+  [ "$WANT_COMPUTE" = "1" ] && cat <<EOF
+# --with-compute (microVM/firecracker) only:
+#   - PrivateDevices=true gives a private /dev with no /dev/kvm, so microVM
+#     isolation could never be advertised. The service now sees the real /dev.
+#   - MemoryDenyWriteExecute: firecracker children need W^X relaxed.
 PrivateDevices=false
 DeviceAllow=/dev/kvm rw
 MemoryDenyWriteExecute=false
-${groups:+SupplementaryGroups=$groups}
-# ProtectSystem=strict leaves /run read-only. Connecting to a socket is not a
-# filesystem write, so this should be unnecessary -- it is here because "should"
-# is not how an operator wants to find out.
-ReadWritePaths=/run/docker.sock
 EOF
   return 0
 }
@@ -1683,8 +2137,11 @@ install_systemd_unit() {
   # restarted -- see install_openrc_service for why.
   if install_managed "$UNIT_PATH" 0644 generate_unit; then
     run systemctl daemon-reload
-    install_compute_dropin
   fi
+  # Outside the branch above on purpose: an operator's hand-written unit still
+  # runs as $NODE_USER and still needs the socket, and skipping the drop-in
+  # because the unit was not ours is how compute ends up half-configured.
+  install_compute_dropin
   step "Enabling syndichan-node on boot"
   run systemctl enable syndichan-node.service
   run systemctl restart syndichan-node.service ||
@@ -1695,7 +2152,7 @@ install_systemd_unit() {
 # systemd only: the drop-in exists to undo systemd's own sandboxing. OpenRC
 # applies none of it, so there is nothing to relax there.
 install_compute_dropin() {
-  [ "$WANT_COMPUTE" = "1" ] || return 0
+  [ "$NEEDS_DOCKER" = "1" ] || return 0
   [ "$SERVICE_MGR" = "systemd" ] || return 0
   local tmp; tmp="$(workdir)/10-compute.conf"
   generate_compute_dropin >"$tmp"
@@ -1714,14 +2171,25 @@ install_compute_dropin() {
 # Alpine a plan row that promised something ACT never did.
 add_docker_group() {
   [ "$DO_ADD_DOCKER_GROUP" = "1" ] || return 0
-  step "Adding $NODE_USER to the docker group (root-equivalent)"
+  [ -n "$DOCKER_GROUP" ] || return 0
+  step "Adding $NODE_USER to the '$DOCKER_GROUP' group (root-equivalent)"
   if have usermod; then
-    run usermod -aG docker "$NODE_USER" || warn "could not add $NODE_USER to the docker group"
+    run usermod -aG "$DOCKER_GROUP" "$NODE_USER" || warn "could not add $NODE_USER to the '$DOCKER_GROUP' group"
   elif have addgroup; then
-    run addgroup "$NODE_USER" docker || warn "could not add $NODE_USER to the docker group"  # busybox
+    run addgroup "$NODE_USER" "$DOCKER_GROUP" || warn "could not add $NODE_USER to the '$DOCKER_GROUP' group"  # busybox
   else
-    warn "no usermod/addgroup here; add $NODE_USER to the docker group yourself"
+    warn "no usermod/addgroup here; add $NODE_USER to the '$DOCKER_GROUP' group yourself"
   fi
+  # Checked, not assumed. Every one of the three branches above can fail in a
+  # way that prints something and continues, and the symptom of the failure --
+  # a DCS worker that never starts -- appears once in the journal hours later.
+  if id -nG "$NODE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$DOCKER_GROUP"; then
+    note "$NODE_USER is now in: $(id -nG "$NODE_USER" 2>/dev/null | tr ' ' ',')"
+  else
+    warn "$NODE_USER is STILL not in the '$DOCKER_GROUP' group; the DCS worker will log 'Docker is not reachable ... permission denied' and not start"
+  fi
+  # Membership is read at exec(), so this only reaches a RUNNING node through
+  # the restart install_unit does at the end.
   return 0
 }
 

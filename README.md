@@ -627,6 +627,13 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
+# This must be the "data_dir" from the config file above, and the DATA DIRECTORY
+# ITSELF -- not <data_dir>/storage. The node writes i2p.destination, p2p.key and
+# content.key beside storage/, so a unit that lists only the subdirectory starts,
+# opens the shard store, and then dies on the next file. If data_dir lives on
+# another disk, list that path here (several paths are allowed, space separated,
+# quoted if they contain spaces) or the node fails with
+# "read-only file system" on a mount that is perfectly writable.
 ReadWritePaths=/home/EXAMPLE/syndichan-node
 ProtectKernelTunables=true
 ProtectKernelModules=true
