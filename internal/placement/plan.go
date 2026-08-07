@@ -144,6 +144,201 @@ func DistinctHolders(shards []Shard) int {
 	return len(seen)
 }
 
+// WithoutCrowdedHolders returns the chunk as the planner should see it when
+// some peer holds more than one of its shards: the SURPLUS placements -- the
+// second and later shards one peer ended up with -- are shown as unplaced, so
+// Plan gives those indexes a holder on a machine that holds nothing of the
+// chunk.
+//
+// WHY THIS IS NEEDED AT ALL
+// -------------------------
+// Plan refuses to create co-location, but it cannot undo it, and rows written
+// before that refusal existed (or by two placement rounds racing, or by two
+// objects sharing a content-addressed shard) can arrive already crowded. Every
+// shard has a holder, so an ordinary plan finds nothing to do: the object would
+// sit in the queue forever, correctly counted as under-replicated and never
+// getting any better. This is the one move that improves it.
+//
+// Nothing is forgotten. The crowded peer stays a holder in the ledger and keeps
+// serving reads; what changes is that the index stops depending on it alone.
+//
+// A shard is only surplus against a DIFFERENT shard: a chunk of uniform bytes
+// produces several indexes with the same content address, and a peer holding
+// those bytes once holds all of them. Re-sending the same shard id to another
+// peer would be paying for a copy that buys nothing.
+func WithoutCrowdedHolders(shards []Shard) []Shard {
+	out := make([]Shard, len(shards))
+	credited := make(map[string]string, len(shards))
+	for i, shard := range shards {
+		out[i] = shard
+		out[i].Holders = append([]string(nil), shard.Holders...)
+		if len(shard.Holders) == 0 {
+			continue
+		}
+		surplus := true
+		for _, holder := range shard.Holders {
+			if by, taken := credited[holder]; !taken || by == shard.ID {
+				credited[holder] = shard.ID
+				surplus = false
+			}
+		}
+		if surplus {
+			out[i].Holders = nil
+		}
+	}
+	return out
+}
+
+// maxEnumeratedHolders / maxEnumeratedSubsets bound the exact survivability
+// search. A chunk has dataShards+parityShards shards and one holder each, so
+// the real numbers are nine and eighty-four; the caps only exist so a ledger
+// row that somehow accumulated hundreds of holders cannot turn a queue scan
+// into a combinatorial explosion.
+const (
+	maxEnumeratedHolders = 63
+	maxEnumeratedSubsets = 50_000
+)
+
+// SurvivingIndexes reports how many distinct shard indexes would still be held
+// off this node after the WORST `losses` holders vanished at the same moment.
+//
+// THIS IS THE NUMBER THE FEATURE EXISTS TO PROTECT, and it is not the number of
+// placed indexes. An index survives exactly as long as one of ITS holders does,
+// so nine indexes on one peer survive zero losses while nine indexes on nine
+// peers survive three and still leave six -- which is a decode. Counting placed
+// indexes cannot tell those two apart; counting holders per index can.
+//
+// It is exact while the search is small (nine shards means a handful of holders
+// and at most a few thousand subsets) and deliberately PESSIMISTIC beyond that:
+// the fallback assumes the largest holders share no index, which can only
+// understate survivability. Understating costs a pass some extra work;
+// overstating retires an object that is one disk away from gone.
+func SurvivingIndexes(shards []Shard, losses int) int {
+	covered := RemoteIndexCount(shards)
+	if losses <= 0 || covered == 0 {
+		return covered
+	}
+
+	// holderOf maps each still-covered index to the set of peers holding it.
+	holderIndex := make(map[string]int)
+	perIndex := make(map[int][]string)
+	for _, shard := range shards {
+		for _, holder := range shard.Holders {
+			if _, known := holderIndex[holder]; !known {
+				holderIndex[holder] = len(holderIndex)
+			}
+			perIndex[shard.Index] = append(perIndex[shard.Index], holder)
+		}
+	}
+	if losses >= len(holderIndex) {
+		// Every holder gone. Nothing is remotely available, whatever was placed.
+		return 0
+	}
+
+	combinations := choose(len(holderIndex), losses)
+	if len(holderIndex) > maxEnumeratedHolders || combinations > maxEnumeratedSubsets {
+		return covered - worstCaseHolderLoad(shards, losses, covered)
+	}
+
+	// Each index becomes a bitmask of the holders that keep it alive; a set of
+	// dead holders kills the index only when the mask is a subset of it.
+	masks := make([]uint64, 0, len(perIndex))
+	for _, holders := range perIndex {
+		var mask uint64
+		for _, holder := range holders {
+			mask |= 1 << uint(holderIndex[holder])
+		}
+		masks = append(masks, mask)
+	}
+	worst := covered
+	forEachSubset(len(holderIndex), losses, func(dead uint64) bool {
+		alive := 0
+		for _, mask := range masks {
+			if mask&^dead != 0 {
+				alive++
+			}
+		}
+		if alive < worst {
+			worst = alive
+		}
+		return worst > 0
+	})
+	return worst
+}
+
+// SurvivesHolderLosses reports whether the chunk is still rebuildable WITHOUT
+// this node after `losses` of its holders drop out.
+func SurvivesHolderLosses(shards []Shard, dataShards, losses int) bool {
+	if dataShards < 1 {
+		dataShards = 1
+	}
+	return SurvivingIndexes(shards, losses) >= dataShards
+}
+
+// worstCaseHolderLoad is the pessimistic fallback: the indexes carried by the
+// `losses` busiest holders, as if none of those indexes were held anywhere else.
+func worstCaseHolderLoad(shards []Shard, losses, covered int) int {
+	load := make(map[string]map[int]bool)
+	for _, shard := range shards {
+		for _, holder := range shard.Holders {
+			if load[holder] == nil {
+				load[holder] = make(map[int]bool)
+			}
+			load[holder][shard.Index] = true
+		}
+	}
+	counts := make([]int, 0, len(load))
+	for _, indexes := range load {
+		counts = append(counts, len(indexes))
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(counts)))
+	lost := 0
+	for i := 0; i < losses && i < len(counts); i++ {
+		lost += counts[i]
+	}
+	if lost > covered {
+		lost = covered
+	}
+	return lost
+}
+
+// forEachSubset calls visit with every bitmask of exactly `pick` of `total`
+// holders, stopping early when visit returns false.
+func forEachSubset(total, pick int, visit func(uint64) bool) {
+	var walk func(start, remaining int, mask uint64) bool
+	walk = func(start, remaining int, mask uint64) bool {
+		if remaining == 0 {
+			return visit(mask)
+		}
+		for i := start; i <= total-remaining; i++ {
+			if !walk(i+1, remaining-1, mask|1<<uint(i)) {
+				return false
+			}
+		}
+		return true
+	}
+	walk(0, pick, 0)
+}
+
+// choose is n-choose-k, saturating rather than overflowing: the caller only
+// wants to know whether the search is small enough to run.
+func choose(n, k int) int {
+	if k < 0 || k > n {
+		return 0
+	}
+	if k > n-k {
+		k = n - k
+	}
+	result := 1
+	for i := 1; i <= k; i++ {
+		result = result * (n - k + i) / i
+		if result > maxEnumeratedSubsets {
+			return maxEnumeratedSubsets + 1
+		}
+	}
+	return result
+}
+
 // RemotelyRecoverable reports whether the shards held off this node are enough
 // to rebuild the chunk WITHOUT the local copies — the only definition of
 // redundancy that survives losing this node.

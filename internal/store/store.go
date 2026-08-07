@@ -372,8 +372,8 @@ func (s *Store) putObject(bucket, key, contentType string, r io.Reader, expected
 			// would put minutes on the site's upload path and would fail
 			// outright whenever the network is young. What must never happen is
 			// claiming a durability that does not exist, which is why the row
-			// starts life under-replicated and only DurableRemoteShards
-			// confirmed holders clear it.
+			// starts life under-replicated and only DurableRemoteHolders
+			// distinct confirmed holders per chunk clear it.
 			if placementErr := s.RecordObjectPlacement(*manifest); placementErr != nil {
 				return manifest, placementErr
 			}

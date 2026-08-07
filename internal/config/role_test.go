@@ -67,11 +67,17 @@ var dashboardRules = []struct {
 	mutate func(*Config)
 }{
 	{"malformed dashboard address", func(c *Config) { c.UIListen = "not-an-address" }},
-	{"dashboard on every interface", func(c *Config) { c.UIListen = "0.0.0.0:9090" }},
-	{"dashboard on every IPv6 interface", func(c *Config) { c.UIListen = "[::]:9090" }},
+	{"dashboard on every interface with no password", func(c *Config) {
+		c.UIListen, c.UIPassword = "0.0.0.0:9090", ""
+	}},
+	{"dashboard on every IPv6 interface with no password", func(c *Config) {
+		c.UIListen, c.UIPassword = "[::]:9090", ""
+	}},
 	{"dashboard on a public address", func(c *Config) { c.UIListen = "198.51.100.10:9090" }},
+	// Default() generates a password for a fresh config, so a rule about
+	// missing credentials has to clear it explicitly or it tests nothing.
 	{"dashboard on a LAN address with no password", func(c *Config) {
-		c.UIListen = "192.168.1.50:9090"
+		c.UIListen, c.UIPassword = "192.168.1.50:9090", ""
 	}},
 	{"dashboard on a LAN address with a guessable password", func(c *Config) {
 		c.UIListen, c.UIPassword = "192.168.1.50:9090", "hunter2"
@@ -140,20 +146,32 @@ func TestLoopbackDashboardNeedsNoPassword(t *testing.T) {
 	}
 }
 
-// 0.0.0.0 is the obvious thing to type and the wrong thing to accept: a
-// password does not make an admin page on every interface -- including the
-// public one of a rented server -- a good idea. The refusal must name the real
-// problem rather than sending the operator off to invent a password.
-func TestAnyInterfaceDashboardIsRefusedEvenWithAPassword(t *testing.T) {
+// 0.0.0.0 is the obvious thing to type, and every role now accepts it -- but
+// only behind a password, and the refusal without one has to name the real
+// problem rather than reading like a typo. This is the rule that carries the
+// whole exception, so it is checked on every role that can start the page.
+func TestAnyInterfaceDashboardIsRefusedWithoutAPassword(t *testing.T) {
+	roles := []Role{RoleStorage, RoleGatewayOnly, RoleProbeOnly, RoleManagement}
 	for _, address := range []string{"0.0.0.0:9090", "[::]:9090"} {
-		cfg := gatewayCandidateConfig(t)
-		cfg.UIListen, cfg.UIPassword = address, "correct-horse-battery-staple"
-		err := cfg.ValidateForRole(RoleStorage)
-		if err == nil {
-			t.Fatalf("%s was accepted", address)
-		}
-		if !strings.Contains(err.Error(), "every interface") {
-			t.Fatalf("%s: refusal does not explain itself: %v", address, err)
+		for _, role := range roles {
+			cfg := gatewayCandidateConfig(t)
+			if role == RoleProbeOnly {
+				cfg = probeCandidateConfig(t)
+			}
+			cfg.UIListen, cfg.UIPassword = address, ""
+			err := cfg.ValidateForRole(role)
+			if err == nil {
+				t.Fatalf("%s accepted %s with no password", role, address)
+			}
+			if !strings.Contains(err.Error(), "every interface") ||
+				!strings.Contains(err.Error(), "ui_password") {
+				t.Fatalf("%s on %s: refusal does not explain itself: %v", role, address, err)
+			}
+
+			cfg.UIPassword = "correct-horse-battery-staple"
+			if err := cfg.ValidateForRole(role); err != nil {
+				t.Fatalf("%s rejected %s behind a password: %v", role, address, err)
+			}
 		}
 	}
 }

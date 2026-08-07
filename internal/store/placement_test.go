@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -91,9 +92,11 @@ func TestWriteWithZeroPeersSucceedsAndIsMarkedUnderReplicated(t *testing.T) {
 	}
 }
 
-// The durability threshold: six of nine is where the promise becomes true, five
-// is not a weaker promise but no promise at all.
-func TestDurabilityThresholdIsDataShards(t *testing.T) {
+// The durability threshold: SEVEN distinct peers is where the promise becomes
+// true for 6+3. Six is the decode threshold and therefore exactly zero
+// redundancy -- lose any one of those six and the remote copies stop being an
+// object -- and "a node drops out" is the event the whole feature is for.
+func TestDurabilityThresholdIsDataShardsPlusOneHolders(t *testing.T) {
 	storage := openProductionShapedStore(t)
 	manifest, err := storage.PutObject("dispersal", "threshold.bin", "application/octet-stream",
 		bytes.NewReader(distinctBytes(12, 40<<10)))
@@ -103,15 +106,19 @@ func TestDurabilityThresholdIsDataShards(t *testing.T) {
 	if len(manifest.Chunks) != 1 {
 		t.Fatalf("expected a single chunk, got %d", len(manifest.Chunks))
 	}
+	if got := DurableRemoteHolders(6, 3); got != 7 {
+		t.Fatalf("DurableRemoteHolders(6,3) = %d, want 7", got)
+	}
+	holderOf := func(index int) string { return fmt.Sprintf("peer-%02d", index) }
 	for index, ref := range manifest.Chunks[0].Shards {
 		row, err := storage.LoadObjectPlacement(manifest.ObjectID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := index >= DurableRemoteShards(6); row.UnderReplicated() == want {
-			t.Fatalf("with %d remote shards UnderReplicated()=%v", index, row.UnderReplicated())
+		if want := index >= DurableRemoteHolders(6, 3); row.UnderReplicated() == want {
+			t.Fatalf("with %d distinct holders UnderReplicated()=%v", index, row.UnderReplicated())
 		}
-		if err := storage.ConfirmShardHolder(manifest.ObjectID, ref.ID, "peer-"+ref.ID[:4]); err != nil {
+		if err := storage.ConfirmShardHolder(manifest.ObjectID, ref.ID, holderOf(index)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -120,12 +127,12 @@ func TestDurabilityThresholdIsDataShards(t *testing.T) {
 		t.Fatal(err)
 	}
 	if row.UnderReplicated() || !row.FullyDispersed() {
-		t.Fatalf("all nine shards placed on distinct peers should be durable and complete: %#v", row)
+		t.Fatalf("all nine shards placed on nine distinct peers should be durable and complete: %#v", row)
 	}
-	// A holder dropping out takes the object back below the line, which is the
-	// signal repair keys off.
+	// A holder dropping out takes the object below the full-dispersal target,
+	// which is the signal repair keys off.
 	if err := storage.DropShardHolder(manifest.ObjectID,
-		manifest.Chunks[0].Shards[0].ID, "peer-"+manifest.Chunks[0].Shards[0].ID[:4]); err != nil {
+		manifest.Chunks[0].Shards[0].ID, holderOf(0)); err != nil {
 		t.Fatal(err)
 	}
 	row, _ = storage.LoadObjectPlacement(manifest.ObjectID)
@@ -133,7 +140,102 @@ func TestDurabilityThresholdIsDataShards(t *testing.T) {
 		t.Fatal("an object that lost a holder still claims full dispersal")
 	}
 	if row.WeakestChunk() != 8 {
-		t.Fatalf("WeakestChunk = %d after one holder left, want 8", row.WeakestChunk())
+		t.Fatalf("WeakestChunk = %d after one holder left, want 8 distinct holders", row.WeakestChunk())
+	}
+	// Eight of nine on eight distinct peers still survives one loss with six
+	// indexes left, so it is under the completion target but not under-replicated.
+	if row.UnderReplicated() {
+		t.Fatal("eight shards on eight distinct peers was reported as under-replicated")
+	}
+}
+
+// CO-LOCATION IS NOT DURABILITY.
+//
+// Nine shards, one peer. Every shard has a confirmed holder and every index is
+// off this node, so an index-counting metric reports 9 of 9 and retires the
+// object -- with the whole of it sitting on a single machine whose loss takes
+// the object with it. Durability is bounded by the number of DISTINCT HOLDERS,
+// never by the number of placed indexes.
+func TestOneHolderOfEveryShardIsNotDurable(t *testing.T) {
+	storage := openProductionShapedStore(t)
+	manifest, err := storage.PutObject("dispersal", "hoarded.bin", "application/octet-stream",
+		bytes.NewReader(distinctBytes(50, 40<<10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, chunk := range manifest.Chunks {
+		for _, ref := range chunk.Shards {
+			if err := storage.ConfirmShardHolder(manifest.ObjectID, ref.ID, "the-only-peer"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	row, err := storage.LoadObjectPlacement(manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.UnderReplicated() {
+		t.Fatal("an object whose every shard sits on ONE peer was reported as durable")
+	}
+	if row.FullyDispersed() {
+		t.Fatal("an object whose every shard sits on ONE peer was reported as fully dispersed")
+	}
+	if got := row.WeakestChunk(); got != 1 {
+		t.Fatalf("WeakestChunk = %d, want 1: one holder is the object's whole redundancy", got)
+	}
+
+	// The consequence that makes it fatal rather than cosmetic: a retired object
+	// is one no pass will ever look at again.
+	candidates, err := storage.DispersalCandidates(10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].ObjectID != manifest.ObjectID {
+		t.Fatalf("a co-located object is not in the dispersal queue: %#v", candidates)
+	}
+	summary, err := storage.PlacementStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.UnderReplicated != 1 || summary.FullyDispersed != 0 {
+		t.Fatalf("summary %#v calls a single-holder object dispersed", summary)
+	}
+}
+
+// Two holders for nine shards is the same failure one step along, and the
+// threshold has to catch every arrangement below dataShards+1 distinct peers.
+func TestDurabilityCountsHoldersNotPlacedIndexes(t *testing.T) {
+	storage := openProductionShapedStore(t)
+	manifest, err := storage.PutObject("dispersal", "lumpy.bin", "application/octet-stream",
+		bytes.NewReader(distinctBytes(51, 40<<10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Chunks) != 1 {
+		t.Fatalf("expected a single chunk, got %d", len(manifest.Chunks))
+	}
+	shards := manifest.Chunks[0].Shards
+	// Six peers, nine shards: peer-0 takes four of them. Six distinct indexes are
+	// remote and every index is placed, but losing peer-0 costs four of nine and
+	// leaves five -- one short of a decode.
+	holders := []string{"peer-0", "peer-0", "peer-0", "peer-0", "peer-1", "peer-2", "peer-3", "peer-4", "peer-5"}
+	for i, ref := range shards {
+		if err := storage.ConfirmShardHolder(manifest.ObjectID, ref.ID, holders[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, err := storage.LoadObjectPlacement(manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.UnderReplicated() {
+		t.Fatal("nine indexes over six peers, four on one, was reported as durable")
+	}
+	if row.FullyDispersed() {
+		t.Fatal("a chunk that cannot survive one node loss was reported as fully dispersed")
+	}
+	if got := row.WeakestChunk(); got != 6 {
+		t.Fatalf("WeakestChunk = %d, want the 6 distinct holders", got)
 	}
 }
 
@@ -453,5 +555,94 @@ func TestAuditQueueIncludesHealthyObjectsThatDispersalSkips(t *testing.T) {
 	}
 	if len(audit) != 1 || audit[0].ObjectID != manifest.ObjectID {
 		t.Fatal("a fully dispersed object is never audited, so a lost holder would go unnoticed")
+	}
+}
+
+// The last gate in front of a push. The planner refuses to co-locate, but a
+// plan is a snapshot and placement rounds overlap, so the question is asked
+// again against the ledger immediately before the bytes go out.
+func TestHoldsSiblingShardSeesTheRestOfTheChunk(t *testing.T) {
+	storage := openProductionShapedStore(t)
+	manifest, err := storage.PutObject("dispersal", "sibling.bin", "application/octet-stream",
+		bytes.NewReader(distinctBytes(52, 40<<10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shards := manifest.Chunks[0].Shards
+	if err := storage.ConfirmShardHolder(manifest.ObjectID, shards[0].ID, "peer-a"); err != nil {
+		t.Fatal(err)
+	}
+	if !storage.HoldsSiblingShard(manifest.ObjectID, shards[1].ID, "peer-a") {
+		t.Fatal("a peer already holding shard 0 was cleared to take shard 1 of the same chunk")
+	}
+	if storage.HoldsSiblingShard(manifest.ObjectID, shards[1].ID, "peer-b") {
+		t.Fatal("a peer holding nothing was refused")
+	}
+	// Not a sibling of itself: a retry, or a content-addressed shard shared with
+	// another object, must still be confirmable on the peer that has it.
+	if storage.HoldsSiblingShard(manifest.ObjectID, shards[0].ID, "peer-a") {
+		t.Fatal("the shard's own holder was treated as co-location")
+	}
+}
+
+// Consecutive is the whole of the word: one answer wipes the record, so a
+// holder that is unreachable one evening a month never accumulates its way to
+// eviction.
+func TestHolderSilencesAreConsecutiveAndSurviveARewrite(t *testing.T) {
+	storage := openProductionShapedStore(t)
+	content := distinctBytes(53, 40<<10)
+	manifest, err := storage.PutObject("dispersal", "silence.bin", "application/octet-stream",
+		bytes.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard := manifest.Chunks[0].Shards[0]
+	if err := storage.ConfirmShardHolder(manifest.ObjectID, shard.ID, "peer-a"); err != nil {
+		t.Fatal(err)
+	}
+	for want := 1; want <= 2; want++ {
+		got, err := storage.NoteHolderSilence(manifest.ObjectID, shard.ID, "peer-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("silence count %d after %d unanswered audits, want %d", got, want, want)
+		}
+	}
+	// A restart must not hand a long-silent holder a clean slate, so the count
+	// survives the manifest being written again.
+	if _, err := storage.PutObject("dispersal", "silence.bin", "application/octet-stream",
+		bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	row, err := storage.LoadObjectPlacement(manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := row.HolderSilences(shard.ID, "peer-a"); got != 2 {
+		t.Fatalf("silence count is %d after a rewrite, want the 2 it had earned", got)
+	}
+	if err := storage.NoteHolderAnswered(manifest.ObjectID, shard.ID, "peer-a"); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = storage.LoadObjectPlacement(manifest.ObjectID)
+	if got := row.HolderSilences(shard.ID, "peer-a"); got != 0 {
+		t.Fatalf("silence count is %d after the holder answered, want 0", got)
+	}
+	// And a holder that is dropped takes its count with it: coming back means
+	// starting from zero, not one probe from eviction.
+	if _, err := storage.NoteHolderSilence(manifest.ObjectID, shard.ID, "peer-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.DropShardHolder(manifest.ObjectID, shard.ID, "peer-a"); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = storage.LoadObjectPlacement(manifest.ObjectID)
+	if got := row.HolderSilences(shard.ID, "peer-a"); got != 0 {
+		t.Fatalf("a dropped holder left a silence count of %d behind", got)
+	}
+	// A peer that is not a holder cannot accumulate silences at all.
+	if got, err := storage.NoteHolderSilence(manifest.ObjectID, shard.ID, "peer-stranger"); err != nil || got != 0 {
+		t.Fatalf("NoteHolderSilence for a non-holder returned %d, %v", got, err)
 	}
 }

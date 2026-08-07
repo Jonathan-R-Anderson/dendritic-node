@@ -184,6 +184,11 @@ type Node struct {
 	// and re-place the same shard twice at once. See repair.go.
 	repairMu  sync.Mutex
 	repairing map[string]struct{}
+	// placing serialises placement rounds per object, so two overlapping rounds
+	// cannot each hand the same peer a different shard of one chunk. See
+	// lockPlacement in disperse.go.
+	placingMu sync.Mutex
+	placing   map[string]*placementGate
 	// cacheOnly nodes serve their own content but host nothing for anyone
 	// else; see the "store" branch of handleStream.
 	cacheOnly           bool

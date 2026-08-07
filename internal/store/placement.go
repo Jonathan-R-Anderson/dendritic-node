@@ -49,6 +49,18 @@ type ShardPlacement struct {
 	// ok to a store frame after the content address was verified on its side.
 	// Never an attempt, never an intention.
 	Holders []string `json:"holders,omitempty"`
+	// Silences counts CONSECUTIVE audits in which a holder failed to answer
+	// while other holders of the same object answered fine. It is keyed by peer
+	// id and reset to nothing the moment that peer answers again.
+	//
+	// It lives in the ledger rather than in memory because that is the only
+	// place it means anything: audits of one object are hours apart and a
+	// process restart in between must not hand a holder that has been silent for
+	// two days a clean slate. Without it there are only two possible policies,
+	// and both are wrong -- evict on the first missed probe (a reboot costs a
+	// node every shard it holds) or never evict at all (a node that dropped out
+	// stays in the ledger forever and its pieces are never rebuilt).
+	Silences map[string]int `json:"silences,omitempty"`
 	// Local records whether this node still has the bytes on its own disk.
 	Local bool `json:"local"`
 }
@@ -70,26 +82,48 @@ type ObjectPlacement struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-// DurableRemoteShards is how many distinct remote shard INDEXES an object's
-// chunk must have before this node calls the object dispersed.
+// DurableRemoteHolders is how many DISTINCT PEERS must hold shards of a chunk
+// before this node calls the object durable.
 //
-// WHY dataShards AND NOT MORE OR LESS
-// -----------------------------------
-// With 6+3, six distinct indexes on six distinct peers is exactly the point at
-// which the chunk can be rebuilt with this node switched off. Five is not a
-// weaker guarantee, it is no guarantee at all: Reed-Solomon reconstructs from
-// dataShards or it reconstructs from nothing, so "5 of 9 placed" means the
-// remote copy is undecodable and the only real copy is still the local disk.
-// Anything below dataShards must therefore be reported as under-replicated, not
-// as partial progress.
+// WHY HOLDERS AND NOT PLACED INDEXES
+// ----------------------------------
+// The metric this replaced counted distinct remote shard INDEXES, which is
+// blind to the only thing dispersal is for. Nine indexes confirmed by ONE peer
+// scored nine out of nine: fully placed, durable, retired from the queue -- with
+// the entire object on a single machine. Reed-Solomon does not make copies, it
+// makes pieces, and a pile of pieces in one building is not redundancy. What
+// bounds survival is how many machines have to fail, and that is the number of
+// distinct holders.
 //
-// Requiring all nine would be the stronger claim but it makes durability
-// hostage to the least available peer: one refused shard would hold an object
-// in the queue forever while the other eight sit safely placed. Six is the
-// threshold where the promise becomes true; the pass keeps pushing toward nine
-// afterwards, because nine placed is what buys the three-node loss tolerance,
-// and it records how far it got.
-func DurableRemoteShards(dataShards int) int { return dataShards }
+// WHY dataShards+1 WITH 6+3
+// -------------------------
+// Six indexes is the decode threshold: below it the remote copies are not an
+// object, they are noise, so six distinct indexes on six distinct peers is the
+// first point at which the chunk exists anywhere but this node's disk. It is
+// also, exactly, zero redundancy -- losing any ONE of those six takes it back
+// under the decode threshold, and "a node drops out" is the event the whole
+// feature was asked for. SEVEN distinct peers is the first arrangement that
+// answers the requirement: the chunk is rebuildable without this node AND
+// without any one of the peers holding it.
+//
+// Requiring all nine here would make durability hostage to the least available
+// peer, holding an object in the queue forever over one refused shard while
+// eight sit safely placed. Seven is where the promise becomes true; the pass
+// keeps pushing toward nine afterwards, because nine shards on nine distinct
+// peers is what buys the full three-node loss tolerance, and FullyDispersed is
+// the flag that says it got there.
+//
+// With no parity at all there is nothing to spare: dataShards distinct peers is
+// the most the layout can offer and the threshold has to say so.
+func DurableRemoteHolders(dataShards, parityShards int) int {
+	if dataShards < 1 {
+		dataShards = 1
+	}
+	if parityShards < 1 {
+		return dataShards
+	}
+	return dataShards + 1
+}
 
 // PlacementSnapshot is the read-only view the dispersal and repair passes work
 // from, converted into the pure planner's vocabulary.
@@ -122,10 +156,11 @@ func (p ObjectPlacement) ChunkIndexes() []int {
 	return out
 }
 
-// WeakestChunk returns the number of distinct remotely-held shard indexes in
-// the WORST chunk, which is the object's real durability: an object is only as
+// WeakestChunk returns the number of DISTINCT REMOTE HOLDERS of the worst
+// chunk, which is the object's real durability: an object is only as
 // recoverable as its least dispersed chunk, since every chunk is needed to
-// reassemble the whole.
+// reassemble the whole, and a chunk is only as safe as the number of separate
+// machines its pieces sit on.
 func (p ObjectPlacement) WeakestChunk() int {
 	chunks := p.ChunkIndexes()
 	if len(chunks) == 0 {
@@ -133,7 +168,7 @@ func (p ObjectPlacement) WeakestChunk() int {
 	}
 	weakest := -1
 	for _, chunk := range chunks {
-		count := placement.RemoteIndexCount(p.PlacementSnapshot(chunk))
+		count := placement.DistinctHolders(p.PlacementSnapshot(chunk))
 		if weakest < 0 || count < weakest {
 			weakest = count
 		}
@@ -141,23 +176,72 @@ func (p ObjectPlacement) WeakestChunk() int {
 	return weakest
 }
 
-// UnderReplicated reports whether this object still lacks the remote shards
-// that would make it recoverable without this node.
-func (p ObjectPlacement) UnderReplicated() bool {
-	return p.WeakestChunk() < DurableRemoteShards(p.DataShards)
+// ChunkIsDurable reports whether one chunk has reached the durability
+// threshold: enough distinct holders, arranged so that the chunk still decodes
+// without this node AND without any one of those holders.
+//
+// Both halves are needed. The holder count alone would accept seven peers where
+// one of them holds four of the nine pieces; the loss test alone would accept
+// arrangements the threshold is meant to describe in plain numbers.
+func (p ObjectPlacement) ChunkIsDurable(chunkIndex int) bool {
+	shards := p.PlacementSnapshot(chunkIndex)
+	if len(shards) == 0 {
+		return false
+	}
+	if placement.DistinctHolders(shards) < DurableRemoteHolders(p.DataShards, p.ParityShards) {
+		return false
+	}
+	return placement.SurvivesHolderLosses(shards, p.DataShards, 1)
 }
 
-// FullyDispersed reports whether every shard of every chunk sits on a peer.
-// This is the target the pass keeps working toward after durability is met,
-// because dataShards+parityShards distinct holders is what tolerates
-// parityShards simultaneous node losses.
-func (p ObjectPlacement) FullyDispersed() bool {
-	for _, shard := range p.Shards {
+// ChunkIsSpread reports whether one chunk has reached the FULL dispersal
+// target: every shard on some peer, spread so the chunk survives parityShards
+// holders dropping out at once. That is the loss tolerance a 6+3 layout is
+// supposed to buy, and it is a claim about holders, not about placements.
+func (p ObjectPlacement) ChunkIsSpread(chunkIndex int) bool {
+	shards := p.PlacementSnapshot(chunkIndex)
+	if len(shards) == 0 {
+		return false
+	}
+	for _, shard := range shards {
 		if len(shard.Holders) == 0 {
 			return false
 		}
 	}
-	return len(p.Shards) > 0
+	return placement.SurvivesHolderLosses(shards, p.DataShards, p.ParityShards)
+}
+
+// UnderReplicated reports whether this object still lacks the remote holders
+// that would make it recoverable without this node and without any one of them.
+func (p ObjectPlacement) UnderReplicated() bool {
+	chunks := p.ChunkIndexes()
+	if len(chunks) == 0 {
+		return true
+	}
+	for _, chunk := range chunks {
+		if !p.ChunkIsDurable(chunk) {
+			return true
+		}
+	}
+	return false
+}
+
+// FullyDispersed reports whether every chunk has reached the full dispersal
+// target. This is what retires an object from the dispersal queue, so it is
+// also the guard against retiring a CO-LOCATED object: a chunk whose pieces
+// share too few machines never satisfies it, however many placements were
+// confirmed.
+func (p ObjectPlacement) FullyDispersed() bool {
+	chunks := p.ChunkIndexes()
+	if len(chunks) == 0 {
+		return false
+	}
+	for _, chunk := range chunks {
+		if !p.ChunkIsSpread(chunk) {
+			return false
+		}
+	}
+	return true
 }
 
 // RecordObjectPlacement writes (or refreshes) the ledger row for a manifest.
@@ -183,12 +267,16 @@ func (s *Store) RecordObjectPlacement(manifest Manifest) error {
 		if existing := placements.Get([]byte(row.ObjectID)); existing != nil {
 			var previous ObjectPlacement
 			if err := json.Unmarshal(existing, &previous); err == nil {
-				known := make(map[string][]string, len(previous.Shards))
+				known := make(map[string]ShardPlacement, len(previous.Shards))
 				for _, shard := range previous.Shards {
-					known[shard.ShardID] = shard.Holders
+					known[shard.ShardID] = shard
 				}
 				for i := range row.Shards {
-					row.Shards[i].Holders = known[row.Shards[i].ShardID]
+					// Silence counts travel with the holders they judge; losing
+					// them on a rewrite would give a holder that has been
+					// unreachable for days a clean slate.
+					row.Shards[i].Holders = known[row.Shards[i].ShardID].Holders
+					row.Shards[i].Silences = known[row.Shards[i].ShardID].Silences
 				}
 				row.LastAttempt, row.Attempts = previous.LastAttempt, previous.Attempts
 			}
@@ -335,8 +423,8 @@ func (s *Store) ConfirmShardHolder(objectID, shardID, peerID string) error {
 }
 
 // DropShardHolder forgets a holder that no longer has the shard — it answered
-// "have" with false, or could not be reached at all across a full audit. This
-// is what turns a node dropping out into a repairable deficit instead of a
+// "have" with false, or has been unreachable across several consecutive audits.
+// This is what turns a node dropping out into a repairable deficit instead of a
 // permanent lie in the ledger.
 func (s *Store) DropShardHolder(objectID, shardID, peerID string) error {
 	return s.updatePlacement(objectID, func(row *ObjectPlacement) error {
@@ -351,9 +439,120 @@ func (s *Store) DropShardHolder(objectID, shardID, peerID string) error {
 				}
 			}
 			row.Shards[i].Holders = append([]string(nil), kept...)
+			// The silence count judged a holder that is no longer recorded, so
+			// it must go with it: a peer that comes back and is placed here
+			// again starts from zero rather than one probe from eviction.
+			delete(row.Shards[i].Silences, peerID)
+			if len(row.Shards[i].Silences) == 0 {
+				row.Shards[i].Silences = nil
+			}
 		}
 		return nil
 	})
+}
+
+// NoteHolderSilence records ONE audit in which a holder did not answer, and
+// returns how many consecutive audits it has now missed. The caller decides
+// what the count is worth; the ledger only remembers.
+func (s *Store) NoteHolderSilence(objectID, shardID, peerID string) (int, error) {
+	silences := 0
+	err := s.updatePlacement(objectID, func(row *ObjectPlacement) error {
+		for i := range row.Shards {
+			if row.Shards[i].ShardID != shardID {
+				continue
+			}
+			holds := false
+			for _, existing := range row.Shards[i].Holders {
+				if existing == peerID {
+					holds = true
+					break
+				}
+			}
+			if !holds {
+				continue
+			}
+			if row.Shards[i].Silences == nil {
+				row.Shards[i].Silences = make(map[string]int, 1)
+			}
+			row.Shards[i].Silences[peerID]++
+			if row.Shards[i].Silences[peerID] > silences {
+				silences = row.Shards[i].Silences[peerID]
+			}
+		}
+		return nil
+	})
+	return silences, err
+}
+
+// NoteHolderAnswered clears a holder's silence count. A holder is dropped only
+// for CONSECUTIVE silences, so one answer has to wipe the record: a node that
+// is unreachable one evening a month must never accumulate its way to eviction.
+func (s *Store) NoteHolderAnswered(objectID, shardID, peerID string) error {
+	return s.updatePlacement(objectID, func(row *ObjectPlacement) error {
+		for i := range row.Shards {
+			if row.Shards[i].ShardID != shardID {
+				continue
+			}
+			if _, counted := row.Shards[i].Silences[peerID]; !counted {
+				continue
+			}
+			delete(row.Shards[i].Silences, peerID)
+			if len(row.Shards[i].Silences) == 0 {
+				row.Shards[i].Silences = nil
+			}
+		}
+		return nil
+	})
+}
+
+// HolderSilences reports a holder's consecutive-silence count, for the audit
+// log and for tests.
+func (p ObjectPlacement) HolderSilences(shardID, peerID string) int {
+	for _, shard := range p.Shards {
+		if shard.ShardID == shardID {
+			return shard.Silences[peerID]
+		}
+	}
+	return 0
+}
+
+// HoldsSiblingShard reports whether a peer is already recorded as holding a
+// DIFFERENT shard of the same chunk.
+//
+// This is the last gate in front of a push, and it is deliberately a question
+// about the ledger rather than about a plan. The planner refuses to put two
+// shards of a chunk on one node, but a plan is a snapshot: two placement rounds
+// overlapping on the same object (a PUT-time dispersal, the replicate pass and
+// the repair pass are three separate goroutines) each computed theirs before
+// the other's confirmations landed. Asking again, immediately before the bytes
+// go out, is what turns the planner's per-call guarantee into a property of the
+// object.
+//
+// "Different" is by content address, not by index: a chunk of uniform bytes
+// produces several indexes with the SAME shard id, and a peer already holding
+// those bytes is not made any more co-located by being asked for them again.
+func (s *Store) HoldsSiblingShard(objectID, shardID, peerID string) bool {
+	row, err := s.LoadObjectPlacement(objectID)
+	if err != nil {
+		return false
+	}
+	chunks := make(map[int]bool)
+	for _, shard := range row.Shards {
+		if shard.ShardID == shardID {
+			chunks[shard.ChunkIndex] = true
+		}
+	}
+	for _, shard := range row.Shards {
+		if !chunks[shard.ChunkIndex] || shard.ShardID == shardID {
+			continue
+		}
+		for _, holder := range shard.Holders {
+			if holder == peerID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // SetShardLocal records whether this node still holds the bytes itself.

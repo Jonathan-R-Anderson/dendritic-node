@@ -59,16 +59,25 @@ type DispersalResult struct {
 	// Unassignable is the number of shards that had nowhere distinct to go,
 	// because the network offered fewer usable peers than the chunk has shards.
 	Unassignable int
-	// WeakestChunk is the smallest number of distinct remotely-held shard
-	// indexes across the object's chunks, after this pass. This is the object's
-	// real durability: it is recoverable without this node only if this is at
-	// least DataShards.
+	// WeakestChunk is the smallest number of DISTINCT HOLDERS across the
+	// object's chunks, after this pass. This is the object's real durability:
+	// how many separate machines would have to fail to take it away.
 	WeakestChunk int
-	// Durable is WeakestChunk >= store.DurableRemoteShards(DataShards).
+	// Durable is true when every chunk has at least
+	// store.DurableRemoteHolders(DataShards, ParityShards) distinct holders AND
+	// still decodes without this node after any one of them drops out.
 	Durable bool
-	// Complete is true when every shard of every chunk sits on some peer, which
-	// is what buys tolerance of ParityShards simultaneous node losses.
+	// Complete is true when every shard of every chunk sits on some peer and no
+	// peer holds enough of one chunk to matter, which is what buys tolerance of
+	// ParityShards simultaneous node losses.
 	Complete bool
+}
+
+// placementGate is one object's placement lock, refcounted so the map does not
+// accumulate an entry per object ever written.
+type placementGate struct {
+	mu      sync.Mutex
+	waiters int
 }
 
 // candidateSource returns peers that can actually take a shard.
@@ -196,12 +205,57 @@ func (n *Node) DisperseObject(ctx context.Context, manifest store.Manifest) Disp
 	}
 	if !result.Durable {
 		n.logger.Printf(
-			"object %s is UNDER-REPLICATED: %d of %d distinct shard indexes are off this node (placed %d, failed %d, unassignable %d)",
+			"object %s is UNDER-REPLICATED: its weakest chunk sits on %d of the %d distinct peers it needs (placed %d, failed %d, unassignable %d)",
 			shortID(manifest.ObjectID), result.WeakestChunk,
-			store.DurableRemoteShards(manifest.DataShards),
+			store.DurableRemoteHolders(manifest.DataShards, manifest.ParityShards),
 			result.Placed, result.Failed, result.Unassignable)
 	}
 	return result
+}
+
+// lockPlacement serialises placement rounds for ONE object and returns the
+// release function.
+//
+// WHY THIS EXISTS
+// ---------------
+// placement.Plan cannot put two shards of a chunk on one peer, but that
+// guarantee covers one call and nothing else, and three separate goroutines
+// place shards for the same object: the PUT-time distributor hook, the
+// replicate pass, and the repair pass. Two of them overlapping each read the
+// ledger before the other's confirmations were written, so both planned from
+// "this chunk has no holders". Identical inputs give identical plans and no
+// harm -- but the candidate list is ranked by advertised free space, and any
+// difference between the two rounds (a refreshed capacity record, a peer that
+// connected in between, an expired candidate cache) permutes the ranking. Round
+// one then sends shard 0 to the peer round two is sending shard 4 to, and the
+// chunk is co-located on a node neither round ever planned to double up on.
+//
+// Per object rather than global: dispersal of unrelated objects should still
+// run in parallel, and there is exactly one node -- the owner -- that ever
+// places an object's shards, so an in-process gate is the whole of the race.
+func (n *Node) lockPlacement(objectID string) func() {
+	n.placingMu.Lock()
+	if n.placing == nil {
+		n.placing = make(map[string]*placementGate)
+	}
+	gate := n.placing[objectID]
+	if gate == nil {
+		gate = &placementGate{}
+		n.placing[objectID] = gate
+	}
+	gate.waiters++
+	n.placingMu.Unlock()
+
+	gate.mu.Lock()
+	return func() {
+		gate.mu.Unlock()
+		n.placingMu.Lock()
+		gate.waiters--
+		if gate.waiters == 0 {
+			delete(n.placing, objectID)
+		}
+		n.placingMu.Unlock()
+	}
 }
 
 // placeShards runs one placement round over every chunk of an object.
@@ -215,6 +269,11 @@ func (n *Node) placeShards(
 	candidates []placement.Candidate,
 	read func(shardID string) ([]byte, error),
 ) DispersalResult {
+	// Taken BEFORE the ledger is read: the plan and the confirmations it
+	// produces have to be one atomic round, or a concurrent round plans against
+	// holders that are about to change.
+	defer n.lockPlacement(objectID)()
+
 	var result DispersalResult
 	row, err := n.store.LoadObjectPlacement(objectID)
 	if err != nil {
@@ -233,17 +292,32 @@ func (n *Node) placeShards(
 		// from copying each shard. dataShards+parityShards shards on that many
 		// distinct nodes already tolerates parityShards losses; a second copy of
 		// each would double the traffic to raise it no further.
-		assignments := placement.Plan(shards, candidates, 1)
-		unplaced := 0
+		//
+		// The exception is a chunk that is fully placed and STILL co-located --
+		// a row written before this node enforced the property, or an index that
+		// two objects share. Every shard has a holder, so a plain plan has
+		// nothing to do and the object would sit in the queue forever being
+		// counted as under-replicated and never getting better. Treating the
+		// surplus placements as unplaced gives those indexes a second holder on
+		// a machine that holds nothing of the chunk, which is the only thing
+		// that raises the number of node losses it survives.
+		assignments := placement.Plan(placement.WithoutCrowdedHolders(shards), candidates, 1)
+		// Unassignable counts shards that have NO holder at all and got no peer
+		// this round. Measured against the real holder lists rather than against
+		// the count of assignments, because some of those assignments are second
+		// holders for crowded indexes and would otherwise hide a shard that
+		// still has nowhere to go.
+		holderless := make(map[int]bool, len(shards))
 		for _, shard := range shards {
 			if len(shard.Holders) == 0 {
-				unplaced++
+				holderless[shard.Index] = true
 			}
 		}
-		mu.Lock()
-		if unplaced > len(assignments) {
-			result.Unassignable += unplaced - len(assignments)
+		for _, assignment := range assignments {
+			delete(holderless, assignment.ShardIndex)
 		}
+		mu.Lock()
+		result.Unassignable += len(holderless)
 		mu.Unlock()
 
 		for _, assignment := range assignments {
@@ -287,6 +361,14 @@ func (n *Node) placeOne(
 	ctx context.Context, objectID, shardID string, target peer.ID,
 	read func(string) ([]byte, error),
 ) error {
+	// Asked again here, against the ledger as it stands at this instant, rather
+	// than trusted from the plan. Everything between planning and sending is a
+	// window in which another round can have confirmed a sibling on this peer,
+	// and a shard that would double up must not be sent at all: the bytes cannot
+	// be recalled, and once they are there the ledger has to record them.
+	if n.store.HoldsSiblingShard(objectID, shardID, target.String()) {
+		return errWouldCoLocate
+	}
 	value, err := read(shardID)
 	if err != nil {
 		return err
@@ -354,3 +436,9 @@ func shortID(id string) string {
 // rather than a yes/no -- it is not a "no", and an audit must not treat it as
 // one or a peer having a bad minute would look like a node that dropped out.
 var errShardProbeRefused = errors.New("peer refused the shard probe")
+
+// errWouldCoLocate means the target already holds another shard of this chunk,
+// so sending is refused. Counted as a failure rather than swallowed: an
+// unplaced shard is a deficit the next pass can fix, and a silent skip would
+// look like success.
+var errWouldCoLocate = errors.New("peer already holds a shard of this chunk")

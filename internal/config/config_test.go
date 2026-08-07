@@ -17,11 +17,12 @@ func validTestConfig(t *testing.T) Config {
 	return cfg
 }
 
-// The dashboard may reach the operator's own network but never the internet,
-// and TLS on the S3 gateway does not buy it an exception: the two ports answer
-// to different rules because they answer to different people.
+// A NAMED public address is still refused outright, and TLS on the S3 gateway
+// does not buy it an exception: the two ports answer to different rules because
+// they answer to different people. An operator who types a routable address has
+// said where the page is, and the answer is no.
 func TestDashboardMustNotBecomePublic(t *testing.T) {
-	for _, address := range []string{"0.0.0.0:9090", "[::]:9090", "198.51.100.10:9090"} {
+	for _, address := range []string{"198.51.100.10:9090", "[2001:db8::1]:9090"} {
 		cfg := validTestConfig(t)
 		cfg.UIListen = address
 		cfg.UIPassword = "correct-horse-battery-staple"
@@ -29,6 +30,29 @@ func TestDashboardMustNotBecomePublic(t *testing.T) {
 		cfg.TLSKey = "key.pem"
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("public dashboard binding %s was accepted", address)
+		}
+	}
+}
+
+// 0.0.0.0 and :: are the deliberate exception -- an installer that refuses the
+// obvious thing to type is not one people use, and naming an address breaks on
+// DHCP, on two NICs, and on a VM whose address nobody knows in advance -- but
+// the exception is not free. The password is what carries it, so the bind is
+// refused without one and refused with a short one.
+func TestAnyInterfaceDashboardIsAllowedOnlyBehindAPassword(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:9090", "[::]:9090"} {
+		cfg := validTestConfig(t)
+		cfg.UIListen, cfg.UIPassword = address, ""
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("%s was accepted with no password at all", address)
+		}
+		cfg.UIPassword = "hunter2"
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("%s was accepted behind a guessable password", address)
+		}
+		cfg.UIPassword = "correct-horse-battery-staple"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("%s with a real password was rejected: %v", address, err)
 		}
 	}
 }

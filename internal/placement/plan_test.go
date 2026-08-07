@@ -107,8 +107,11 @@ func TestPlanPrefersTheEmptiestPeer(t *testing.T) {
 	}
 }
 
-// Durability is counted in distinct shard INDEXES held remotely, not in holders
-// and not in shards. Two copies of index 4 rebuild nothing one copy does not.
+// RemotelyRecoverable answers "can the chunk be decoded off this node AT ALL",
+// which is counted in distinct shard INDEXES: two copies of index 4 rebuild
+// nothing one copy does not. It is NOT the durability question -- see
+// TestSurvivingIndexesIsBoundedByHolders -- because it says nothing about how
+// many machines have to fail before the answer changes.
 func TestRemotelyRecoverableCountsDistinctIndexes(t *testing.T) {
 	shards := chunkOf(9, 1000)
 	for i := 0; i < 5; i++ {
@@ -123,5 +126,139 @@ func TestRemotelyRecoverableCountsDistinctIndexes(t *testing.T) {
 	}
 	if got := DistinctHolders(shards); got != 6 {
 		t.Fatalf("DistinctHolders = %d, want 6", got)
+	}
+}
+
+// The property the durability metric has to have: nine indexes placed says
+// nothing on its own, and everything once you ask how many machines they are
+// on. Same nine placements, three arrangements, three different answers.
+func TestSurvivingIndexesIsBoundedByHolders(t *testing.T) {
+	onePeer := chunkOf(9, 1000)
+	for i := range onePeer {
+		onePeer[i].Holders = []string{"peer-00"}
+	}
+	if got := RemoteIndexCount(onePeer); got != 9 {
+		t.Fatalf("RemoteIndexCount = %d, want the 9 that make the old metric wrong", got)
+	}
+	if got := SurvivingIndexes(onePeer, 1); got != 0 {
+		t.Fatalf("SurvivingIndexes after one loss = %d, want 0: it was all on one machine", got)
+	}
+	if SurvivesHolderLosses(onePeer, 6, 1) {
+		t.Fatal("nine shards on one peer claimed to survive that peer going away")
+	}
+
+	spread := chunkOf(9, 1000)
+	for i := range spread {
+		spread[i].Holders = []string{fmt.Sprintf("peer-%02d", i)}
+	}
+	if got := SurvivingIndexes(spread, 3); got != 6 {
+		t.Fatalf("SurvivingIndexes after three losses = %d, want the 6 that decode", got)
+	}
+	if !SurvivesHolderLosses(spread, 6, 3) {
+		t.Fatal("nine shards on nine peers should tolerate the three losses parity pays for")
+	}
+	if SurvivesHolderLosses(spread, 6, 4) {
+		t.Fatal("6+3 claimed to survive four simultaneous losses")
+	}
+
+	// Nine indexes on six peers, four of them on one: the count of placements is
+	// unchanged and the object is one machine away from undecodable.
+	lumpy := chunkOf(9, 1000)
+	for i := range lumpy {
+		if i < 4 {
+			lumpy[i].Holders = []string{"peer-00"}
+			continue
+		}
+		lumpy[i].Holders = []string{fmt.Sprintf("peer-%02d", i)}
+	}
+	if got := DistinctHolders(lumpy); got != 6 {
+		t.Fatalf("DistinctHolders = %d, want 6", got)
+	}
+	if got := SurvivingIndexes(lumpy, 1); got != 5 {
+		t.Fatalf("SurvivingIndexes after one loss = %d, want 5: one short of a decode", got)
+	}
+	if SurvivesHolderLosses(lumpy, 6, 1) {
+		t.Fatal("a chunk with four of nine shards on one peer claimed to survive its loss")
+	}
+}
+
+// Several holders per index is the case the exact search exists for: a peer
+// leaving costs nothing while another peer still has the same index, and a
+// count of "indexes minus the biggest holder" would call this fatal.
+func TestSurvivingIndexesCreditsIndexesHeldTwice(t *testing.T) {
+	shards := chunkOf(9, 1000)
+	for i := range shards {
+		shards[i].Holders = []string{"peer-a", "peer-b"}
+	}
+	if got := SurvivingIndexes(shards, 1); got != 9 {
+		t.Fatalf("SurvivingIndexes after one loss = %d, want 9: every index has a second holder", got)
+	}
+	if got := SurvivingIndexes(shards, 2); got != 0 {
+		t.Fatalf("SurvivingIndexes after two losses = %d, want 0: there were only two machines", got)
+	}
+}
+
+// Plan refuses to CREATE co-location but cannot undo it, and a chunk that
+// arrives crowded is fully placed -- so an ordinary plan has nothing to do and
+// the object would stay under-replicated forever with no move that improves it.
+func TestCrowdedChunkGetsItsSurplusIndexesASecondHolder(t *testing.T) {
+	shards := chunkOf(9, 1000)
+	for i := range shards {
+		if i < 4 {
+			shards[i].Holders = []string{"peer-crowded"}
+			continue
+		}
+		shards[i].Holders = []string{fmt.Sprintf("peer-%02d", i)}
+	}
+	replanned := WithoutCrowdedHolders(shards)
+	unplaced := 0
+	for i, shard := range replanned {
+		if len(shard.Holders) == 0 {
+			unplaced++
+			continue
+		}
+		if i >= 4 && shard.Holders[0] != fmt.Sprintf("peer-%02d", i) {
+			t.Fatalf("shard %d lost its own holder", i)
+		}
+	}
+	if unplaced != 3 {
+		t.Fatalf("%d shards look unplaced, want the 3 surplus ones on peer-crowded", unplaced)
+	}
+	// The ledger is untouched: the crowded peer is still a holder and still
+	// serves reads.
+	if len(shards[1].Holders) != 1 || shards[1].Holders[0] != "peer-crowded" {
+		t.Fatal("WithoutCrowdedHolders mutated the chunk it was given")
+	}
+
+	assignments := Plan(replanned, peers(12), 1)
+	if len(assignments) != 3 {
+		t.Fatalf("planned %d assignments, want a fresh holder for each surplus index", len(assignments))
+	}
+	for _, assignment := range assignments {
+		if assignment.Peer == "peer-crowded" {
+			t.Fatal("the surplus index was planned back onto the peer that was already crowded")
+		}
+	}
+	// And the arrangement it produces is the one that survives a loss.
+	for _, assignment := range assignments {
+		shards[assignment.ShardIndex].Holders = append(shards[assignment.ShardIndex].Holders, assignment.Peer)
+	}
+	if !SurvivesHolderLosses(shards, 6, 1) {
+		t.Fatal("after re-placing the surplus indexes the chunk still dies with one node")
+	}
+}
+
+// A chunk of uniform bytes produces several indexes with the SAME content
+// address, and a peer holding those bytes holds all of them. That is not
+// crowding, and re-sending the same shard id elsewhere buys nothing.
+func TestAliasedShardsAreNotTreatedAsCrowding(t *testing.T) {
+	shards := make([]Shard, 6)
+	for i := range shards {
+		shards[i] = Shard{ID: "same-bytes", Index: i, Size: 1000, Holders: []string{"peer-00"}}
+	}
+	for i, shard := range WithoutCrowdedHolders(shards) {
+		if len(shard.Holders) != 1 {
+			t.Fatalf("index %d of an all-identical chunk was called surplus", i)
+		}
 	}
 }

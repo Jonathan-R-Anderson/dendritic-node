@@ -14,12 +14,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"github.com/syndichan/maniwani/storage-client/internal/placement"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 )
 
@@ -449,5 +451,407 @@ func TestRepairRefusesToRebuildBelowDataShards(t *testing.T) {
 	if _, err := source.restoreChunkBytes(ctx, *manifest, chunk.Index,
 		row.PlacementSnapshot(chunk.Index), &budget); err == nil {
 		t.Fatal("repair claimed to rebuild a chunk with 2 of 3 data shards surviving")
+	}
+}
+
+// dispersedObject stands up a source node and `targets` peers, connects them
+// all, and writes one object. Returned so the placement tests below can talk
+// about "the peer holding shard 3" rather than about indexes into a slice.
+type dispersedObject struct {
+	source      *Node
+	sourceStore *store.Store
+	sourceDir   string
+	nodes       map[string]*Node
+	stores      map[string]*store.Store
+	manifest    *store.Manifest
+}
+
+func disperseOnto(t *testing.T, ctx context.Context, targets, dataShards, parityShards int,
+	bucket string, seed int64) *dispersedObject {
+	t.Helper()
+	source, sourceStore, sourceDir := openTestNode(t, ctx, dataShards, parityShards)
+	out := &dispersedObject{
+		source: source, sourceStore: sourceStore, sourceDir: sourceDir,
+		nodes: map[string]*Node{}, stores: map[string]*store.Store{},
+	}
+	all := []*Node{source}
+	for i := 0; i < targets; i++ {
+		node, storage, _ := openTestNode(t, ctx, dataShards, parityShards)
+		out.nodes[node.host.ID().String()] = node
+		out.stores[node.host.ID().String()] = storage
+		all = append(all, node)
+	}
+	stubCoordinator(t, all...)
+	for _, target := range all[1:] {
+		if err := source.host.Connect(ctx, peer.AddrInfo{
+			ID: target.host.ID(), Addrs: target.host.Addrs(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sourceStore.CreateBucket(bucket); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := sourceStore.PutObject(bucket, "object.bin", "application/octet-stream",
+		bytes.NewReader(varyingBytes(seed, 4000)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Chunks) != 1 {
+		t.Fatalf("expected a single chunk, got %d", len(manifest.Chunks))
+	}
+	out.manifest = manifest
+	return out
+}
+
+// coLocation reports the peers holding more than one shard of the chunk,
+// measured from the peers' own disks rather than from the sender's opinion.
+func (d *dispersedObject) coLocation(t *testing.T) map[string]int {
+	t.Helper()
+	held := map[string]int{}
+	for _, ref := range d.manifest.Chunks[0].Shards {
+		for id, storage := range d.stores {
+			if _, err := storage.ReadShard(ref.ID); err == nil {
+				held[id]++
+			}
+		}
+	}
+	for id, count := range held {
+		if count == 1 {
+			delete(held, id)
+		} else {
+			t.Logf("peer %s holds %d shards of one chunk", id[:12], count)
+		}
+	}
+	return held
+}
+
+// CRITICAL: two placement rounds running at once must not undo the planner.
+//
+// placement.Plan cannot put two shards of a chunk on one peer, but that holds
+// for ONE call: the PUT-time distributor, the replicate pass and the repair
+// pass are three goroutines that all place shards for the same object, and two
+// of them overlapping each plan from a ledger the other has not written to yet.
+// Their candidate lists are ranked by advertised free space, so any change
+// between the rounds permutes the ranking and the second round sends shard 4 to
+// the peer the first round is sending shard 0 to.
+func TestConcurrentPlacementRoundsNeverCoLocateAChunk(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const dataShards, parityShards = 3, 2
+	fixture := disperseOnto(t, ctx, dataShards+parityShards, dataShards, parityShards, "race", 7)
+
+	// The same peers, ranked in OPPOSITE orders: one round's first choice is the
+	// other's last. This is a capacity record refreshing between two passes, not
+	// a contrivance -- free space is exactly what the ranking is made of.
+	var ids []string
+	for id := range fixture.nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	ascending := make([]placement.Candidate, len(ids))
+	descending := make([]placement.Candidate, len(ids))
+	for i, id := range ids {
+		ascending[i] = placement.Candidate{PeerID: id, FreeBytes: int64(1<<30 + (len(ids) - i))}
+		descending[i] = placement.Candidate{PeerID: id, FreeBytes: int64(1<<30 + i)}
+	}
+
+	read := func(shardID string) ([]byte, error) { return fixture.sourceStore.ReadShard(shardID) }
+	var start sync.WaitGroup
+	var done sync.WaitGroup
+	var mu sync.Mutex
+	placed := 0
+	start.Add(1)
+	for _, candidates := range [][]placement.Candidate{ascending, descending} {
+		done.Add(1)
+		go func(candidates []placement.Candidate) {
+			defer done.Done()
+			start.Wait()
+			result := fixture.source.placeShards(ctx, fixture.manifest.ObjectID, candidates, read)
+			mu.Lock()
+			placed += result.Placed
+			mu.Unlock()
+		}(candidates)
+	}
+	start.Done()
+	done.Wait()
+
+	if doubled := fixture.coLocation(t); len(doubled) > 0 {
+		t.Fatalf("%d peer(s) ended up holding two shards of one chunk; losing one costs %d of %d parity",
+			len(doubled), 2, parityShards)
+	}
+	if placed != dataShards+parityShards {
+		t.Fatalf("two rounds placed %d shards between them, want each of the %d shards once",
+			placed, dataShards+parityShards)
+	}
+	row, err := fixture.sourceStore.LoadObjectPlacement(fixture.manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, shard := range row.PlacementSnapshot(0) {
+		if len(shard.Holders) != 1 {
+			t.Fatalf("shard %d has holders %v, want exactly one", shard.Index, shard.Holders)
+		}
+		seen[shard.Holders[0]]++
+	}
+	for holder, count := range seen {
+		if count > 1 {
+			t.Fatalf("the ledger records %s as holding %d shards of one chunk", holder[:12], count)
+		}
+	}
+	if row.UnderReplicated() || !row.FullyDispersed() {
+		t.Fatalf("ledger reports %#v after the object was fully placed", row)
+	}
+}
+
+// holderOfShard returns the recorded holder of a shard, and fails if there is
+// not exactly one.
+func holderOfShard(t *testing.T, storage *store.Store, objectID, shardID string) string {
+	t.Helper()
+	row, err := storage.LoadObjectPlacement(objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, shard := range row.Shards {
+		if shard.ShardID != shardID {
+			continue
+		}
+		if len(shard.Holders) != 1 {
+			t.Fatalf("shard %s has holders %v, want exactly one", shardID[:12], shard.Holders)
+		}
+		return shard.Holders[0]
+	}
+	t.Fatalf("shard %s is not in the ledger", shardID[:12])
+	return ""
+}
+
+func recordsHolder(t *testing.T, storage *store.Store, objectID, shardID, peerID string) bool {
+	t.Helper()
+	row, err := storage.LoadObjectPlacement(objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, shard := range row.Shards {
+		if shard.ShardID != shardID {
+			continue
+		}
+		for _, holder := range shard.Holders {
+			if holder == peerID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// THE OTHER HALF OF THE REQUIREMENT: "when a node drops out the missing pieces
+// are reconstructed".
+//
+// A node that drops out does not answer "no", it says nothing at all, so the
+// audit has to reach a verdict from silence. This drives the whole loop --
+// audit, drop, rebuild, re-place -- against a peer whose process is gone,
+// rather than deleting a file and calling the rebuild directly.
+func TestUnreachableHolderIsDroppedAcrossAuditsAndItsShardRebuilt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const dataShards, parityShards = 3, 2
+	// One peer more than the chunk has shards, so the regenerated shard has
+	// somewhere to go that is not already holding a sibling.
+	fixture := disperseOnto(t, ctx, dataShards+parityShards+1, dataShards, parityShards, "dropout", 8)
+	source, sourceStore := fixture.source, fixture.sourceStore
+
+	result := source.DisperseObject(ctx, *fixture.manifest)
+	if result.Placed != dataShards+parityShards || !result.Complete {
+		t.Fatalf("setup dispersal reported %#v", result)
+	}
+
+	victimShard := fixture.manifest.Chunks[0].Shards[0]
+	victimPeer := holderOfShard(t, sourceStore, fixture.manifest.ObjectID, victimShard.ID)
+	// The node goes away. Not "answers no", not "refuses": gone.
+	if err := fixture.nodes[victimPeer].Close(); err != nil {
+		t.Fatalf("could not stop the holder: %v", err)
+	}
+	// And the local copy goes with a disk, so the shard has to be REBUILT rather
+	// than merely re-sent.
+	if err := os.Remove(shardFileOf(fixture.sourceDir, victimShard.ID)); err != nil {
+		t.Fatal(err)
+	}
+
+	for audit := 1; audit <= 3; audit++ {
+		// Audits are hours apart in production, so the two-minute candidate cache
+		// has always expired between them.
+		source.candidateMu.Lock()
+		source.candidateCache, source.candidateAt = nil, time.Time{}
+		source.candidateMu.Unlock()
+
+		row, err := sourceStore.LoadObjectPlacement(fixture.manifest.ObjectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		budget := 16
+		source.repairObject(ctx, *row, &budget)
+
+		stillRecorded := recordsHolder(t, sourceStore, fixture.manifest.ObjectID, victimShard.ID, victimPeer)
+		switch {
+		case audit < 3 && !stillRecorded:
+			t.Fatalf("a holder was evicted after %d unanswered audit(s); a reboot would cost a node every shard it holds",
+				audit)
+		case audit == 3 && stillRecorded:
+			t.Fatal("a holder unreachable across three consecutive audits is still in the ledger, so its shard is never rebuilt")
+		}
+	}
+
+	rebuilt, err := sourceStore.ReadShard(victimShard.ID)
+	if err != nil {
+		t.Fatalf("the shard of the node that dropped out was never rebuilt: %v", err)
+	}
+	replacement := holderOfShard(t, sourceStore, fixture.manifest.ObjectID, victimShard.ID)
+	if replacement == victimPeer {
+		t.Fatal("the shard was re-placed on the node that dropped out")
+	}
+	storage, known := fixture.stores[replacement]
+	if !known {
+		t.Fatalf("shard re-placed on unknown peer %s", replacement)
+	}
+	value, err := storage.ReadShard(victimShard.ID)
+	if err != nil {
+		t.Fatalf("the new holder does not actually have the shard: %v", err)
+	}
+	if !bytes.Equal(value, rebuilt) {
+		t.Fatal("the new holder stored different bytes")
+	}
+	if doubled := fixture.coLocation(t); len(doubled) > 0 {
+		t.Fatalf("repair put two shards of one chunk on %d peer(s)", len(doubled))
+	}
+	row, err := sourceStore.LoadObjectPlacement(fixture.manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.UnderReplicated() || !row.FullyDispersed() {
+		t.Fatalf("after repair the object still reports %#v", row)
+	}
+}
+
+// The other side of the same judgement: silence is only evidence about a holder
+// when this node is demonstrably able to reach the others. With most holders
+// unreachable the likely fault is local, and an audit that "repaired" its way
+// through a netsplit would forget where the object lives and then rebuild and
+// re-push the whole catalogue as the peers come back.
+func TestAuditDropsNothingWhenMostHoldersAreSilent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const dataShards, parityShards = 3, 2
+	fixture := disperseOnto(t, ctx, dataShards+parityShards, dataShards, parityShards, "netsplit", 9)
+	source, sourceStore := fixture.source, fixture.sourceStore
+	if result := source.DisperseObject(ctx, *fixture.manifest); !result.Complete {
+		t.Fatalf("setup dispersal reported %#v", result)
+	}
+
+	before, err := sourceStore.LoadObjectPlacement(fixture.manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three of the five holders go dark at once -- the shape of a netsplit, or
+	// of an I2P tunnel this node lost rather than three machines dying.
+	silenced := 0
+	for _, shard := range before.Shards {
+		if silenced == 3 {
+			break
+		}
+		if err := fixture.nodes[shard.Holders[0]].Close(); err != nil {
+			t.Fatal(err)
+		}
+		silenced++
+	}
+
+	for audit := 0; audit < 5; audit++ {
+		row, err := sourceStore.LoadObjectPlacement(fixture.manifest.ObjectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source.auditHolders(ctx, *row)
+	}
+
+	after, err := sourceStore.LoadObjectPlacement(fixture.manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, shard := range before.Shards {
+		for _, holder := range shard.Holders {
+			if !recordsHolder(t, sourceStore, fixture.manifest.ObjectID, shard.ShardID, holder) {
+				t.Fatalf("five audits during a netsplit forgot that %s holds shard %s",
+					holder[:12], shard.ShardID[:12])
+			}
+			if count := after.HolderSilences(shard.ShardID, holder); count != 0 {
+				t.Fatalf("holder %s carries %d silences out of a netsplit; it would be two probes from eviction",
+					holder[:12], count)
+			}
+		}
+	}
+}
+
+// A chunk can arrive at this code already co-located -- a ledger row written
+// before the property was enforced, two objects sharing a content-addressed
+// shard, or a placement round from an older build. Every shard has a holder, so
+// the pass has nothing obvious left to do; the object must not simply sit there
+// being counted as under-replicated forever.
+func TestAlreadyCoLocatedObjectIsSpreadByTheNextPass(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const dataShards, parityShards = 3, 2
+	fixture := disperseOnto(t, ctx, dataShards+parityShards, dataShards, parityShards, "crowded", 11)
+	source, sourceStore := fixture.source, fixture.sourceStore
+
+	// One peer is recorded as holding the entire chunk. Nine of nine placed,
+	// zero machines of redundancy.
+	var crowded string
+	for id := range fixture.nodes {
+		if crowded == "" || id < crowded {
+			crowded = id
+		}
+	}
+	for _, ref := range fixture.manifest.Chunks[0].Shards {
+		if err := sourceStore.ConfirmShardHolder(fixture.manifest.ObjectID, ref.ID, crowded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, err := sourceStore.LoadObjectPlacement(fixture.manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.UnderReplicated() || row.FullyDispersed() {
+		t.Fatalf("setup: a single-holder object reports %#v", row)
+	}
+
+	result := source.DisperseObject(ctx, *fixture.manifest)
+	if result.Placed == 0 {
+		t.Fatal("a fully placed but co-located object was left exactly as it was")
+	}
+	row, err = sourceStore.LoadObjectPlacement(fixture.manifest.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.UnderReplicated() {
+		t.Fatalf("still under-replicated after a pass over a co-located object: %#v", row)
+	}
+	// Measured from the peers' own disks: the pieces really did move.
+	elsewhere := 0
+	for id, storage := range fixture.stores {
+		if id == crowded {
+			continue
+		}
+		for _, ref := range fixture.manifest.Chunks[0].Shards {
+			if _, err := storage.ReadShard(ref.ID); err == nil {
+				elsewhere++
+			}
+		}
+	}
+	if elsewhere < dataShards {
+		t.Fatalf("only %d shard(s) reached a second machine, want at least %d", elsewhere, dataShards)
 	}
 }
