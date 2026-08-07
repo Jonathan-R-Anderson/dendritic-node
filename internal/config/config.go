@@ -511,7 +511,22 @@ func Default() (Config, error) {
 		DataDir:  dir,
 		RunMode:  "storage",
 		S3Listen: "127.0.0.1:9000",
-		UIListen: "127.0.0.1:9090",
+		// Every interface, not loopback. A node is usually a headless box, a VM
+		// or a Pi that the operator administers from their laptop, so a
+		// loopback-only dashboard is one they cannot reach at all without
+		// knowing to change this first -- and they cannot know, because the
+		// page that would tell them is the page they cannot open.
+		//
+		// This is only safe because validateDashboard REQUIRES a password for
+		// any non-loopback bind, and the generated password below satisfies it.
+		// Do not change one of these without the other.
+		UIListen: "0.0.0.0:9090",
+		// Generated, not blank: a blank password with the bind above would fail
+		// validation and the node would refuse to start out of the box. Printed
+		// at startup so the operator can read it out of the journal, and it is
+		// theirs to replace with something memorable.
+		UIUsername: DefaultDashboardUsername,
+		UIPassword: generatedDashboardPassword(),
 		// P2PListen is retained only so old configuration files still parse. The
 		// production node never uses these clearnet addresses.
 		P2PListen:     nil,
@@ -716,19 +731,27 @@ func (c Config) validateDashboard() error {
 	if isLoopback(host) {
 		return nil
 	}
-	// 0.0.0.0 and :: are refused even though they are the obvious thing to
-	// type, and refused BEFORE the password rule so the operator is told the
-	// real problem. They bind every interface this machine has now or acquires
-	// later: the LAN address that was wanted, but also the public address of a
-	// rented server and the café Wi-Fi a laptop joins next week. A password
-	// would still be asked for, but a password over cleartext HTTP is not what
-	// should stand between an admin panel and the open internet. Naming the
-	// address makes the blast radius a decision instead of a side effect of
-	// however this machine happens to be routed today.
+	// 0.0.0.0 and :: are ALLOWED, and this is a deliberate reversal. Naming one
+	// private address is safer in the abstract -- it binds only the interface
+	// you meant -- but it also breaks on DHCP, on a machine with two NICs, and
+	// on every VM whose address the operator does not know in advance. The
+	// operator asked for all interfaces, and an installer that refuses the
+	// obvious thing to type is not one people use.
+	//
+	// The password requirement below is what carries the weight now, and it
+	// applies to every non-loopback bind including this one. Note what that
+	// does NOT cover: this is cleartext HTTP, so on a machine with a public
+	// address the dashboard is exposed to the internet behind one password.
+	// Bind a private address, or firewall the port, if that machine is not
+	// yours alone.
 	if address := net.ParseIP(strings.Trim(host, "[]")); address != nil && address.IsUnspecified() {
-		return fmt.Errorf("ui_listen %q binds every interface, including any public one; "+
-			"name the private address you mean instead (for example \"192.168.1.50:9090\")",
-			c.UIListen)
+		if len(c.UIPassword) < minDashboardPasswordLength {
+			return fmt.Errorf("ui_listen %q binds every interface, including any public one, so it "+
+				"must have a password: set \"ui_password\" in the config file to at least %d "+
+				"characters (\"ui_username\" is optional and defaults to %q)",
+				c.UIListen, minDashboardPasswordLength, DefaultDashboardUsername)
+		}
+		return nil
 	}
 	if !isLANOnly(host) {
 		return fmt.Errorf("ui_listen %q is publicly routable; the management dashboard may only "+
@@ -1214,4 +1237,24 @@ func (r RouterConfig) CanRoute() (bool, string) {
 		return false, "a single channel may not exceed the total liquidity ceiling"
 	}
 	return true, ""
+}
+
+// generatedDashboardPassword returns a random password for a fresh config.
+//
+// A default node binds its dashboard to every interface, which validateDashboard
+// only permits with a password -- so the alternative to generating one is a node
+// that will not start until the operator edits a file they cannot yet reach the
+// page to be told about. Random beats a fixed default for the obvious reason: a
+// shipped constant is not a password, it is a published one.
+//
+// Base64 of 18 bytes, comfortably past the 12-character minimum. On the
+// vanishingly unlikely failure of the system RNG this returns empty, which makes
+// validation refuse the config loudly rather than silently install a node whose
+// admin page has no password at all.
+func generatedDashboardPassword() string {
+	buf := make([]byte, 18)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(buf)
 }
