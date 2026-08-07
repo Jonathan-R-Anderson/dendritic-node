@@ -138,8 +138,8 @@ type Config struct {
 	// run on every request -- HTTP Basic re-sends the credential on each poll of
 	// /api/status, so a KDF would hand any unauthenticated LAN host a cheap way
 	// to burn this node's CPU. Use a password you do not use anywhere else.
-	UIUsername    string   `json:"ui_username,omitempty"`
-	UIPassword    string   `json:"ui_password,omitempty"`
+	UIUsername    string   `json:"ui_username"`
+	UIPassword    string   `json:"ui_password"`
 	P2PListen     []string `json:"p2p_listen"`
 	I2PSAM        string   `json:"i2p_sam"`
 	I2PHTTPProxy  string   `json:"i2p_http_proxy"`
@@ -150,7 +150,12 @@ type Config struct {
 	// address the operator controls, typically their MetaMask. Empty means
 	// the node does the work but is never paid for it, so the dashboard
 	// nags until it is set.
-	PayoutAddress string        `json:"payout_address,omitempty"`
+	// NO omitempty, deliberately. This is where the operator's earnings go, and
+	// with omitempty an unset address is simply ABSENT from the written config
+	// -- so the one field somebody most needs to fill in is the one field they
+	// cannot see. Always writing it, empty, makes it self-documenting: open the
+	// file and there is a labelled blank waiting.
+	PayoutAddress string        `json:"payout_address"`
 	DataShards    int           `json:"data_shards"`
 	ParityShards  int           `json:"parity_shards"`
 	ChunkBytes    int           `json:"chunk_bytes"`
@@ -232,7 +237,7 @@ type DCSConfig struct {
 	// bridge calls to publish challenge blobs, deploy on a user's behalf, and
 	// read back addresses/queue status. It lets a container run through the site
 	// can deploy them anywhere; keep it off a public interface.
-	APIListen string `json:"api_listen,omitempty"`
+	APIListen string `json:"api_listen"`
 }
 
 type DCSRoleConfig struct {
@@ -266,7 +271,7 @@ type ComputeConfig struct {
 	// Supplied by the operator rather than downloaded automatically. A node
 	// that fetched and booted a kernel somebody else chose would have handed
 	// over the machine in the act of protecting it.
-	MicroVMKernel string `json:"microvm_kernel,omitempty"`
+	MicroVMKernel string `json:"microvm_kernel"`
 	MicroVMRootFS string `json:"microvm_rootfs,omitempty"`
 }
 
