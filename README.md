@@ -134,6 +134,57 @@ Build them before enabling compute.
 This prints the image's SHA-256, which is its address on the network. Needs
 `mke2fs` (`e2fsprogs`).
 
+## Install it
+
+`scripts/install.sh` does the whole Linux setup: it finds what is missing,
+installs it, and leaves the node running as a non-root service that comes back
+after a reboot.
+
+**Start with `--check`.** It runs every detection and changes nothing:
+
+```sh
+./scripts/install.sh --check
+```
+
+That prints a table of each dependency, which role needs it, whether it is
+present, and what would be done about it — including the things that *cannot*
+be installed (a CPU without `vmx`/`svm`, a VPS with no `/dev/kvm`, the microVM
+guest kernel you have to supply yourself). It is also the fastest answer to
+"why is my node half-working?", so keep using it after the install.
+
+When the plan looks right:
+
+```sh
+sudo ./scripts/install.sh                      # asks before it changes anything
+sudo ./scripts/install.sh --yes                # same plan, no questions
+sudo ./scripts/install.sh --with-compute       # also prepare Docker for compute
+sudo ./scripts/install.sh --no-service         # no boot service; you run it yourself
+```
+
+What it does, and does not do:
+
+- **Installs an I2P router only if one is not already there.** It decides that
+  by completing a real SAM handshake on `127.0.0.1:7656`, not by checking a
+  console port — the console answers immediately while SAM can be two minutes
+  behind it. If something already answers, it installs no router and edits no
+  router config: two routers fighting over `7656` is worse than none.
+- **Waits for SAM properly**, up to five minutes, and installs that same wait
+  as the service's `ExecStartPre`. The node has no startup retry, so a service
+  that starts before the bridge exists just dies.
+- **Runs the node as a dedicated `syndichan` user**, never root, and the only
+  path it takes ownership of is the node's own data directory.
+- **Enables the router on boot too**, otherwise the node reboots into nothing.
+- **Never downloads a guest kernel**, never installs a GPU driver, and never
+  claims `/dev/kvm` can be installed. Those it reports.
+- **Is safe to re-run.** If the unit file has been edited since the installer
+  wrote it, it says so and refuses to overwrite your changes.
+
+On macOS it installs a LaunchAgent instead and says plainly that this starts
+the node at login rather than at boot. On a platform it does not recognise it
+prints the exact commands to run rather than guessing.
+
+Run `./scripts/install.sh --help` for the full option list.
+
 ## Run it as a storage node
 
 **First install I2P**, because the storage node refuses to start without it —
