@@ -9,7 +9,12 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/syndichan-node
-ExecStart=/home/ubuntu/syndichan-node/bin/syndichan-node -gateway-only -config /home/ubuntu/syndichan-node/config/config.json -data-dir /home/ubuntu/syndichan-node/data
+# Neither -gateway-only nor -data-dir exists on the binary; both exit 2 with
+# "flag provided but not defined". The gateway role is selected IN THE CONFIG:
+#   "run_mode": "gateway-only"
+# in /home/ubuntu/syndichan-node/config/config.json (see GATEWAY.md). The data
+# directory is that config file's own directory, or its data_dir key.
+ExecStart=/home/ubuntu/syndichan-node/bin/syndichan-node -config /home/ubuntu/syndichan-node/config/config.json
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=75s

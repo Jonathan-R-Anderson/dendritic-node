@@ -1,15 +1,28 @@
+# REFERENCE COPY. scripts/install.sh generates a better unit than this one and
+# writes it to /etc/systemd/system/syndichan-node.service: it names whichever
+# router this machine actually has, and it adds an ExecStartPre that waits for
+# the SAM bridge. Prefer the installer; this file is for people who want to see
+# the shape, or who are packaging by hand.
 [Unit]
 Description=Syndichan encrypted volunteer storage and edge node
 Documentation=https://github.com/Jonathan-R-Anderson/syndichan/tree/main/storage-client
-Wants=network-online.target
+Wants=network-online.target i2pd.service
 After=network-online.target i2pd.service
-Requires=i2pd.service
+# Wants=, not Requires=. Requires=i2pd.service refuses to start the node at all
+# on a machine whose router unit is i2p.service (Java I2P) -- "Unit
+# i2pd.service not found" -- and otherwise takes the node down with the router
+# every time the router restarts.
 
 [Service]
 Type=simple
 User=syndichan
 Group=syndichan
-ExecStart=/usr/local/bin/syndichan-node -config /var/lib/syndichan/config.json -data-dir /var/lib/syndichan/data
+# The node registers exactly six flags: -config, -payout, -capacity-gib,
+# -ui-listen, -show-config, -config-path. There is no -data-dir; passing it
+# exits 2 with "flag provided but not defined" before anything starts. The data
+# directory is the config file's own directory (config.LoadOrCreate), or the
+# data_dir key inside it.
+ExecStart=/usr/local/bin/syndichan-node -config /var/lib/syndichan/config.json
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=75s

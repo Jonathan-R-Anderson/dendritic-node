@@ -130,8 +130,14 @@ chmod 0755 "$tmp/syndichan-node"
 
 # Loading the real configuration catches schema or validation incompatibility
 # without binding a listener or touching the durable identity/store.
-"$tmp/syndichan-node" -gateway-status \
-  -config "$CONFIG_FILE" -data-dir "$DATA_DIR" >/dev/null
+#
+# -show-config, not -gateway-status: that flag has never existed on this binary.
+# It exited 2 with "flag provided but not defined", and under `set -euo pipefail`
+# that aborted EVERY update run at this line -- so no update ever reached the
+# install step. -show-config is the flag that does what the comment above
+# describes: ConfigPath -> LoadOrCreate -> ValidateForRole, print, exit. There is
+# no -data-dir either; the data directory comes from the config file.
+"$tmp/syndichan-node" -show-config -config "$CONFIG_FILE" >/dev/null
 if [ -f "$tmp/source/scripts/update-from-github.sh" ]; then
   bash -n "$tmp/source/scripts/update-from-github.sh"
 fi
