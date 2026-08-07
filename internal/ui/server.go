@@ -62,6 +62,9 @@ type Server struct {
 	// disagree: there is no way to wire up a LAN-reachable dashboard and forget
 	// to turn authentication on.
 	listen string
+	// listenIsUnspecified: bound to 0.0.0.0 or ::, so there is no single
+	// address a browser's Host header could match. See validRequestHost.
+	listenIsUnspecified bool
 	// SHA-256 of the expected credential. Digests rather than the strings
 	// themselves so the comparison is over fixed-length values: a byte-wise
 	// compare of the raw password would take a length-dependent amount of time
@@ -80,6 +83,12 @@ type Server struct {
 // are unaffected; a Server nobody called this on is loopback-only.
 func (s *Server) SetAccessControl(listen, username, password string) {
 	s.listen = listen
+	s.listenIsUnspecified = false
+	if host, _, err := net.SplitHostPort(listen); err == nil {
+		if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil && ip.IsUnspecified() {
+			s.listenIsUnspecified = true
+		}
+	}
 	s.authSet = password != ""
 	s.authUser = sha256.Sum256([]byte(username))
 	s.authPass = sha256.Sum256([]byte(password))
@@ -137,7 +146,29 @@ func (s *Server) validRequestHost(value string) bool {
 	if validDashboardHost(value) {
 		return true
 	}
-	return s.listen != "" && strings.EqualFold(value, s.listen)
+	if s.listen != "" && strings.EqualFold(value, s.listen) {
+		return true
+	}
+	// Bound to every interface (0.0.0.0 / ::), which is the default. There is no
+	// single address to compare against -- the operator reaches this page at
+	// whichever of the machine's addresses they can route to, and the node
+	// cannot know which -- so the literal-address check above matches nothing
+	// real and every LAN request was rejected as an "invalid dashboard host".
+	//
+	// Accept any IP-LITERAL Host instead. That keeps the guard doing the one job
+	// it exists for: DNS rebinding needs a NAME in the Host header, because the
+	// attack is a hostname whose address flips to a private one after the page
+	// loads. An IP literal cannot rebind -- there is nothing to re-resolve -- so
+	// allowing them costs nothing, while a name still has to pass
+	// validDashboardHost.
+	if s.listenIsUnspecified {
+		host := value
+		if h, _, err := net.SplitHostPort(value); err == nil {
+			host = h
+		}
+		return net.ParseIP(strings.Trim(host, "[]")) != nil
+	}
+	return false
 }
 
 // SetStoragePaths tells the dashboard where shards live and how to persist a
