@@ -1201,7 +1201,10 @@ func (n *Node) replicateOnce(ctx context.Context) {
 		}
 		manifest, err := n.store.HeadObject(row.Bucket, row.Key)
 		if err != nil {
-			_ = n.store.ForgetPlacement(row.ObjectID)
+			// Ghost row: the object is gone but its holders are not. Capture
+			// them into a recall tombstone before the row is dropped, or the
+			// shards stay on peers with nothing left that can name them.
+			_ = n.store.RetirePlacement(row.ObjectID, "object missing at replicate pass")
 			continue
 		}
 		result := n.DisperseObject(ctx, *manifest)

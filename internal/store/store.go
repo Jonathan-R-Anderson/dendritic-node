@@ -106,6 +106,7 @@ func Open(dir string, dataShards, parityShards, chunkBytes int, capacity int64) 
 		for _, name := range [][]byte{
 			bucketBuckets, bucketObjects, bucketDenied, bucketRemote,
 			bucketSettings, bucketPolicies, bucketPlacement, bucketPlacementIndex,
+			bucketRecall,
 		} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
@@ -898,9 +899,18 @@ func (s *Store) DeleteObject(bucket, key string) error {
 	if err == nil {
 		s.removeUnreferenced(candidates)
 		if objectID != "" {
-			// Otherwise the dispersal pass keeps trying to place shards of an
-			// object that no longer exists, forever.
-			_ = s.forgetPlacement(objectID)
+			// RECALL BEFORE FORGET. forgetPlacement destroys the holder list,
+			// and the holder list is the only record anywhere of which peers
+			// hold shards of this object -- the peers keep a row keyed by shard
+			// id and do not know who else has a piece. Capturing it into a
+			// recall tombstone FIRST is what makes the shards reachable after
+			// the object is gone; doing it in the other order (which is what
+			// this did) leaves the bytes on peers and no way to name them.
+			//
+			// RetirePlacement does both, in that order. Forgetting is still
+			// required: otherwise the dispersal pass keeps trying to place
+			// shards of an object that no longer exists, forever.
+			_ = s.RetirePlacement(objectID, "object deleted")
 		}
 	}
 	return err
@@ -1013,7 +1023,10 @@ func (s *Store) RejectAndRemove(kind, id string) error {
 		return err
 	}
 	if kind == "object" {
-		_ = s.forgetPlacement(id)
+		// Same ordering rule as DeleteObject: the operator rejecting an object
+		// from the dashboard is exactly the case where its shards most need
+		// recalling, so capture the holders before the list is destroyed.
+		_ = s.RetirePlacement(id, "object rejected by this node")
 	}
 	for _, shardID := range candidates {
 		if err := s.removeUnreferenced([]string{shardID}); err != nil {

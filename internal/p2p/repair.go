@@ -173,9 +173,13 @@ func (n *Node) repairObject(ctx context.Context, row store.ObjectPlacement, budg
 	if err != nil {
 		// The object is gone but the ledger row survived (a delete path that
 		// predates the ledger). Drop it rather than repairing a ghost forever.
-		n.logger.Printf("repair: %s/%s no longer exists; dropping its placement row",
+		n.logger.Printf("repair: %s/%s no longer exists; retiring its placement row",
 			row.Bucket, row.Key)
-		_ = n.store.ForgetPlacement(row.ObjectID)
+		// Retire, not forget: this is a ghost row, so the holder list it carries
+		// is the ONLY surviving evidence that shards of a now-deleted object are
+		// sitting on peers. RetirePlacement captures it into a recall tombstone
+		// before dropping the row.
+		_ = n.store.RetirePlacement(row.ObjectID, "object missing at repair audit")
 		return outcome
 	}
 	n.auditHolders(ctx, row)
