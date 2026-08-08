@@ -103,7 +103,7 @@ func (h *recallHarness) token(objectID, shardID string) Revocation {
 		Version: 1, ObjectID: objectID, ShardID: shardID,
 		Recipient: h.target.host.ID().String(),
 		IssuedAt:  time.Now().Unix(), ExpiresAt: time.Now().Unix() + 300,
-		Nonce:     base64.RawURLEncoding.EncodeToString(nonce),
+		Nonce: base64.RawURLEncoding.EncodeToString(nonce),
 	})
 }
 
