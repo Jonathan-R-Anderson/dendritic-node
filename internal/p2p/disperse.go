@@ -122,6 +122,9 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 			}
 			byID[record.NodeID] = placement.Candidate{
 				PeerID: record.NodeID, FreeBytes: record.FreeBytes,
+				// Carried for levelling, which needs occupancy rather than room:
+				// Capacity-FreeBytes is what the peer measured on its own disk.
+				Capacity: record.Capacity,
 			}
 		}
 	}
@@ -390,6 +393,16 @@ func (n *Node) placeOne(
 	if n.store.HoldsSiblingShard(objectID, shardID, target.String()) {
 		return errWouldCoLocate
 	}
+	// A peer levelling has just taken this shard OFF is refusing it for the next
+	// six hours (DeleteRemoteShard writes that refusal, and it must: it is what
+	// stops the replicate loop undoing an operator's delete). Asking anyway would
+	// spend a lease and an I2P round trip to be told "recalled recently" -- which
+	// answeredNo counts as a refusal, so three of them would drop a healthy
+	// volunteer out of every candidate set over a refusal this node caused.
+	// Declining here is the mover skipping its own; see NoteShardMovedAway.
+	if n.store.ShardMovedAwayFrom(objectID, shardID, target.String()) {
+		return errRecentlyMovedAway
+	}
 	value, err := read(shardID)
 	if err != nil {
 		return err
@@ -463,6 +476,11 @@ var errShardProbeRefused = errors.New("peer refused the shard probe")
 // unplaced shard is a deficit the next pass can fix, and a silent skip would
 // look like success.
 var errWouldCoLocate = errors.New("peer already holds a shard of this chunk")
+
+// errRecentlyMovedAway means levelling took this shard off this peer recently
+// enough that the peer would refuse it. Not a fault of the peer's and not
+// counted against it: this node created the condition and this node remembers.
+var errRecentlyMovedAway = errors.New("this shard was levelled off that peer recently")
 
 // A peer that keeps saying no is worse than a peer that is absent: candidates
 // are ranked by ADVERTISED free space, and the peers refusing here advertise

@@ -25,9 +25,47 @@ import (
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 )
 
-// stubCoordinator signs whatever lease is asked for, so a test exercises
-// placement rather than the lease service.
-func stubCoordinator(t *testing.T, nodes ...*Node) {
+// coordinatorStub is the signing authority a test stands in for, and the record
+// of what was asked of it. The counts matter to the levelling tests: "the source
+// was never asked to delete" is only observable as "no delete token was ever
+// minted for it", so the stub has to be able to say.
+type coordinatorStub struct {
+	key ed25519.PrivateKey
+	mu  sync.Mutex
+	// revocations counts delete tokens issued, by (shard, recipient).
+	revocations []revocationRequestShard
+	// gate, when non-nil, holds every revocation request until it is closed, so
+	// a test can park one move mid-flight and watch what another one does.
+	gate chan struct{}
+	// hit is signalled once per revocation request, buffered so nothing blocks
+	// on a test that is not listening.
+	hit chan struct{}
+}
+
+func (c *coordinatorStub) revocationsIssued() []revocationRequestShard {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]revocationRequestShard(nil), c.revocations...)
+}
+
+func (c *coordinatorStub) hold() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gate = make(chan struct{})
+}
+
+func (c *coordinatorStub) release() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gate != nil {
+		close(c.gate)
+		c.gate = nil
+	}
+}
+
+// stubCoordinator signs whatever lease or revocation is asked for, so a test
+// exercises placement and levelling rather than the coordinator.
+func stubCoordinator(t *testing.T, nodes ...*Node) *coordinatorStub {
 	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -36,6 +74,7 @@ func stubCoordinator(t *testing.T, nodes ...*Node) {
 	for _, node := range nodes {
 		node.coordKey = publicKey
 	}
+	stub := &coordinatorStub{key: privateKey, hit: make(chan struct{}, 64)}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request leaseRequest
 		if err := json.NewDecoder(io.LimitReader(r.Body, maxHeaderBytes)).Decode(&request); err != nil {
@@ -56,6 +95,49 @@ func stubCoordinator(t *testing.T, nodes ...*Node) {
 	previous := leaseURL
 	leaseURL = server.URL
 	t.Cleanup(func() { leaseURL = previous })
+
+	revocations := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request revocationRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&request); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		stub.mu.Lock()
+		stub.revocations = append(stub.revocations, request.Shards...)
+		gate := stub.gate
+		stub.mu.Unlock()
+		select {
+		case stub.hit <- struct{}{}:
+		default:
+		}
+		if gate != nil {
+			<-gate
+		}
+		var issued revocationResponse
+		for _, entry := range request.Shards {
+			nonce := make([]byte, 16)
+			_, _ = rand.Read(nonce)
+			revocation := Revocation{
+				Version: 1, ObjectID: request.ObjectID, ShardID: entry.ShardID,
+				Recipient: entry.Recipient,
+				// Taken from the body the node signed, exactly as the real
+				// coordinator takes it from the authenticated requester.
+				Requester: request.Requester,
+				IssuedAt:  time.Now().Unix(), ExpiresAt: time.Now().Unix() + 600,
+				Nonce: base64.RawURLEncoding.EncodeToString(nonce),
+			}
+			revocation.Signature = base64.RawStdEncoding.EncodeToString(
+				ed25519.Sign(privateKey, revocationMessage(revocation)),
+			)
+			issued.Revocations = append(issued.Revocations, revocation)
+		}
+		_ = json.NewEncoder(w).Encode(issued)
+	}))
+	t.Cleanup(revocations.Close)
+	previousRevocation := revocationURL
+	revocationURL = revocations.URL
+	t.Cleanup(func() { revocationURL = previousRevocation })
+	return stub
 }
 
 // varyingBytes is deterministic pseudo-random content. Uniform content matters:
@@ -464,6 +546,7 @@ type dispersedObject struct {
 	nodes       map[string]*Node
 	stores      map[string]*store.Store
 	manifest    *store.Manifest
+	coordinator *coordinatorStub
 }
 
 func disperseOnto(t *testing.T, ctx context.Context, targets, dataShards, parityShards int,
@@ -481,7 +564,7 @@ func disperseOnto(t *testing.T, ctx context.Context, targets, dataShards, parity
 		out.stores[node.host.ID().String()] = storage
 		all = append(all, node)
 	}
-	stubCoordinator(t, all...)
+	out.coordinator = stubCoordinator(t, all...)
 	for _, target := range all[1:] {
 		if err := source.host.Connect(ctx, peer.AddrInfo{
 			ID: target.host.ID(), Addrs: target.host.Addrs(),

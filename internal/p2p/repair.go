@@ -222,6 +222,13 @@ func (n *Node) repairObject(ctx context.Context, row store.ObjectPlacement, budg
 	result := n.placeShards(ctx, row.ObjectID, candidates,
 		func(shardID string) ([]byte, error) { return n.store.ReadShard(shardID) })
 	outcome.replaced += result.Placed
+	// Repair's shard movements are charged to the budget it shares with
+	// levelling. Recorded, never refused: repair is restoring durability, and
+	// throttling it to make room for tidying would be exactly backwards. What
+	// this buys is the other direction -- a half hour of heavy repair leaves
+	// nothing for the mover, which is the priority order the roadmap requires,
+	// enforced by a counter rather than asserted in a comment.
+	n.shardMoves.record(outcome.regenerated + outcome.replaced)
 	return outcome
 }
 

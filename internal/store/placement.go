@@ -79,7 +79,17 @@ type ObjectPlacement struct {
 	// cannot spin the same objects in a loop.
 	LastAttempt time.Time `json:"last_attempt"`
 	Attempts    int       `json:"attempts"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	// LastRebalance is when the levelling mover last worked on this object.
+	//
+	// A SEPARATE clock from LastAttempt on purpose. Stamping the shared one
+	// would make the lowest-priority mover in the system push the object's next
+	// REPAIR audit six hours into the future every time it looked at it, so
+	// levelling would starve the loop that keeps objects alive. Absent from
+	// older rows, which decode as the zero time and are therefore due
+	// immediately -- correct, since they have never been levelled.
+	LastRebalance time.Time `json:"last_rebalance,omitempty"`
+	Rebalances    int       `json:"rebalances,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // DurableRemoteHolders is how many DISTINCT PEERS must hold shards of a chunk
@@ -279,6 +289,10 @@ func (s *Store) RecordObjectPlacement(manifest Manifest) error {
 					row.Shards[i].Silences = known[row.Shards[i].ShardID].Silences
 				}
 				row.LastAttempt, row.Attempts = previous.LastAttempt, previous.Attempts
+				// The levelling clock travels with them. A rewrite that reset it
+				// would hand the mover a fresh licence to churn the object every
+				// time the same bytes were re-PUT under a new key.
+				row.LastRebalance, row.Rebalances = previous.LastRebalance, previous.Rebalances
 			}
 		}
 		encoded, err := json.Marshal(row)

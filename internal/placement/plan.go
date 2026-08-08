@@ -34,6 +34,12 @@ import "sort"
 type Candidate struct {
 	PeerID    string
 	FreeBytes int64
+	// Capacity is the total the peer says it will accept, from the same record.
+	// Zero means the record is absent, NOT that the peer has no room -- levelling
+	// needs the difference, because Capacity-FreeBytes is the only measured
+	// occupancy figure a peer publishes about itself and "unknown" must never be
+	// read as "empty". Plan itself ignores it.
+	Capacity int64
 }
 
 // Shard is one erasure shard of one chunk, as the planner sees it.

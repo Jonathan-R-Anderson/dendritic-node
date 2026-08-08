@@ -218,6 +218,11 @@ type Node struct {
 	// lockPlacement in disperse.go.
 	placingMu sync.Mutex
 	placing   map[string]*placementGate
+	// shardMoves is the rate limit repair and levelling SHARE. Both move shards
+	// and both draw on the same coordinator; unbounded they fight over the leases
+	// placement needs. Repair records against it and is never refused, levelling
+	// is refused as soon as the window is spent. See rebalance.go.
+	shardMoves *shardMoveBudget
 	// cacheOnly nodes serve their own content but host nothing for anyone
 	// else; see the "store" branch of handleStream.
 	cacheOnly           bool
@@ -375,7 +380,7 @@ func finishNode(
 		host: h, dht: kad, store: storage, logger: logger, bootstrap: config.BootstrapURL,
 		bootstrapPeers: make(map[peer.ID]struct{}), http: httpClient,
 		directHTTP: directHTTP, i2pOnly: i2pOnly,
-		repairing: make(map[string]struct{}),
+		repairing: make(map[string]struct{}), shardMoves: newShardMoveBudget(),
 		// Empty until the first bootstrap fetch, and empty reports STALE — so a
 		// node that has not yet learned the network offers no candidates rather
 		// than silently offering none and looking healthy.
@@ -417,6 +422,12 @@ func finishNode(
 		// an object was purged are chased until they answer, so a partial recall
 		// finishes itself instead of quietly stopping.
 		go n.RecallStored(ctx)
+		// Levelling is last, in the list and in priority. It moves shards off
+		// nodes holding more than their share onto nodes holding less, and it
+		// yields to both of the loops above -- per object (never levels one that
+		// is under-replicated) and per half hour (a rate limit it shares with
+		// repair).
+		go n.RebalanceStored(ctx)
 	}
 	return n, nil
 }
