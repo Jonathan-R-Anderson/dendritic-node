@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -247,7 +248,21 @@ func (s *Store) RetirePlacement(objectID, reason string) error {
 	return s.forgetPlacement(objectID)
 }
 
-// LoadRecall returns one tombstone, or os.ErrNotExist.
+// ErrRecallLedgerUnreadable means the tombstone could not be READ: bolt failed,
+// or the row will not unmarshal. It is a different error from os.ErrNotExist on
+// purpose, and every caller has to keep them apart.
+//
+// "there is no tombstone" and "I could not find out whether there is a
+// tombstone" are opposite answers on the page an operator uses for takedowns.
+// Collapsing the second into the first prints "the ledger recorded no confirmed
+// remote holder for this object" -- i.e. draws an unknown as a zero, in the
+// comfortable direction -- which is the same defect as a backfill counter that
+// fell on schedule while every node stayed empty.
+var ErrRecallLedgerUnreadable = errors.New("the recall ledger could not be read")
+
+// LoadRecall returns one tombstone, os.ErrNotExist when the object genuinely has
+// none, or an error wrapping ErrRecallLedgerUnreadable when the answer is not
+// known.
 func (s *Store) LoadRecall(objectID string) (*RecallRecord, error) {
 	var record RecallRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -257,20 +272,112 @@ func (s *Store) LoadRecall(objectID string) (*RecallRecord, error) {
 		}
 		return json.Unmarshal(value, &record)
 	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, os.ErrNotExist
+	}
 	if err != nil {
-		return nil, err
+		// %v on the cause, not %w: callers classify on ErrRecallLedgerUnreadable
+		// and must not accidentally match a bolt or json sentinel underneath it.
+		return nil, fmt.Errorf("%w (%s): %v", ErrRecallLedgerUnreadable, objectID, err)
 	}
 	return &record, nil
 }
 
+// A REFUSAL IS NOT TERMINAL, BUT IT IS NOT FREE EITHER
+// ----------------------------------------------------
+// RecallRefused is deliberately non-terminal: "another manifest of mine still
+// references these bytes" can stop being true, and a holder that refuses because
+// it has not fetched the coordinator's bootstrap document yet starts honouring
+// tokens the moment it does. So the tombstone survives and the holder is asked
+// again.
+//
+// With a flat cooldown, though, a holder that refuses PERMANENTLY was asked
+// every ten minutes forever, and each pass minted a fresh coordinator-signed
+// revocation for it -- a destructive token, spent on a peer that has already
+// said no a hundred times -- and wrote another line to the log. Verifying
+// deletions (a holder that claims deletion and still has the shard is now
+// recorded refused, not deleted) only produces MORE of these.
+//
+// The answer is a backoff with a ceiling, and NOT a terminal state:
+//
+//   - the delay doubles from the base cooldown per answered pass, so a holder
+//     mid-outage costs a handful of retries instead of one every ten minutes;
+//   - once the least-asked outstanding holder has answered recallAttemptCeiling
+//     times, the tombstone drops to recallDeferredInterval and stays there;
+//   - it is never dropped and never marked gone. Deferred is a SCHEDULE, so a
+//     holder that starts answering again is still retried -- just hourly-ish
+//     rather than every ten minutes;
+//   - and it binds the BACKGROUND pass only. An operator re-running a recall
+//     from the admin page calls RecallObject directly and is never deferred:
+//     the ceiling exists to stop the machine from spending tokens on a peer
+//     that keeps saying no, not to stop a human from asking.
+//
+// The clock is the least-asked OUTSTANDING holder, so one stubborn refuser
+// cannot slow down a holder that was only just added by a re-capture, and a
+// holder that reaches a terminal answer stops counting against the record.
+const (
+	recallAttemptCeiling   = 6
+	recallDeferredInterval = 6 * time.Hour
+)
+
+// leastAskedOutstanding is how many answers the least-asked non-terminal holder
+// has given. Zero when a holder has never been reached at all.
+func (r RecallRecord) leastAskedOutstanding() int {
+	fewest := -1
+	for _, shard := range r.Shards {
+		for _, holder := range shard.Holders {
+			if holder.State == RecallDeleted || holder.State == RecallAbsent {
+				continue
+			}
+			if fewest < 0 || holder.Attempts < fewest {
+				fewest = holder.Attempts
+			}
+		}
+	}
+	if fewest < 0 {
+		return 0
+	}
+	return fewest
+}
+
+// retryAfter is the cooldown this tombstone has earned: base, doubling per
+// answered pass, capped at recallDeferredInterval.
+func (r RecallRecord) retryAfter(base time.Duration) time.Duration {
+	if base <= 0 {
+		base = time.Minute
+	}
+	attempts := r.leastAskedOutstanding()
+	if attempts >= recallAttemptCeiling {
+		return recallDeferredInterval
+	}
+	delay := base
+	for i := 0; i < attempts; i++ {
+		delay *= 2
+		if delay >= recallDeferredInterval {
+			return recallDeferredInterval
+		}
+	}
+	return delay
+}
+
+// Deferred reports whether the background pass has backed off to the long
+// interval for this tombstone. Exported so the admin report can say so out loud:
+// "still outstanding, and being retried every six hours" is a different fact
+// from "still outstanding", and an operator watching for progress deserves the
+// difference.
+func (r RecallRecord) Deferred() bool {
+	return r.Outstanding() > 0 && r.leastAskedOutstanding() >= recallAttemptCeiling
+}
+
 // PendingRecalls returns tombstones with outstanding holders, least-recently
-// attempted first, skipping anything attempted inside cooldown. Same shape as
-// DispersalCandidates so a recall storm is rate-limited the same way.
+// attempted first, skipping anything still inside the cooldown it has earned.
+// Same shape as DispersalCandidates so a recall storm is rate-limited the same
+// way.
 func (s *Store) PendingRecalls(limit int, cooldown time.Duration) ([]RecallRecord, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	cutoff := time.Now().UTC().Add(-cooldown)
+	now := time.Now().UTC()
 	var rows []RecallRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketRecall).ForEach(func(_, value []byte) error {
@@ -281,7 +388,8 @@ func (s *Store) PendingRecalls(limit int, cooldown time.Duration) ([]RecallRecor
 			if record.Resolved() {
 				return nil
 			}
-			if !record.LastAttempt.IsZero() && record.LastAttempt.After(cutoff) {
+			if !record.LastAttempt.IsZero() &&
+				record.LastAttempt.Add(record.retryAfter(cooldown)).After(now) {
 				return nil
 			}
 			rows = append(rows, record)
@@ -300,20 +408,29 @@ func (s *Store) PendingRecalls(limit int, cooldown time.Duration) ([]RecallRecor
 	return rows, nil
 }
 
-// AllRecalls lists every tombstone, resolved or not, for the admin listing.
-func (s *Store) AllRecalls() ([]RecallRecord, error) {
+// AllRecalls lists every tombstone, resolved or not, for the admin listing, and
+// separately COUNTS the rows it could not parse.
+//
+// The count is returned rather than swallowed for the same reason LoadRecall
+// classifies its errors: a row that will not unmarshal used to vanish from this
+// listing, so an object whose holders were still being chased simply stopped
+// being mentioned and the summary's "recalls outstanding" silently shrank. A row
+// that cannot be read is not a row that is not there.
+func (s *Store) AllRecalls() ([]RecallRecord, int, error) {
 	var rows []RecallRecord
+	unreadable := 0
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketRecall).ForEach(func(_, value []byte) error {
 			var record RecallRecord
 			if err := json.Unmarshal(value, &record); err != nil {
+				unreadable++
 				return nil
 			}
 			rows = append(rows, record)
 			return nil
 		})
 	})
-	return rows, err
+	return rows, unreadable, err
 }
 
 func (s *Store) updateRecall(objectID string, mutate func(*RecallRecord) error) error {
@@ -809,6 +926,141 @@ func (s *Store) refuseRecalledShard(objectID, shardID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketDenied).Put(recallRefusalKey(objectID, shardID), []byte(deadline))
 	})
+}
+
+// REVOCATION REPLAY, AND WHY THE NONCE IS WRITTEN TO DISK
+// =======================================================
+// A revocation carries a Nonce, it is inside the signed message, and nothing
+// remembered it. A delete token was therefore reusable at its recipient for its
+// entire lifetime: anything holding a copy of the frame -- the holder itself,
+// most obviously -- could present the same bytes again and again until it
+// expired. The practical damage was small (the shard is gone and denylisted, so
+// a replay deletes nothing), but a destructive capability that can be spent
+// twice is a bug in the capability, not in its consequences.
+//
+// PERSISTED, LIKE refuseRecalledShard, AND FOR A WEAKER VERSION OF THE SAME
+// REASON. That function is on disk because an in-memory cooldown resets in a
+// crash loop and the owner's replicate pass would push the recalled shard
+// straight back -- a permanent loss of the guarantee. Here the exposure is
+// bounded by the token's own lifetime instead: validateRevocation refuses
+// anything expiring more than an hour out, and the coordinator mints ten
+// minutes, so an in-memory cache would only reopen the replay window for a node
+// that restarted inside those minutes. That is a narrower hole, but a crash
+// loop is exactly a machine that restarts repeatedly inside ten minutes, and the
+// cost of closing it is one bolt write on a path that already writes to bolt
+// (DeleteRemoteShard) and that runs at most once per placed shard per recall.
+// So: persisted.
+//
+// BOUNDED, BECAUSE A REMOTE PARTY FEEDS IT. Entries can only be created by a
+// token this node has already fully validated -- coordinator-signed, naming this
+// node as recipient and the authenticated peer as requester -- so the fill rate
+// is the coordinator's minting rate and not an attacker's request rate. It is
+// still bounded twice: every claim drops entries whose token has expired (they
+// are inert, validateRevocation rejects them on age alone), and if that still
+// leaves more than maxRevocationNonces, the entries closest to expiry are
+// dropped to make room. Evicting the closest to expiry is the least-harmful
+// choice available: those are the tokens with the least remaining life in which
+// to be replayed.
+var bucketRevocationNonces = []byte("revocation_nonces")
+
+// maxRevocationNonces caps the replay cache. A holder sees one token per shard
+// it holds of the object being recalled -- tens, for a large object -- and a
+// token lives at most an hour, so a few thousand covers a very busy hour with
+// room to spare. At roughly 80 bytes an entry the cap is a few hundred kB.
+const maxRevocationNonces = 4096
+
+// maxRevocationNonceLength mirrors validateRevocation's own ceiling so a caller
+// that forgot to validate cannot use this bucket as unbounded remote storage.
+const maxRevocationNonceLength = 128
+
+// ClaimRevocationNonce records a revocation nonce as SPENT and reports whether
+// this caller is the first to spend it. A false return is a replay.
+//
+// Check-and-set inside one transaction on purpose: two streams presenting the
+// same captured token at the same moment must not both read "unused" and both
+// be honoured.
+//
+// The caller passes the token's own expiry, so an entry lives exactly as long as
+// the token it defends against and not a second longer.
+func (s *Store) ClaimRevocationNonce(nonce string, expiresAt time.Time) (bool, error) {
+	if nonce == "" {
+		return false, errors.New("revocation nonce is empty")
+	}
+	if len(nonce) > maxRevocationNonceLength {
+		return false, errors.New("revocation nonce is too long")
+	}
+	now := time.Now().UTC()
+	if !expiresAt.After(now) {
+		return false, errors.New("revocation has already expired")
+	}
+	fresh := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		spent := tx.Bucket(bucketRevocationNonces)
+		if raw := spent.Get([]byte(nonce)); raw != nil {
+			deadline, perr := time.Parse(time.RFC3339Nano, string(raw))
+			if perr == nil && now.Before(deadline) {
+				// Spent, and the token it was spent on is still live. Replay.
+				return nil
+			}
+			// An elapsed or unparseable entry is re-claimable: a token that old
+			// cannot be honoured anyway (validateRevocation checks the expiry),
+			// so keeping the entry would only consume space.
+		}
+		if err := pruneRevocationNonces(tx, now); err != nil {
+			return err
+		}
+		fresh = true
+		return spent.Put([]byte(nonce),
+			[]byte(expiresAt.UTC().Format(time.RFC3339Nano)))
+	})
+	if err != nil {
+		return false, err
+	}
+	return fresh, nil
+}
+
+// pruneRevocationNonces drops expired entries, then -- if the bucket is still at
+// its cap -- enough of the entries closest to expiry to fit one more.
+//
+// Keys are collected and deleted after the walk rather than through the cursor,
+// because deleting under an iterating cursor is the kind of subtlety that works
+// until the day it skips an entry.
+func pruneRevocationNonces(tx *bolt.Tx, now time.Time) error {
+	spent := tx.Bucket(bucketRevocationNonces)
+	type entry struct {
+		key      []byte
+		deadline time.Time
+	}
+	var expired [][]byte
+	var live []entry
+	if err := spent.ForEach(func(key, value []byte) error {
+		deadline, err := time.Parse(time.RFC3339Nano, string(value))
+		if err != nil || !now.Before(deadline) {
+			expired = append(expired, append([]byte(nil), key...))
+			return nil
+		}
+		live = append(live, entry{key: append([]byte(nil), key...), deadline: deadline})
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, key := range expired {
+		if err := spent.Delete(key); err != nil {
+			return err
+		}
+	}
+	if len(live) < maxRevocationNonces {
+		return nil
+	}
+	sort.SliceStable(live, func(i, j int) bool {
+		return live[i].deadline.Before(live[j].deadline)
+	})
+	for i := 0; i <= len(live)-maxRevocationNonces; i++ {
+		if err := spent.Delete(live[i].key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RecallRefused reports whether this object's copy of this shard is still

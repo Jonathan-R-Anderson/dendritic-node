@@ -106,7 +106,7 @@ func Open(dir string, dataShards, parityShards, chunkBytes int, capacity int64) 
 		for _, name := range [][]byte{
 			bucketBuckets, bucketObjects, bucketDenied, bucketRemote,
 			bucketSettings, bucketPolicies, bucketPlacement, bucketPlacementIndex,
-			bucketRecall,
+			bucketRecall, bucketRevocationNonces,
 		} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err

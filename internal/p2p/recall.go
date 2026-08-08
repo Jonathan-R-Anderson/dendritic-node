@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -81,6 +82,9 @@ import (
 //   - recipient is this node and nothing else;
 //   - requester is the authenticated peer that opened this stream;
 //   - it has not expired, and its expiry is not absurdly far out;
+//   - its nonce has not been spent here before (store.ClaimRevocationNonce),
+//     which is what makes the token single-use rather than reusable for its
+//     whole lifetime by anyone who kept a copy of the frame;
 //   - and only then, whether the shard may actually go (store.DeleteRemoteShard,
 //     which refuses bytes another manifest still references).
 //
@@ -98,8 +102,10 @@ import (
 //
 // Refusal is NOT terminal in the recall ledger (store.RecallRecord.Outstanding
 // counts anything that is not deleted/absent), so the tombstone survives, the
-// background pass retries every recallInterval, and a recall issued during the
-// upgrade window completes on its own once the holders are new. Rollout order is
+// background pass keeps retrying -- on a backoff, see PendingRecalls, so a
+// holder that refuses permanently stops costing a coordinator token every ten
+// minutes -- and a recall issued during the upgrade window completes on its own
+// once the holders are new. Rollout order is
 // therefore: sign first, upgrade holders after, and expect recalls against
 // not-yet-upgraded holders to sit refused-and-retrying in the meantime.
 //
@@ -258,6 +264,34 @@ func (n *Node) validateRevocation(revocation *Revocation, header requestHeader, 
 func (n *Node) handleDelete(stream io.Writer, header requestHeader, remote peer.ID) {
 	if err := n.validateRevocation(header.Revocation, header, remote); err != nil {
 		writeJSONFrame(stream, responseHeader{Refused: true, Error: err.Error()})
+		return
+	}
+	// SINGLE USE. The nonce was signed and then forgotten, so a token stayed
+	// valid at its recipient for its whole lifetime and anything holding a copy
+	// of the frame could present it again. Spending it here -- after validation,
+	// before the delete -- makes the capability single-use whatever the delete
+	// then does, so a replay cannot even reach DeleteRemoteShard. A retry after a
+	// transient failure costs nothing: every recall pass mints fresh tokens.
+	//
+	// Deliberately NOT inside validateRevocation. That function is a verdict on
+	// a token and tests call it for the verdict; a side effect hidden inside it
+	// would consume a nonce every time anything asked whether a token was valid.
+	//
+	// The claim FAILING is refused rather than waved through: a node whose
+	// metadata store cannot answer is a node whose DeleteRemoteShard is about to
+	// fail too, and the owner records a refusal and retries with a fresh token.
+	// Refusing a delete is recoverable; honouring a token whose single-use
+	// guarantee is unknown is not.
+	fresh, err := n.store.ClaimRevocationNonce(
+		header.Revocation.Nonce, time.Unix(header.Revocation.ExpiresAt, 0))
+	if err != nil {
+		writeJSONFrame(stream, responseHeader{
+			Refused: true, Error: "could not record the revocation nonce: " + err.Error()})
+		return
+	}
+	if !fresh {
+		writeJSONFrame(stream, responseHeader{
+			Refused: true, Error: "this revocation has already been used"})
 		return
 	}
 	removed, err := n.store.DeleteRemoteShard(header.ObjectID, header.ShardID)
@@ -465,7 +499,7 @@ func (n *Node) RecallObject(ctx context.Context, objectID string, shardFilter ma
 		}
 	}
 	if len(targets) == 0 {
-		return n.finishRecall(objectID)
+		return n.finishRecall(objectID, record)
 	}
 
 	// Tokens first, in batches, so a coordinator outage costs one failed pass
@@ -525,14 +559,26 @@ func (n *Node) RecallObject(ctx context.Context, objectID string, shardFilter ma
 		}(item, token)
 	}
 	wait.Wait()
-	return n.finishRecall(objectID)
+	return n.finishRecall(objectID, record)
 }
 
 // finishRecall reloads the tombstone and drops it only when every holder has
 // answered terminally. An unreachable holder is never terminal: recording it as
 // gone would make the ledger lie in the dangerous direction.
-func (n *Node) finishRecall(objectID string) (*store.RecallRecord, error) {
+//
+// before is the tombstone as this pass found it. It is used for exactly one
+// case: the tombstone is GONE by the time the pass ends, because a concurrent
+// pass (the background loop and an operator can both be running) resolved and
+// dropped it. Reloading then yields os.ErrNotExist, which the gateway renders as
+// "no ledger row for this key" and the site renders as "no confirmed remote
+// holder" -- naming zero holders for an object that had them and whose holders
+// just answered. Reporting the pre-pass record instead is stale by one pass and
+// true about who was asked.
+func (n *Node) finishRecall(objectID string, before *store.RecallRecord) (*store.RecallRecord, error) {
 	record, err := n.store.LoadRecall(objectID)
+	if errors.Is(err, os.ErrNotExist) && before != nil {
+		return before, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -554,14 +600,27 @@ func (n *Node) RecallForKey(ctx context.Context, bucket, key string, shardFilter
 }
 
 // RecallObjectID captures then recalls, by object id.
+//
+// The two ways LoadRecall can fail to hand back a tombstone are NOT the same
+// answer and are not treated as one. This used to read `if err != nil { return
+// empty, nil }`, so a bolt failure or a row that would not unmarshal arrived at
+// the admin page as "the ledger recorded no confirmed remote holder for this
+// object" -- an unknown drawn as a zero, on the page an operator uses for
+// takedowns, in the direction that says the bytes are already gone.
 func (n *Node) RecallObjectID(ctx context.Context, objectID string, shardFilter map[string]bool, reason string) (*store.RecallRecord, error) {
 	if _, err := n.store.CaptureRecall(objectID, reason); err != nil {
 		return nil, err
 	}
 	if _, err := n.store.LoadRecall(objectID); err != nil {
-		// Nothing was ever confirmed on a peer, so there is nothing to recall.
-		// An empty record is the honest answer, not an error.
-		return &store.RecallRecord{ObjectID: objectID}, nil
+		if errors.Is(err, os.ErrNotExist) {
+			// Genuine absence: nothing was ever confirmed on a peer, so there is
+			// nothing to recall. An empty record is the honest answer.
+			return &store.RecallRecord{ObjectID: objectID}, nil
+		}
+		// Anything else means the ledger could not be READ. Propagated, so the
+		// caller says "could not read the ledger" rather than "there are no
+		// holders".
+		return nil, err
 	}
 	return n.RecallObject(ctx, objectID, shardFilter)
 }

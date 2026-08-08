@@ -74,25 +74,36 @@ func (s *Server) ledgerSummary(w http.ResponseWriter, requestID string) {
 		s3Error(w, "InternalError", "Could not read the placement ledger.", 500, requestID)
 		return
 	}
-	recalls, err := s.store.AllRecalls()
+	recalls, unreadable, err := s.store.AllRecalls()
 	if err != nil {
 		s3Error(w, "InternalError", "Could not read the recall ledger.", 500, requestID)
 		return
 	}
-	outstanding, holders := 0, 0
+	outstanding, holders, deferred := 0, 0, 0
 	for _, record := range recalls {
 		if !record.Resolved() {
 			outstanding++
 		}
+		if record.Deferred() {
+			deferred++
+		}
 		holders += record.Outstanding()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"objects":               summary.Objects,
-		"under_replicated":      summary.UnderReplicated,
-		"fully_dispersed":       summary.FullyDispersed,
-		"local_only":            summary.LocalOnly,
-		"recalls":               len(recalls),
-		"recalls_outstanding":   outstanding,
+		"objects":             summary.Objects,
+		"under_replicated":    summary.UnderReplicated,
+		"fully_dispersed":     summary.FullyDispersed,
+		"local_only":          summary.LocalOnly,
+		"recalls":             len(recalls),
+		"recalls_outstanding": outstanding,
+		// Tombstones the background pass has backed off on. Counted separately
+		// so "outstanding and being chased" is not read off the same number as
+		// "outstanding and now retried every six hours".
+		"recalls_deferred": deferred,
+		// Rows that would not parse. Reported rather than skipped: an
+		// unreadable row used to disappear from every count above, which makes
+		// an unknown look like a zero.
+		"recalls_unreadable":    unreadable,
 		"recall_holders_left":   holders,
 		"recall_verb_available": true,
 	})
@@ -143,10 +154,23 @@ func (s *Server) recallStatus(w http.ResponseWriter, bucket, key, requestID stri
 		return
 	}
 	record, err := s.store.LoadRecall(objectID)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"object_id": objectID, "outstanding": 0, "shards": []any{},
 			"note": "no recall is outstanding for this object",
+		})
+		return
+	}
+	if err != nil {
+		// NOT the note above. "there is no tombstone" and "I could not read the
+		// tombstones" are opposite answers, and only one of them means the
+		// shards are accounted for.
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":     "recall_ledger_unreadable",
+			"object_id": objectID,
+			"detail": "The node could not read its own recall ledger for this " +
+				"object, so how many holders still have its shards is unknown -- " +
+				"not zero: " + err.Error(),
 		})
 		return
 	}
@@ -193,12 +217,25 @@ func (s *Server) recallObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			s3Error(w, "NoSuchKey", "No ledger row for this key.", http.StatusNotFound, requestID)
 			return
 		}
+		// A LEDGER THAT COULD NOT BE READ GETS ITS OWN CODE. Both branches are
+		// failures, but only this one means the node cannot say how many peers
+		// hold shards of this object -- and the site must print "unknown", never
+		// "none". Kept at HTTP 200 with a structured body, like every other
+		// answer on this route, because the caller classifies on the code and a
+		// 4xx/5xx would arrive there as an opaque status line.
+		code := "recall_failed"
+		if errors.Is(err, store.ErrRecallLedgerUnreadable) {
+			code = "recall_ledger_unreadable"
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"error": "recall_failed", "detail": err.Error(),
+			"error": code, "detail": err.Error(),
 		})
 		return
 	}
 	if record == nil {
+		// Genuine absence only: RecallForKey answers with an empty record when
+		// the ledger says nothing was ever confirmed on a peer, and with an
+		// error -- handled above -- when it could not tell.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"outstanding": 0, "shards": []any{},
 			"note": "the ledger recorded no confirmed remote holder for this object",
@@ -231,6 +268,12 @@ func recallReport(record store.RecallRecord) map[string]any {
 		"object_id": record.ObjectID, "bucket": record.Bucket, "key": record.Key,
 		"reason": record.Reason, "attempts": record.Attempts,
 		"outstanding": record.Outstanding(), "resolved": record.Resolved(),
-		"counts": counts, "shards": shards,
+		// deferred says the BACKGROUND pass has backed off to its long interval
+		// for this tombstone, because its outstanding holders have answered and
+		// refused enough times. It is not a give-up -- the tombstone stands and
+		// re-running the recall from the page asks again immediately -- but an
+		// operator watching for progress needs to know the clock changed.
+		"deferred": record.Deferred(),
+		"counts":   counts, "shards": shards,
 	}
 }
