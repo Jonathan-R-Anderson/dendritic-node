@@ -419,6 +419,17 @@ func (n *Node) RecallObject(ctx context.Context, objectID string, shardFilter ma
 			defer func() { <-slots }()
 			state, detail := n.recallFromPeer(ctx, item.target, token)
 			_ = n.store.RecordRecallOutcome(objectID, item.shardID, item.peerID, state, detail)
+			if state == store.RecallDeleted || state == store.RecallAbsent {
+				// The PLACEMENT ledger has to stop naming this peer as a holder
+				// too. Without this the ledger keeps claiming a durability that
+				// no longer exists -- and for an object that still exists (a
+				// per-shard recall, not a purge) repair would never notice the
+				// deficit it was just asked to create.
+				//
+				// os.ErrNotExist here simply means the object was deleted and
+				// its placement row already retired, which is the normal case.
+				_ = n.store.DropShardHolder(objectID, item.shardID, item.peerID)
+			}
 		}(item, token)
 	}
 	wait.Wait()
