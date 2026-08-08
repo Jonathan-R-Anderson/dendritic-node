@@ -133,6 +133,15 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 		if _, known := byID[id]; known {
 			continue
 		}
+		// The refusal filter belongs on BOTH tiers. It was applied only to the
+		// DHT-record branch above, and the peers that refuse are exactly the
+		// ones we stay connected to -- so every refusing peer walked straight
+		// back in through this fallback and kept consuming a slot. Measured:
+		// four peers still drew ~170 attempts each in twenty minutes with the
+		// filter "on".
+		if n.refusingPeer(id) {
+			continue
+		}
 		byID[id] = placement.Candidate{PeerID: id}
 	}
 
