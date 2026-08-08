@@ -510,6 +510,18 @@ func (n *Node) noteRefusal(peerID string) {
 	}
 	entry.count++
 	entry.last = time.Now()
+	crossed := entry.count == refusalsBeforeSkipping
+	n.refusalMu.Unlock()
+	if crossed {
+		// Drop the cached candidate set immediately. The cache exists to reuse
+		// one lookup across the shards of a pass, but holding a peer we have
+		// just decided to stop asking means it keeps consuming a slot for the
+		// rest of the TTL -- and with nine shards a pass, that is most of them.
+		n.candidateMu.Lock()
+		n.candidateCache = nil
+		n.candidateMu.Unlock()
+	}
+	n.refusalMu.Lock()
 }
 
 // noteAccepted clears a peer's refusal history. Any success means the reason it

@@ -2,8 +2,12 @@ package p2p
 
 import (
 	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/syndichan/maniwani/storage-client/internal/placement"
 )
 
 // A peer that keeps refusing must stop winning candidate slots. Measured on
@@ -76,5 +80,44 @@ func TestOnlyAnsweredRefusalsCount(t *testing.T) {
 	}
 	if answeredNo(nil) {
 		t.Error("nil error counted as a refusal")
+	}
+}
+
+// The filter has to cover BOTH candidate tiers. It was applied only to the
+// DHT-record branch, and the peers that refuse are precisely the ones we stay
+// connected to -- so every one of them walked back in through the connected-peer
+// fallback. Measured on production: four peers still drew ~170 attempts each in
+// twenty minutes with the filter "on".
+func TestBothCandidateTiersConsultTheRefusalFilter(t *testing.T) {
+	source, err := os.ReadFile("disperse.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	// The DHT-record tier and the connected-peer fallback each build a
+	// Candidate; both must be guarded.
+	guards := strings.Count(text, "n.refusingPeer(")
+	if guards < 2 {
+		t.Fatalf("refusingPeer is consulted %d time(s); both the DHT-record tier "+
+			"and the connected-peer fallback must check it", guards)
+	}
+}
+
+// Crossing the threshold must drop the cached candidate set, or the peer keeps
+// its slot for the rest of the TTL -- which, at nine shards a pass, is most of
+// the pass we just decided to stop wasting.
+func TestCrossingTheThresholdInvalidatesTheCandidateCache(t *testing.T) {
+	n := &Node{}
+	n.candidateCache = []placement.Candidate{{PeerID: "someone"}}
+	n.candidateAt = time.Now()
+	const peer = "12D3KooWJustWentBad"
+	for i := 0; i < refusalsBeforeSkipping; i++ {
+		n.noteRefusal(peer)
+	}
+	n.candidateMu.Lock()
+	cached := len(n.candidateCache)
+	n.candidateMu.Unlock()
+	if cached != 0 {
+		t.Error("the candidate cache still holds a peer we have stopped asking")
 	}
 }
