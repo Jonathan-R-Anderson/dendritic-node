@@ -760,6 +760,7 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 			n.gatewayMu.RUnlock()
 			state := heartbeat.State{
 				CapacityBytes:   n.store.Capacity(),
+				UsedBytes:       usedBytesOrZero(n.store),
 				GatewayEnabled:  n.gatewayEnabled.Load(),
 				GatewayVerified: n.gatewayVerified.Load(),
 				Registration:    registration,
@@ -1559,4 +1560,23 @@ func writeJSONFrame(writer io.Writer, value any) error {
 	}
 	_, err = writer.Write(encoded)
 	return err
+}
+
+// usedBytesOrZero reports what the store is holding, or zero if it cannot say.
+//
+// Cheap because Store caches the figure; it was once a full directory walk per
+// call, which is why several callers avoided asking. A read error yields zero
+// rather than failing the heartbeat -- a node that cannot measure itself should
+// still report presence, and the coordinator draws a zero as "not measured"
+// rather than "empty" (the status page distinguishes those the same way it does
+// for traffic).
+func usedBytesOrZero(s *store.Store) int64 {
+	if s == nil {
+		return 0
+	}
+	used, err := s.UsedBytes()
+	if err != nil {
+		return 0
+	}
+	return used
 }

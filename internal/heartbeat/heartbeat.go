@@ -51,7 +51,17 @@ type logf interface{ Printf(string, ...any) }
 // State is what the node currently is, sampled fresh on every send so a
 // gateway that gains or loses verification is reflected within one interval.
 type State struct {
-	CapacityBytes   int64
+	CapacityBytes int64
+	// UsedBytes is how much this node is ACTUALLY holding, not how much it
+	// offered. The coordinator had capacity and no usage, so it could see how
+	// big each pool was and nothing about how full -- which makes levelling the
+	// pools impossible to even plan, let alone verify. See
+	// roadmap/dht-storage-roadmap.md phase 2b.
+	//
+	// Measured from disk rather than from the placement ledger: the ledger
+	// records intent and disk records fact, they diverge on a failed delete or a
+	// manual removal, and levelling toward a fiction moves real bytes.
+	UsedBytes       int64
 	GatewayEnabled  bool
 	GatewayVerified bool
 	Registration    *gateway.Registration
@@ -103,6 +113,7 @@ type request struct {
 	Timestamp           int64                 `json:"timestamp"`
 	Nonce               string                `json:"nonce"`
 	CapacityBytes       int64                 `json:"capacity_bytes"`
+	UsedBytes           int64                 `json:"used_bytes"`
 	Platform            string                `json:"platform"`
 	GatewayEnabled      bool                  `json:"gateway_enabled"`
 	GatewayVerified     bool                  `json:"gateway_verified"`
@@ -195,6 +206,7 @@ func (c *Client) Send(ctx context.Context) {
 		Version: 1, NodeID: c.Signer.ID(), Timestamp: time.Now().UTC().Unix(),
 		Nonce:          base64.RawURLEncoding.EncodeToString(nonceBytes),
 		CapacityBytes:  state.CapacityBytes,
+		UsedBytes:      state.UsedBytes,
 		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
 		GatewayEnabled: state.GatewayEnabled,
 		// A registration is attached only when the node genuinely holds one;
