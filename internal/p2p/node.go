@@ -124,6 +124,10 @@ type requestHeader struct {
 	ObjectID  string `json:"object_id,omitempty"`
 	Size      int64  `json:"size,omitempty"`
 	Lease     *Lease `json:"lease,omitempty"`
+	// Revocation authorises the "delete" operation and nothing else. A separate
+	// field from Lease on purpose -- see internal/p2p/recall.go for why the two
+	// tokens must never be interchangeable.
+	Revocation *Revocation `json:"revocation,omitempty"`
 }
 
 type responseHeader struct {
@@ -131,6 +135,12 @@ type responseHeader struct {
 	Error   string `json:"error,omitempty"`
 	Present bool   `json:"present,omitempty"`
 	Size    int64  `json:"size,omitempty"`
+	// Deleted answers the "delete" operation: the shard was here and is gone.
+	Deleted bool `json:"deleted,omitempty"`
+	// Refused marks an answer that was an explicit no rather than a failure. The
+	// purge report treats "the holder refused" and "the holder never answered"
+	// as different, true outcomes, so the wire has to keep them apart too.
+	Refused bool `json:"refused,omitempty"`
 }
 
 type leaseRequest struct {
@@ -398,6 +408,10 @@ func finishNode(
 		// Dispersal makes an object redundant once. Repair keeps it that way
 		// when a holder goes away, which is the half that did not exist at all.
 		go n.RepairStored(ctx)
+		// Recall is the reverse of dispersal: holders that were unreachable when
+		// an object was purged are chased until they answer, so a partial recall
+		// finishes itself instead of quietly stopping.
+		go n.RecallStored(ctx)
 	}
 	return n, nil
 }
@@ -1049,6 +1063,13 @@ func (n *Node) handleStream(stream network.Stream) {
 		}
 		writeJSONFrame(stream, responseHeader{OK: true})
 		go n.Provide(context.Background(), header.ShardID)
+	case "delete":
+		// Recall. Authorised by a coordinator-signed revocation bound to this
+		// exact shard AND this exact peer; see recall.go. cacheOnly is NOT
+		// consulted here -- a node that has stopped accepting shards may still
+		// be holding ones it accepted earlier, and those are exactly the ones
+		// an owner needs back.
+		n.handleDelete(stream, header)
 	default:
 		writeJSONFrame(stream, responseHeader{Error: "unsupported operation"})
 	}

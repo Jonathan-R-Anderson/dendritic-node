@@ -360,6 +360,11 @@ func (s *Store) RecordRecallOutcome(objectID, shardID, peerID, state, detail str
 		detail = detail[:400]
 	}
 	return s.updateRecall(objectID, func(record *RecallRecord) error {
+		// EVERY matching entry, not the first. Shards are content-addressed, so
+		// one object can legitimately contain the same shard id more than once
+		// (a chunk of constant bytes produces identical data shards). Stopping
+		// at the first match would leave the duplicates pending forever and the
+		// tombstone would never resolve.
 		for i := range record.Shards {
 			if record.Shards[i].ShardID != shardID {
 				continue
@@ -372,7 +377,6 @@ func (s *Store) RecordRecallOutcome(objectID, shardID, peerID, state, detail str
 				record.Shards[i].Holders[j].Detail = detail
 				record.Shards[i].Holders[j].Attempts++
 				record.Shards[i].Holders[j].UpdatedAt = time.Now().UTC()
-				return nil
 			}
 		}
 		return nil

@@ -279,6 +279,11 @@ func main() {
 
 		s3Handler := s3api.New(storageNode, cfg.AccessKey, cfg.SecretKey, logger)
 		s3Handler.SetMeter(meter)
+		// The ledger listing can be served off the Store alone, but a RECALL has
+		// to open streams to the holders, so the node is injected the same way
+		// the meter is. Without it the ?recall route answers 503 rather than
+		// reporting a recall that never happened.
+		s3Handler.SetRecaller(node)
 		s3Server = &http.Server{
 			Addr: cfg.S3Listen, Handler: s3Handler,
 			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute,

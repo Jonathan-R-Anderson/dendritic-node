@@ -30,6 +30,9 @@ type Server struct {
 	maxBody int64
 	mu      sync.RWMutex
 	uploads map[string]*multipartUpload
+	// recaller reaches the peers. nil on a gateway-only process, in which case
+	// the recall route answers 503 rather than pretending nothing was placed.
+	recaller Recaller
 	// Meter counts bytes served to callers, for the network throughput figure
 	// on the public status page. Optional and nil-safe: a node that is not
 	// reporting simply has none, and the coordinator reads an absent report as
@@ -73,7 +76,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bucket, key := splitPath(r.URL.Path)
 	query := r.URL.Query()
 	var auth AuthResult
-	if !(bucket != "" && key != "" &&
+	// The public-read bypass is for OBJECT BYTES only. It never inspected the
+	// query string, so without the placementQuery() term the ledger surface --
+	// which names every peer holding a shard, and can order those shards
+	// destroyed -- would be readable and callable with no credential at all on
+	// every public-read bucket (arcade, static, releases).
+	if placementQuery(query) || !(bucket != "" && key != "" &&
 		(r.Method == http.MethodGet || r.Method == http.MethodHead) &&
 		s.publicReadAllowed(bucket)) {
 		var err error
@@ -88,6 +96,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	// The placement ledger, as query subresources -- the extension pattern this
+	// gateway already uses for ?policy / ?delete / ?uploads. Listed first so no
+	// object route can shadow them.
+	case bucket == "" && query.Has("placement") && r.Method == http.MethodGet:
+		s.ledgerSummary(w, requestID)
+	case bucket != "" && key == "" && query.Has("placement") && r.Method == http.MethodGet:
+		s.listPlacements(w, r, bucket, requestID)
+	case bucket != "" && key != "" && query.Has("placement") && r.Method == http.MethodGet:
+		s.objectPlacement(w, bucket, key, requestID)
+	case bucket != "" && key != "" && query.Has("recall") && r.Method == http.MethodGet:
+		s.recallStatus(w, bucket, key, requestID)
+	case bucket != "" && key != "" && query.Has("recall") && r.Method == http.MethodPost:
+		s.recallObject(w, r, bucket, key, requestID)
 	case bucket != "" && key != "" && query.Has("uploads") && r.Method == http.MethodPost:
 		s.createMultipartUpload(w, r, bucket, key, requestID)
 	case bucket != "" && key != "" && query.Get("uploadId") != "" &&
