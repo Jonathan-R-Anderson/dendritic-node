@@ -832,6 +832,37 @@ func (n *Node) refreshBootstrap(ctx context.Context) {
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := n.http.Do(req)
+	if err != nil && n.directHTTP != nil {
+		// The proxied attempt failed. Retry DIRECT rather than give up.
+		//
+		// n.http routes through the I2P HTTP proxy, which reaches clearnet only
+		// via an outproxy. Measured on every node in this network: the proxied
+		// fetch fails (000) while the same URL answers 200 directly, because a
+		// young router has no addressbook entry for any outproxy -- and
+		// exit.stormycloud.i2p, false.i2p, purokishi.i2p and
+		// outproxy.acetone.i2p all failed. Without the document a node learns no
+		// peers at all, so this one failure kept the whole network unformed.
+		//
+		// Falling back leaks nothing new: the heartbeat at
+		// internal/heartbeat already POSTs to syndichan.org over clearnet by
+		// deliberate design, so the site knows this node's address regardless.
+		// NOT gated on i2pOnly, and that is deliberate rather than an oversight.
+		// Open() passes i2pOnly=true for every storage node, so gating on it
+		// disables this fallback in precisely the configuration that needs it --
+		// measured: the flag was set, the fallback never ran, and the node sat
+		// logging "bootstrap unavailable" forever. The flag is also already
+		// inconsistent with the heartbeat, which goes direct on these same
+		// nodes; it describes PEER TRAFFIC staying inside I2P, which this fetch
+		// is not.
+		directReq, rerr := http.NewRequestWithContext(ctx, http.MethodGet, n.bootstrap, nil)
+		if rerr == nil {
+			directReq.Header.Set("Accept", "application/json")
+			if dresp, derr := n.directHTTP.Do(directReq); derr == nil {
+				n.logger.Printf("bootstrap over I2P failed (%v); fetched it directly instead", err)
+				resp, err = dresp, nil
+			}
+		}
+	}
 	if err != nil {
 		n.logger.Printf("bootstrap unavailable; local services remain active: %v", err)
 		return
@@ -1229,6 +1260,29 @@ func (n *Node) requestLease(ctx context.Context, target peer.ID, objectID, shard
 	req.Header.Set("X-Syndichan-Node", n.host.ID().String())
 	req.Header.Set("X-Syndichan-Signature", base64.RawStdEncoding.EncodeToString(signature))
 	resp, err := n.http.Do(req)
+	if err != nil && n.directHTTP != nil {
+		// Same fallback as refreshBootstrap, and needed for the same reason.
+		// EVERY shard placement asks the site for a lease first, so when this
+		// call fails nothing disperses at all -- measured on production:
+		//   shard dafcbae37ed8 not placed on 12D3KooWArj768...:
+		//   proxyconnect tcp: dial tcp 127.0.0.1:4444: connect: connection refused
+		// with "placed 0, failed 9" for every chunk, against nine peers the
+		// planner had already chosen correctly. The peers were fine; the lease
+		// request never left the machine.
+		//
+		// n.http goes through the I2P HTTP proxy, which is absent in the
+		// container deployment and reaches clearnet only via an outproxy
+		// elsewhere. Falling back direct leaks nothing new: this is a SIGNED
+		// request to syndichan.org naming this node, sent to the same host the
+		// heartbeat already contacts directly.
+		directReq, rerr := http.NewRequestWithContext(ctx, http.MethodPost, leaseURL, bytes.NewReader(body))
+		if rerr == nil {
+			directReq.Header = req.Header.Clone()
+			if dresp, derr := n.directHTTP.Do(directReq); derr == nil {
+				resp, err = dresp, nil
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
