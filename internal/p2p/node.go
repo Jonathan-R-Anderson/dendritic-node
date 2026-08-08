@@ -73,11 +73,25 @@ const (
 	// one doomed attempt per 15 minutes, and a new node can sit peerless for
 	// hours. Retry quickly until the first peer sticks, then back off.
 	bootstrapRetry = 60 * time.Second
-	// Backfill cadence for shards stored before any peer existed. Deliberately
-	// unhurried and small: each shard needs a coordinator lease over I2P before
-	// it can be placed, so this is a trickle, not a flush.
+	// Backfill cadence for shards stored before any peer existed.
+	//
+	// Sized against the backlog it has to clear, not against a single object.
+	// Measured on production once dispersal started working: 12,639 objects had
+	// no remote copy, and 5 per 5-minute pass drains that in about twelve DAYS
+	// -- during which every one of those objects is a single copy on one disk,
+	// which is the exact condition this whole subsystem exists to end.
+	//
+	// The old comment called it "a trickle, not a flush" because each shard
+	// needs a coordinator lease over I2P first. That cost is real but it is
+	// per-shard and concurrent, not per-object and serial, so the batch was
+	// throttling the wrong thing. 40 keeps a pass bounded while cutting the
+	// drain to well under a day.
+	//
+	// Raise further only with evidence: the ceiling is the lease service and
+	// the peers' willingness to accept shards, and a batch that outruns either
+	// converts a slow backlog into a loud one.
 	replicateInterval = 5 * time.Minute
-	replicateBatch    = 5
+	replicateBatch    = 40
 	StorageUserAgent  = heartbeat.UserAgent
 )
 
