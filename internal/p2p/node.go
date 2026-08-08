@@ -44,6 +44,7 @@ import (
 	"github.com/syndichan/maniwani/storage-client/internal/gateway"
 	"github.com/syndichan/maniwani/storage-client/internal/heartbeat"
 	syndii2p "github.com/syndichan/maniwani/storage-client/internal/i2p"
+	"github.com/syndichan/maniwani/storage-client/internal/place"
 	"github.com/syndichan/maniwani/storage-client/internal/placement"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 	"github.com/syndichan/maniwani/storage-client/internal/traffic"
@@ -207,7 +208,12 @@ type Node struct {
 	refusals       map[string]*peerRefusal
 	candidateMu    sync.Mutex
 	candidateCache []placement.Candidate
-	candidateAt    time.Time
+	// capacityRecords is the UNFILTERED half of the same discovery: every fresh
+	// capacity record, including peers this node will not currently write to.
+	// Levelling reads occupancy from here rather than from candidateCache; see
+	// occupancyRecords in disperse.go for why the difference matters.
+	capacityRecords []place.Record
+	candidateAt     time.Time
 	// repairing is the single-flight set for repair. Keyed by shard id, so two
 	// passes -- or a pass overlapping the one before it -- can never regenerate
 	// and re-place the same shard twice at once. See repair.go.

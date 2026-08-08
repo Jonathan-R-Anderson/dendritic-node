@@ -11,6 +11,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"github.com/syndichan/maniwani/storage-client/internal/place"
 	"github.com/syndichan/maniwani/storage-client/internal/placement"
 	"github.com/syndichan/maniwani/storage-client/internal/store"
 )
@@ -106,12 +107,20 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 	lookupCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	records, err := n.FindStoragePeers(lookupCtx, candidateLimit)
 	cancel()
+	var fresh []place.Record
 	if err == nil {
 		now := time.Now()
 		for _, record := range records {
 			if !record.Fresh(now) || record.NodeID == n.host.ID().String() {
 				continue
 			}
+			// Kept BEFORE the dial and refusal filters below, and cached
+			// separately, because occupancy and eligibility are different
+			// questions. A peer refusing shards with "capacity exceeded" is
+			// exactly the node levelling has to notice is fat -- dropping it
+			// here would make the fullest machines on the network the only ones
+			// the mover cannot see.
+			fresh = append(fresh, record)
 			// Teach the host how to reach it, so the push does not fail on
 			// "no addresses" for a peer we are not currently connected to.
 			if _, dialErr := n.DialStoragePeer(ctx, record); dialErr != nil {
@@ -161,8 +170,25 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 
 	n.candidateMu.Lock()
 	n.candidateCache, n.candidateAt = append([]placement.Candidate(nil), out...), time.Now()
+	n.capacityRecords = fresh
 	n.candidateMu.Unlock()
 	return out
+}
+
+// occupancyRecords returns the fresh capacity records behind the last candidate
+// discovery: every peer that published one, INCLUDING the ones this node will
+// not currently write to.
+//
+// Levelling needs the whole picture. storageCandidates is an eligibility list --
+// it drops peers that cannot be dialled and peers that have been refusing -- and
+// a peer refusing because its disk is full is precisely a source. Computing the
+// fleet mean over the eligible peers only would leave the fullest machines out
+// of the average, understate the target, and make the healthy nodes look fat.
+func (n *Node) occupancyRecords(ctx context.Context) []place.Record {
+	n.storageCandidates(ctx)
+	n.candidateMu.Lock()
+	defer n.candidateMu.Unlock()
+	return append([]place.Record(nil), n.capacityRecords...)
 }
 
 // DistributeManifest keeps its name and signature so the store's distributor

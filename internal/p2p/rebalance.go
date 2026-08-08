@@ -234,16 +234,16 @@ func (n *Node) rebalanceOnce(ctx context.Context) {
 // byte at whichever volunteer merely runs an older build.
 func (n *Node) storagePools(ctx context.Context) []placement.Pool {
 	var pools []placement.Pool
-	for _, candidate := range n.storageCandidates(ctx) {
-		if candidate.Capacity <= 0 {
+	for _, record := range n.occupancyRecords(ctx) {
+		if record.Capacity <= 0 {
 			continue
 		}
-		used := candidate.Capacity - candidate.FreeBytes
+		used := record.Capacity - record.FreeBytes
 		if used < 0 {
 			used = 0
 		}
 		pools = append(pools, placement.Pool{
-			PeerID: candidate.PeerID, Used: used, Capacity: candidate.Capacity,
+			PeerID: record.NodeID, Used: used, Capacity: record.Capacity,
 		})
 	}
 	if len(pools) == 0 {
@@ -287,10 +287,19 @@ func (n *Node) rebalanceWith(ctx context.Context, pools []placement.Pool) Rebala
 		}
 		surplus[source.PeerID] = source.Delta
 	}
+	// A sink has to be a peer this node would write to at all. The pools above
+	// deliberately include peers the candidate list drops -- a peer refusing with
+	// "capacity exceeded" belongs in the mean, and is usually a source -- but
+	// offering a shard to a peer that is refusing everything would spend a lease
+	// to be told no.
+	writable := map[string]bool{}
+	for _, candidate := range n.storageCandidates(ctx) {
+		writable[candidate.PeerID] = true
+	}
 	deficit := map[string]int64{}
 	var sinks []placement.Candidate
 	for _, sink := range level.Sinks() {
-		if sink.PeerID == self {
+		if sink.PeerID == self || !writable[sink.PeerID] {
 			continue
 		}
 		deficit[sink.PeerID] = -sink.Delta
@@ -359,14 +368,21 @@ func (n *Node) rebalanceObject(
 	}
 
 	for _, chunkIndex := range row.ChunkIndexes() {
-		if ctx.Err() != nil || *budget <= 0 {
+		if ctx.Err() != nil || *budget <= 0 || len(*sinks) == 0 || len(surplus) == 0 {
 			return
 		}
+		// Re-read per chunk rather than working from one snapshot: the previous
+		// chunk's move changed the holder lists this one plans against.
 		fresh, err := n.store.LoadObjectPlacement(objectID)
 		if err != nil {
 			return
 		}
 		moved, err := n.rebalanceChunk(ctx, *fresh, chunkIndex, surplus, deficit, sinks, report)
+		if report.BudgetExhausted {
+			// The shared window is spent. Every remaining chunk would ask and be
+			// refused, so stop asking.
+			return
+		}
 		if err != nil {
 			continue
 		}
@@ -480,7 +496,9 @@ func pickSurplusShard(
 ) (string, placement.Shard, bool) {
 	best, bestSurplus := "", int64(0)
 	for holder, over := range surplus {
-		if over <= bestSurplus {
+		// Deterministic on ties: map iteration order is random, and two passes
+		// over the same fleet should reach the same decision.
+		if over < bestSurplus || (over == bestSurplus && holder >= best) {
 			continue
 		}
 		if len(row.MovableChunkShards(chunkIndex, holder)) == 0 {
@@ -562,9 +580,17 @@ func (n *Node) moveShard(
 	//    it" and "two peers have it" at the moment the delete is authorised.
 	has, err := n.PeerHasShard(ctx, target, shard.ID)
 	if err != nil {
+		// UNKNOWN, not "no". A probe that could not be delivered says nothing
+		// about the destination's disk -- the same distinction the repair audit
+		// refuses to blur -- so the ledger is left exactly as it is and nothing
+		// is deleted. The next pass asks again.
 		return errCopyUnverified
 	}
 	if !has {
+		// ANSWERED no, having just acknowledged the store. The ledger now names
+		// a holder that does not hold, which overstates the chunk's durability
+		// by one machine; the mover found that out and must not leave it.
+		_ = n.store.DropShardHolder(row.ObjectID, shard.ID, destination)
 		return errCopyUnverified
 	}
 
