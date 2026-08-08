@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -114,6 +115,9 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 			// Teach the host how to reach it, so the push does not fail on
 			// "no addresses" for a peer we are not currently connected to.
 			if _, dialErr := n.DialStoragePeer(ctx, record); dialErr != nil {
+				continue
+			}
+			if n.refusingPeer(record.NodeID) {
 				continue
 			}
 			byID[record.NodeID] = placement.Candidate{
@@ -340,11 +344,19 @@ func (n *Node) placeShards(
 				if err := n.placeOne(ctx, objectID, assignment.ShardID, target, read); err != nil {
 					n.logger.Printf("shard %s not placed on %s: %v",
 						shortID(assignment.ShardID), target, err)
+					// An ANSWERED no counts against the peer; a dial that never
+					// completed does not. Absence is already handled by the peer
+					// dropping out of the candidate set, and counting it here
+					// would punish a healthy volunteer for one bad tunnel.
+					if answeredNo(err) {
+						n.noteRefusal(target.String())
+					}
 					mu.Lock()
 					result.Failed++
 					mu.Unlock()
 					return
 				}
+				n.noteAccepted(target.String())
 				mu.Lock()
 				result.Placed++
 				mu.Unlock()
@@ -442,3 +454,96 @@ var errShardProbeRefused = errors.New("peer refused the shard probe")
 // unplaced shard is a deficit the next pass can fix, and a silent skip would
 // look like success.
 var errWouldCoLocate = errors.New("peer already holds a shard of this chunk")
+
+// A peer that keeps saying no is worse than a peer that is absent: candidates
+// are ranked by ADVERTISED free space, and the peers refusing here advertise
+// plenty of it -- a cache-only node, a node past its capacity, a node whose
+// lease verification is broken. So they win slots on every round, consume one of
+// the nine a chunk has, and the object stalls one holder short of the durability
+// threshold forever. *Measured:* three such peers held the ceiling at
+// "placed 6, failed 3" while seven healthy nodes were available.
+//
+// Deliberately NOT permanent and NOT persisted. A refusal is often temporary --
+// capacity is freed, a config is fixed, a node is upgraded (RKLs was refusing
+// every lease until its binary was replaced) -- and a permanent blacklist would
+// quietly shrink the network every time a volunteer had a bad hour. Losing the
+// counts on restart is a feature: the node re-learns from current behaviour
+// rather than trusting a stale grudge.
+const (
+	refusalsBeforeSkipping = 3
+	refusalCooldown        = 30 * time.Minute
+)
+
+type peerRefusal struct {
+	count int
+	last  time.Time
+}
+
+// noteRefusal records that a peer explicitly declined a shard. Only for answers
+// -- an unreachable peer is not refusing, it is absent, and the difference
+// matters because absence is already handled by the dial failing.
+func (n *Node) noteRefusal(peerID string) {
+	n.refusalMu.Lock()
+	defer n.refusalMu.Unlock()
+	if n.refusals == nil {
+		n.refusals = make(map[string]*peerRefusal)
+	}
+	entry := n.refusals[peerID]
+	if entry == nil {
+		entry = &peerRefusal{}
+		n.refusals[peerID] = entry
+	}
+	// A refusal after the cooldown starts the count again rather than adding to
+	// an old grudge: three refusals spread over a week is a peer having bad
+	// luck, three in half an hour is a peer that will refuse the next one too.
+	if !entry.last.IsZero() && time.Since(entry.last) > refusalCooldown {
+		entry.count = 0
+	}
+	entry.count++
+	entry.last = time.Now()
+}
+
+// noteAccepted clears a peer's refusal history. Any success means the reason it
+// was refusing is gone.
+func (n *Node) noteAccepted(peerID string) {
+	n.refusalMu.Lock()
+	defer n.refusalMu.Unlock()
+	delete(n.refusals, peerID)
+}
+
+// refusingPeer reports whether a peer should be skipped as a candidate.
+func (n *Node) refusingPeer(peerID string) bool {
+	n.refusalMu.Lock()
+	defer n.refusalMu.Unlock()
+	entry := n.refusals[peerID]
+	if entry == nil || entry.count < refusalsBeforeSkipping {
+		return false
+	}
+	// The cooldown expiring is what lets a fixed peer back in without anyone
+	// intervening.
+	return time.Since(entry.last) <= refusalCooldown
+}
+
+// answeredNo distinguishes a peer that DECLINED from one that could not be
+// reached. Only the former says anything about whether the next attempt will
+// also fail; a dial failure says the network was busy, which is not the peer's
+// fault and not predictive.
+func answeredNo(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	for _, refusal := range []string{
+		"cache-only",
+		"capacity exceeded",
+		"invalid coordinator lease signature",
+		"rejected by this node",
+		"recalled recently",
+		"unsupported operation",
+	} {
+		if strings.Contains(text, refusal) {
+			return true
+		}
+	}
+	return false
+}

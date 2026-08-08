@@ -200,6 +200,11 @@ type Node struct {
 	i2pOnly         bool
 	// candidateCache holds the storage peers the last discovery found, so one
 	// dispersal pass does not issue a DHT capacity query per chunk.
+	// refusals tracks peers that answered "no" to a shard, so the planner stops
+	// spending one of a chunk's nine slots on a peer that will refuse again. See
+	// noteRefusal in disperse.go for why it is neither permanent nor persisted.
+	refusalMu      sync.Mutex
+	refusals       map[string]*peerRefusal
 	candidateMu    sync.Mutex
 	candidateCache []placement.Candidate
 	candidateAt    time.Time
