@@ -452,34 +452,36 @@ func (s *Store) DeleteRemoteShard(objectID, shardID string) (bool, error) {
 	if hadRow && objectID != "" && heldFor != "" && heldFor != objectID {
 		return false, ErrShardHeldForAnotherObject
 	}
-	referenced, err := s.manifestReferencesShard(shardID)
-	if err != nil {
+	// ONE TRANSACTION for the whole decision: is this shard still referenced,
+	// record the scoped refusal, and drop the remote row. Previously these were
+	// three separate transactions with the unlink outside all of them, so a
+	// concurrent PutRemoteShard could make the shard referenced after the check
+	// passed and the recall would delete it anyway. The unlink stays outside --
+	// a filesystem operation cannot be rolled back, so it must come after the
+	// commit that authorises it, never inside.
+	//
+	// The scoped refusal is written here rather than by refuseRecalledShard so
+	// it shares this transaction; see that function for WHY the moderation
+	// denylist is the wrong tool.
+	var referenced bool
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		if referenced, err = manifestReferencesShardTx(tx, shardID); err != nil {
+			return err
+		}
+		if referenced {
+			return nil
+		}
+		deadline := time.Now().UTC().Add(recallRefusalTTL).Format(time.RFC3339Nano)
+		if err := tx.Bucket(bucketDenied).Put(recallRefusalKey(objectID, shardID), []byte(deadline)); err != nil {
+			return err
+		}
+		return tx.Bucket(bucketRemote).Delete([]byte(shardID))
+	}); err != nil {
 		return false, err
 	}
 	if referenced {
 		return false, ErrShardStillReferenced
-	}
-	// A SCOPED, EXPIRING refusal -- deliberately not s.Reject.
-	//
-	// Reject writes to the moderation denylist, whose key is "shard\x00"+id and
-	// which nothing ever removes from. Shard ids are CONTENT ADDRESSES, so that
-	// entry is object-blind and permanent: confirmed by test, object B recalling
-	// a shard it happens to share with object A destroyed A's bytes AND made it
-	// impossible for repair to ever restore them on this holder, for any object,
-	// forever. Durability then erodes by one holder per recall, silently.
-	//
-	// A recall means "this owner no longer wants THIS object here", which is a
-	// narrower and shorter-lived claim than "this content is banned". Scoping it
-	// to the object stops one owner's takedown from touching another's data;
-	// expiring it stops the holder from refusing a legitimate re-placement once
-	// the owner's replicate cycle has moved on.
-	if err := s.refuseRecalledShard(objectID, shardID); err != nil {
-		return false, err
-	}
-	if err := s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketRemote).Delete([]byte(shardID))
-	}); err != nil {
-		return false, err
 	}
 	_, statErr := os.Stat(s.shardPath(shardID))
 	existed := statErr == nil
@@ -497,6 +499,34 @@ func (s *Store) DeleteRemoteShard(objectID, shardID string) (bool, error) {
 // manifestReferencesShard asks only about THIS node's own objects, deliberately
 // ignoring bucketRemote: the remote row is what the recall is removing, so
 // counting it as a reference would make every recall refuse itself.
+// manifestReferencesShardTx is the reference check INSIDE a caller's
+// transaction. DeleteRemoteShard needs the check and the delete to see the same
+// database state: with separate transactions a concurrent PutRemoteShard for a
+// different object lands between them, and the recall then deletes bytes that
+// became referenced a microsecond earlier.
+func manifestReferencesShardTx(tx *bolt.Tx, shardID string) (bool, error) {
+	var referenced bool
+	err := tx.Bucket(bucketObjects).ForEach(func(_, value []byte) error {
+		if referenced {
+			return nil
+		}
+		var manifest Manifest
+		if err := json.Unmarshal(value, &manifest); err != nil {
+			return err
+		}
+		for _, chunk := range manifest.Chunks {
+			for _, shard := range chunk.Shards {
+				if shard.ID == shardID {
+					referenced = true
+					return nil
+				}
+			}
+		}
+		return nil
+	})
+	return referenced, err
+}
+
 func (s *Store) manifestReferencesShard(shardID string) (bool, error) {
 	var referenced bool
 	err := s.db.View(func(tx *bolt.Tx) error {
