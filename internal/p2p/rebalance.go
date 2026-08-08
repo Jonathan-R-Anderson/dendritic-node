@@ -323,7 +323,13 @@ func (n *Node) rebalanceWith(ctx context.Context, pools []placement.Pool) Rebala
 	}
 	budget := rebalanceShardsPerPass
 	for _, row := range rows {
-		if ctx.Err() != nil || budget <= 0 {
+		if ctx.Err() != nil || budget <= 0 || report.BudgetExhausted {
+			break
+		}
+		if len(sinks) == 0 || len(surplus) == 0 {
+			// Every sink has taken its share for this pass, or every source has
+			// shed its surplus. Either way the pass has converged as far as it
+			// is allowed to; the next one recomputes from measured usage.
 			break
 		}
 		report.Examined++
@@ -568,7 +574,10 @@ func (n *Node) moveShard(
 	}
 	// placeOne re-asks the ledger for a sibling on the target immediately before
 	// sending, records the holder only on the peer's acknowledgement, and skips
-	// the transfer entirely if the peer already has the bytes.
+	// the transfer entirely if the peer already has the bytes -- which is also
+	// how a move interrupted between the copy and the delete resumes: the next
+	// pass finds the destination already holding the shard, costs one small
+	// frame, and goes on to the delete it never got to.
 	if err := n.placeOne(ctx, row.ObjectID, shard.ID, target, read); err != nil {
 		return err
 	}
