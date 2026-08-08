@@ -160,9 +160,13 @@ func TestDeleteRemoteShardRefusesAnotherOwnersShard(t *testing.T) {
 	if _, err := storage.ReadShard(shardID); err == nil {
 		t.Fatal("the shard file survived an honoured revocation")
 	}
-	if !storage.IsRejected("shard", shardID) {
-		t.Fatal("an honoured revocation left no denylist entry, so the next " +
+	if !storage.RecallRefused(held, shardID) {
+		t.Fatal("an honoured revocation left no refusal entry, so the next " +
 			"replicate pass would restore the shard")
+	}
+	if storage.IsRejected("shard", shardID) {
+		t.Fatal("a recall wrote a PERMANENT moderation rejection; that poisons " +
+			"the content address for every other object, forever")
 	}
 	if err := storage.PutRemoteShard(RemoteShard{
 		ID: shardID, ObjectID: held, Size: int64(len(value)),

@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"io"
 	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ type recallHarness struct {
 	sourceStore    *store.Store
 	targetStore    *store.Store
 	coordinator    ed25519.PrivateKey
+	coordPublic    ed25519.PublicKey
 	ctx            context.Context
 }
 
@@ -38,40 +40,48 @@ func newRecallHarness(t *testing.T) *recallHarness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	openStorage := func() (*store.Store, string) {
-		dir := t.TempDir()
-		storage, err := store.Open(dir+"/storage", 3, 2, 64<<10, 64<<20)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { storage.Close() })
-		return storage, dir
-	}
-	sourceStore, sourceDir := openStorage()
-	targetStore, targetDir := openStorage()
-	logger := log.New(io.Discard, "", 0)
-	source, err := openNode(ctx, sourceDir, []string{"/ip4/127.0.0.1/tcp/0"}, sourceStore, logger, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { source.Close() })
-	target, err := openNode(ctx, targetDir, []string{"/ip4/127.0.0.1/tcp/0"}, targetStore, logger, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { target.Close() })
-	if err := source.host.Connect(ctx, peer.AddrInfo{ID: target.host.ID(), Addrs: target.host.Addrs()}); err != nil {
-		t.Fatal(err)
-	}
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source.coordKey = publicKey
-	target.coordKey = publicKey
-	return &recallHarness{
-		source: source, target: target, sourceStore: sourceStore,
-		targetStore: targetStore, coordinator: privateKey, ctx: ctx,
+	h := &recallHarness{coordinator: privateKey, coordPublic: publicKey, ctx: ctx}
+	var sourceStore, targetStore *store.Store
+	h.source, sourceStore = h.spawnPeer(t)
+	h.target, targetStore = h.spawnPeer(t)
+	h.sourceStore, h.targetStore = sourceStore, targetStore
+	h.connect(t, h.source)
+	return h
+}
+
+// spawnPeer opens another node on the same pretend network, pinning the same
+// coordinator key. Tests that care WHO presents a token need a peer that is
+// genuinely somebody else -- one with its own identity key, dialing its own
+// stream -- because the binding under test is against the peer libp2p
+// authenticated, not against anything a test could type into a field.
+func (h *recallHarness) spawnPeer(t *testing.T) (*Node, *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	storage, err := store.Open(dir+"/storage", 3, 2, 64<<10, 64<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { storage.Close() })
+	node, err := openNode(h.ctx, dir, []string{"/ip4/127.0.0.1/tcp/0"}, storage, log.New(io.Discard, "", 0), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { node.Close() })
+	node.coordKey = h.coordPublic
+	return node, storage
+}
+
+func (h *recallHarness) connect(t *testing.T, from *Node) {
+	t.Helper()
+	err := from.host.Connect(h.ctx, peer.AddrInfo{
+		ID: h.target.host.ID(), Addrs: h.target.host.Addrs(),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -96,12 +106,20 @@ func (h *recallHarness) sign(revocation Revocation) Revocation {
 	return revocation
 }
 
+// token mints what the coordinator would mint for h.source: bound to the target
+// as the holder that may honour it, and to the source as the only peer that may
+// present it.
 func (h *recallHarness) token(objectID, shardID string) Revocation {
+	return h.tokenFor(h.source, objectID, shardID)
+}
+
+func (h *recallHarness) tokenFor(requester *Node, objectID, shardID string) Revocation {
 	nonce := make([]byte, 16)
 	_, _ = rand.Read(nonce)
 	return h.sign(Revocation{
 		Version: 1, ObjectID: objectID, ShardID: shardID,
 		Recipient: h.target.host.ID().String(),
+		Requester: requester.host.ID().String(),
 		IssuedAt:  time.Now().Unix(), ExpiresAt: time.Now().Unix() + 300,
 		Nonce: base64.RawURLEncoding.EncodeToString(nonce),
 	})
@@ -112,7 +130,12 @@ func (h *recallHarness) token(objectID, shardID string) Revocation {
 // the two must never be confused.
 func (h *recallHarness) ask(t *testing.T, header requestHeader) responseHeader {
 	t.Helper()
-	stream, err := h.source.host.NewStream(h.ctx, h.target.host.ID(), ProtocolID)
+	return h.askFrom(t, h.source, header)
+}
+
+func (h *recallHarness) askFrom(t *testing.T, from *Node, header requestHeader) responseHeader {
+	t.Helper()
+	stream, err := from.host.NewStream(h.ctx, h.target.host.ID(), ProtocolID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,6 +305,106 @@ func TestRevocationCannotBeReplayedAtAnotherPeer(t *testing.T) {
 	}
 	if !h.stillHeld(shardID) {
 		t.Fatal("a replayed token deleted the shard")
+	}
+}
+
+// A token is bound to the peer that ASKED for it, not only to the peer that
+// holds the bytes. A delete frame travels the network in the clear, so the token
+// inside it is visible to the holder it was aimed at and to anything that
+// observed the exchange. Without this binding a token is a bearer instrument:
+// pick one up, present it yourself, and the holder cannot tell the difference.
+func TestARevocationIssuedToOnePeerCannotBePresentedByAnother(t *testing.T) {
+	h := newRecallHarness(t)
+	objectID := stringOf('a', 64)
+	shardID := h.plantShard(t, objectID, bytes.Repeat([]byte("bearer"), 64))
+
+	// A second origin: its own identity key, its own stream. This is the peer
+	// that captured the token, not a peer id typed into a field.
+	thief, _ := h.spawnPeer(t)
+	h.connect(t, thief)
+
+	captured := h.token(objectID, shardID)
+	stolen := h.askFrom(t, thief, requestHeader{
+		Operation: "delete", ObjectID: objectID, ShardID: shardID, Revocation: &captured,
+	})
+	if stolen.OK || !stolen.Refused {
+		t.Fatalf("a token issued to another peer was honoured for the bearer: %#v", stolen)
+	}
+	if !h.stillHeld(shardID) {
+		t.Fatal("a captured token deleted the shard when replayed by another peer")
+	}
+
+	// An OLD token, from before the coordinator bound requesters, is refused
+	// rather than grandfathered -- an unbound token is exactly the bearer
+	// instrument this check abolishes.
+	unbound := h.token(objectID, shardID)
+	unbound.Requester = ""
+	unbound = h.sign(unbound)
+	legacy := h.ask(t, requestHeader{
+		Operation: "delete", ObjectID: objectID, ShardID: shardID, Revocation: &unbound,
+	})
+	if legacy.OK || !legacy.Refused {
+		t.Fatalf("a token with no requester was honoured: %#v", legacy)
+	}
+	if !h.stillHeld(shardID) {
+		t.Fatal("an unbound token deleted the shard")
+	}
+
+	// And the same token in the right hands still works, so the refusals above
+	// are about who presented it and not about the verb being broken.
+	granted := h.ask(t, requestHeader{
+		Operation: "delete", ObjectID: objectID, ShardID: shardID, Revocation: &captured,
+	})
+	if !granted.OK || !granted.Deleted {
+		t.Fatalf("the rightful requester was refused its own token: %#v", granted)
+	}
+}
+
+// Editing the requester to match the bearer must not rescue a stolen token: the
+// field is inside the signed message, so rewriting it breaks the coordinator's
+// signature. Without that, the equality check above would be trivially defeated
+// by anyone holding a token and a text editor.
+func TestATamperedRequesterFailsSignatureVerification(t *testing.T) {
+	h := newRecallHarness(t)
+	objectID := stringOf('a', 64)
+	shardID := h.plantShard(t, objectID, bytes.Repeat([]byte("tamper"), 64))
+
+	thief, _ := h.spawnPeer(t)
+	h.connect(t, thief)
+
+	// Captured from the wire and re-addressed to the thief, WITHOUT re-signing:
+	// the thief has no coordinator key, which is the whole point.
+	forged := h.token(objectID, shardID)
+	forged.Requester = thief.host.ID().String()
+	answer := h.askFrom(t, thief, requestHeader{
+		Operation: "delete", ObjectID: objectID, ShardID: shardID, Revocation: &forged,
+	})
+	if answer.OK || !answer.Refused {
+		t.Fatalf("a token with a rewritten requester was accepted: %#v", answer)
+	}
+	// It must fail on the SIGNATURE, not merely on the identity comparison --
+	// that is the difference between a field that is bound and a field that is
+	// only checked.
+	if !strings.Contains(answer.Error, "signature") {
+		t.Fatalf("a rewritten requester was refused for the wrong reason (%q); "+
+			"the field is not covered by the coordinator signature", answer.Error)
+	}
+	if !h.stillHeld(shardID) {
+		t.Fatal("a tampered requester deleted the shard")
+	}
+
+	// The same edit is equally dead when made by the peer the token names: this
+	// is a signature property, not an identity one.
+	widened := h.token(objectID, shardID)
+	widened.Requester = "*"
+	wildcard := h.ask(t, requestHeader{
+		Operation: "delete", ObjectID: objectID, ShardID: shardID, Revocation: &widened,
+	})
+	if wildcard.OK || !wildcard.Refused {
+		t.Fatalf("a wildcard requester was accepted: %#v", wildcard)
+	}
+	if !h.stillHeld(shardID) {
+		t.Fatal("a wildcard requester deleted the shard")
 	}
 }
 

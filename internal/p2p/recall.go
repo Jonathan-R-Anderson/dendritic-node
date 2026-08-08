@@ -57,15 +57,51 @@ import (
 //     "any peer may accept these bytes". That is safe for a write and unsafe for
 //     a delete, so validateRevocation refuses an empty recipient outright: a
 //     token minted against peer A is inert at peer B.
+//   - a REQUIRED requester -- see below.
+//
+// BOTH ENDS ARE NAMED, AND FOR DIFFERENT REASONS
+// ----------------------------------------------
+// recipient binds the token to the peer that may HONOUR it. requester binds it
+// to the peer that may PRESENT it. Without the second, a token is a bearer
+// instrument: it travels the network in the clear inside a delete frame, so the
+// holder it was aimed at -- or anything that observed the exchange -- could turn
+// round and present the same bytes itself. Naming the requester inside the
+// signed message and checking it against the authenticated peer on the other end
+// of the libp2p stream makes a captured token inert in anyone else's hands.
+//
+// The requester is taken from stream.Conn().RemotePeer(), never from the frame.
+// libp2p has already proved possession of that peer's private key during the
+// security handshake; a peer id copied into the header would prove nothing at
+// all, and an attacker would simply type the victim's id into it.
 //
 // WHAT A HOLDER CHECKS, IN ORDER
 //   - the token is version 1 and signed by the coordinator key it already pins;
 //   - object_id and shard_id equal the request header's, so a token for shard A
 //     cannot delete shard B;
 //   - recipient is this node and nothing else;
+//   - requester is the authenticated peer that opened this stream;
 //   - it has not expired, and its expiry is not absurdly far out;
 //   - and only then, whether the shard may actually go (store.DeleteRemoteShard,
 //     which refuses bytes another manifest still references).
+//
+// COMPATIBILITY, AND WHICH WAY IT FAILS
+// -------------------------------------
+// requester is inside the SIGNED message, so its arrival is a wire break in both
+// directions -- deliberately, and both directions fail closed:
+//
+//   - an OLD holder given a NEW token reconstructs the message without the
+//     requester line, so ed25519.Verify fails and it answers "invalid
+//     coordinator revocation signature". It refuses to delete. Safe.
+//   - a NEW holder given an OLD token sees an empty Requester, which can never
+//     equal a real peer id, and refuses before it even reaches the signature.
+//     An unbound token is never honoured by a node that knows about binding.
+//
+// Refusal is NOT terminal in the recall ledger (store.RecallRecord.Outstanding
+// counts anything that is not deleted/absent), so the tombstone survives, the
+// background pass retries every recallInterval, and a recall issued during the
+// upgrade window completes on its own once the holders are new. Rollout order is
+// therefore: sign first, upgrade holders after, and expect recalls against
+// not-yet-upgraded holders to sit refused-and-retrying in the meantime.
 //
 // cacheOnly is deliberately NOT consulted. A cache-only node refuses new stores,
 // but it can still be holding shards it accepted before the operator set that
@@ -99,10 +135,16 @@ const (
 // peer. Deliberately not a Lease with a flag: the two are separate token types
 // with separate signed messages so neither can be replayed as the other.
 type Revocation struct {
-	Version   int    `json:"version"`
-	ObjectID  string `json:"object_id"`
-	ShardID   string `json:"shard_id"`
+	Version  int    `json:"version"`
+	ObjectID string `json:"object_id"`
+	ShardID  string `json:"shard_id"`
+	// Recipient is the only peer that may HONOUR this token.
 	Recipient string `json:"recipient"`
+	// Requester is the only peer that may PRESENT it: the origin that asked the
+	// coordinator to mint it. Inside the signed message, so it cannot be edited
+	// in flight, and checked against the authenticated peer on the other end of
+	// the stream, so a token captured in transit is inert in other hands.
+	Requester string `json:"requester"`
 	IssuedAt  int64  `json:"issued_at"`
 	ExpiresAt int64  `json:"expires_at"`
 	Nonce     string `json:"nonce"`
@@ -130,19 +172,30 @@ type revocationResponse struct {
 // revocationMessage is the exact byte sequence the coordinator signs. Its Python
 // twin is _revocation_message in backend/services/storage_coordination.py and
 // the two must stay byte-identical.
+//
+// requester sits between recipient and issued_at because the two peer ids belong
+// together: this line and the one above it name the two ends of the delete, and
+// a reader who sees one should not have to scroll to find the other. Both are
+// peer ids, which are base58 and cannot contain the newline that separates
+// fields, so no value can impersonate a field boundary.
 func revocationMessage(revocation Revocation) []byte {
 	return []byte(fmt.Sprintf(
-		"syndichan-storage-revocation-v1\n%d\n%s\n%s\n%s\n%d\n%d\n%s",
+		"syndichan-storage-revocation-v1\n%d\n%s\n%s\n%s\n%s\n%d\n%d\n%s",
 		revocation.Version, revocation.ObjectID, revocation.ShardID,
-		revocation.Recipient, revocation.IssuedAt, revocation.ExpiresAt,
-		revocation.Nonce,
+		revocation.Recipient, revocation.Requester, revocation.IssuedAt,
+		revocation.ExpiresAt, revocation.Nonce,
 	))
 }
 
 // validateRevocation is the holder-side check. Mirrors validateLease, with the
-// two deliberate differences documented at the top of this file: an empty
-// recipient is refused, and the message it verifies is a different one.
-func (n *Node) validateRevocation(revocation *Revocation, header requestHeader) error {
+// deliberate differences documented at the top of this file: an empty recipient
+// is refused, the message it verifies is a different one, and the token must
+// name the peer presenting it.
+//
+// remote is the peer libp2p authenticated when it accepted the stream. It is an
+// argument rather than a field read out of the header precisely so that no
+// caller can pass something an attacker chose.
+func (n *Node) validateRevocation(revocation *Revocation, header requestHeader, remote peer.ID) error {
 	if revocation == nil || revocation.Version != 1 {
 		return errors.New("coordinator revocation required")
 	}
@@ -159,6 +212,18 @@ func (n *Node) validateRevocation(revocation *Revocation, header requestHeader) 
 	// peer that saw it could replay it against all the others.
 	if revocation.Recipient == "" || revocation.Recipient != n.host.ID().String() {
 		return errors.New("revocation was issued to another node")
+	}
+	// And the other end. An empty requester is an OLD token minted before the
+	// coordinator bound them, and it is refused rather than grandfathered: an
+	// unbound token is exactly the bearer instrument this check exists to
+	// abolish, and accepting "no requester means anyone" would keep every token
+	// already in flight usable by whoever picked it up. The signature check below
+	// would fail such a token anyway -- this branch is here to say why.
+	if revocation.Requester == "" {
+		return errors.New("revocation is not bound to a requester")
+	}
+	if revocation.Requester != remote.String() {
+		return errors.New("revocation was issued to another requester")
 	}
 	if len(revocation.Nonce) < 16 || len(revocation.Nonce) > 128 {
 		return errors.New("invalid revocation nonce")
@@ -187,8 +252,11 @@ func (n *Node) validateRevocation(revocation *Revocation, header requestHeader) 
 // handleDelete serves the delete verb. Every branch writes exactly one response
 // frame, because the caller distinguishes "this peer refused" from "this peer
 // never answered" by whether a frame came back at all.
-func (n *Node) handleDelete(stream io.Writer, header requestHeader) {
-	if err := n.validateRevocation(header.Revocation, header); err != nil {
+//
+// remote comes from the stream's connection, not from the frame: it is the peer
+// libp2p authenticated, and it is what the token's requester has to match.
+func (n *Node) handleDelete(stream io.Writer, header requestHeader, remote peer.ID) {
+	if err := n.validateRevocation(header.Revocation, header, remote); err != nil {
 		writeJSONFrame(stream, responseHeader{Refused: true, Error: err.Error()})
 		return
 	}
@@ -229,7 +297,29 @@ func (n *Node) recallFromPeer(ctx context.Context, target peer.ID, revocation Re
 	}
 	switch {
 	case response.OK && response.Deleted:
-		return store.RecallDeleted, "the holder removed the shard and blocklisted it"
+		// VERIFY THE CLAIM. "deleted: true" is a sentence written by the party
+		// with the motive to lie: a holder that wants to keep the bytes says it
+		// deleted them, is recorded as deleted, and is then dropped from the
+		// placement ledger -- so the owner no longer knows it ever held the
+		// shard and will never ask again. For a feature whose entire purpose is
+		// content removal, that is the one comfortable lie that matters.
+		//
+		// A fresh "have" on a new stream is cheap and turns the holder's word
+		// into an observation. It is not proof against a holder that hides the
+		// shard from "have" while keeping it on disk -- nothing short of
+		// pof-challenge is -- but it catches the holder that simply did not
+		// delete, which is the realistic case.
+		//
+		// An unreachable or erroring re-check is NOT treated as deleted: unknown
+		// must not collapse into the outcome we were hoping for.
+		still, err := n.PeerHasShard(ctx, target, revocation.ShardID)
+		if err != nil {
+			return store.RecallUnreachable, "the holder claimed deletion but could not be re-checked: " + err.Error()
+		}
+		if still {
+			return store.RecallRefused, "the holder claimed deletion but still has the shard"
+		}
+		return store.RecallDeleted, "the holder removed the shard, verified by a follow-up have"
 	case response.OK:
 		return store.RecallAbsent, "the holder answered and no longer had the shard"
 	default:

@@ -1110,6 +1110,13 @@ func (s *Store) PutRemoteShard(shard RemoteShard, value []byte) error {
 	if s.IsRejected("shard", shard.ID) || s.IsRejected("object", shard.ObjectID) {
 		return errors.New("shard or object is rejected by this node")
 	}
+	// Scoped recall refusal: this OBJECT's copy was recalled recently. Checked
+	// separately from the moderation denylist above because it is per-object and
+	// expires -- a different object's shard with the same content address is
+	// still welcome here, which is exactly what the permanent denylist got wrong.
+	if s.RecallRefused(shard.ObjectID, shard.ID) {
+		return errors.New("this object's copy of the shard was recalled recently")
+	}
 	if err := s.writeShard(shard.ID, value); err != nil {
 		return err
 	}

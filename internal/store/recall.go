@@ -459,7 +459,21 @@ func (s *Store) DeleteRemoteShard(objectID, shardID string) (bool, error) {
 	if referenced {
 		return false, ErrShardStillReferenced
 	}
-	if err := s.Reject("shard", shardID); err != nil {
+	// A SCOPED, EXPIRING refusal -- deliberately not s.Reject.
+	//
+	// Reject writes to the moderation denylist, whose key is "shard\x00"+id and
+	// which nothing ever removes from. Shard ids are CONTENT ADDRESSES, so that
+	// entry is object-blind and permanent: confirmed by test, object B recalling
+	// a shard it happens to share with object A destroyed A's bytes AND made it
+	// impossible for repair to ever restore them on this holder, for any object,
+	// forever. Durability then erodes by one holder per recall, silently.
+	//
+	// A recall means "this owner no longer wants THIS object here", which is a
+	// narrower and shorter-lived claim than "this content is banned". Scoping it
+	// to the object stops one owner's takedown from touching another's data;
+	// expiring it stops the holder from refusing a legitimate re-placement once
+	// the owner's replicate cycle has moved on.
+	if err := s.refuseRecalledShard(objectID, shardID); err != nil {
 		return false, err
 	}
 	if err := s.db.Update(func(tx *bolt.Tx) error {
@@ -740,4 +754,50 @@ func placementView(row ObjectPlacement, withShards bool) PlacementView {
 		view.Shards = append([]ShardPlacement(nil), row.Shards...)
 	}
 	return view
+}
+
+// recallRefusalTTL bounds how long a holder refuses a shard it recalled.
+//
+// Long enough to outlast the owner's replicate cycle, so a recall is not
+// immediately undone by the very loop that placed the shard; short enough that
+// the holder does not carry a permanent grudge against a content address it may
+// legitimately be asked to store again for a different object.
+const recallRefusalTTL = 6 * time.Hour
+
+func recallRefusalKey(objectID, shardID string) []byte {
+	return []byte("recall\x00" + objectID + "\x00" + shardID)
+}
+
+// refuseRecalledShard records that this object's copy of this shard was
+// recalled. Scoped to the object and expiring -- see the call site for why the
+// moderation denylist is the wrong tool.
+func (s *Store) refuseRecalledShard(objectID, shardID string) error {
+	if !IsContentID(shardID) {
+		return errors.New("invalid shard ID")
+	}
+	deadline := time.Now().UTC().Add(recallRefusalTTL).Format(time.RFC3339Nano)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketDenied).Put(recallRefusalKey(objectID, shardID), []byte(deadline))
+	})
+}
+
+// RecallRefused reports whether this object's copy of this shard is still
+// within its refusal window. An unparseable or elapsed deadline is NOT a
+// refusal: the failure direction has to be "accept the shard", because
+// refusing forever is the bug this replaced.
+func (s *Store) RecallRefused(objectID, shardID string) bool {
+	var refused bool
+	s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketDenied).Get(recallRefusalKey(objectID, shardID))
+		if raw == nil {
+			return nil
+		}
+		deadline, err := time.Parse(time.RFC3339Nano, string(raw))
+		if err != nil {
+			return nil
+		}
+		refused = time.Now().UTC().Before(deadline)
+		return nil
+	})
+	return refused
 }

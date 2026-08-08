@@ -1065,11 +1065,15 @@ func (n *Node) handleStream(stream network.Stream) {
 		go n.Provide(context.Background(), header.ShardID)
 	case "delete":
 		// Recall. Authorised by a coordinator-signed revocation bound to this
-		// exact shard AND this exact peer; see recall.go. cacheOnly is NOT
-		// consulted here -- a node that has stopped accepting shards may still
-		// be holding ones it accepted earlier, and those are exactly the ones
-		// an owner needs back.
-		n.handleDelete(stream, header)
+		// exact shard, this exact holder, AND the peer presenting it; see
+		// recall.go. That last binding is why the connection's remote peer is
+		// passed down: it is the one identity on this stream libp2p has actually
+		// proved, and nothing in the frame may be substituted for it.
+		//
+		// cacheOnly is NOT consulted here -- a node that has stopped accepting
+		// shards may still be holding ones it accepted earlier, and those are
+		// exactly the ones an owner needs back.
+		n.handleDelete(stream, header, stream.Conn().RemotePeer())
 	default:
 		writeJSONFrame(stream, responseHeader{Error: "unsupported operation"})
 	}
