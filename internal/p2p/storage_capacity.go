@@ -50,6 +50,20 @@ func storageCapacityKey(nodeID string) string {
 // space is a moving number: a stale record is worse than none, since it routes
 // writes at a node that filled up an hour ago.
 func (n *Node) PublishStorageCapacity(ctx context.Context, freeBytes, capacity int64) error {
+	if n.cacheOnly {
+		// A cache-only node hosts nothing for other peers -- the "store" handler
+		// refuses every shard with "node is cache-only and does not host
+		// shards". Advertising capacity anyway makes it a permanent candidate
+		// that permanently refuses: measured on production, every placement
+		// round offered it a shard, burned the attempt, and objects stalled one
+		// holder short of the durability threshold because a slot was spent on
+		// a node that was never going to accept.
+		//
+		// Silently publishing nothing is right here rather than an error: being
+		// cache-only is a legitimate configuration, not a failure, and the
+		// caller has nothing to handle.
+		return nil
+	}
 	record := place.Record{
 		RecordType:  "storage_capacity",
 		NodeID:      n.host.ID().String(),
