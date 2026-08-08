@@ -427,7 +427,9 @@ var ErrShardHeldForAnotherObject = errors.New("shard is held on behalf of anothe
 //     Deleting the bolt row alone is not deleting the shard: `have` and `get`
 //     both read the file off disk and never consult remote_shards.
 func (s *Store) DeleteRemoteShard(objectID, shardID string) (bool, error) {
-	if len(shardID) != 64 {
+	if !IsContentID(shardID) {
+		// Charset, not just length -- see IsContentID. A length-only check
+		// here made this an arbitrary-file-unlink primitive.
 		return false, errors.New("invalid shard ID")
 	}
 	var heldFor string

@@ -149,7 +149,9 @@ func (n *Node) validateRevocation(revocation *Revocation, header requestHeader) 
 	if revocation.ObjectID != header.ObjectID || revocation.ShardID != header.ShardID {
 		return errors.New("revocation does not match the shard requested")
 	}
-	if len(revocation.ShardID) != 64 {
+	if !store.IsContentID(revocation.ShardID) {
+		// Charset-checked, not merely length-checked: 64 characters of path
+		// traversal escape the shard directory once filepath.Join cleans them.
 		return errors.New("invalid shard ID")
 	}
 	// A lease may be recipient-less. A revocation may not: without this, one

@@ -954,7 +954,7 @@ func (s *Store) Reject(kind, id string) error {
 	if kind != "object" && kind != "shard" {
 		return errors.New("invalid rejection kind")
 	}
-	if len(id) != 64 {
+	if !IsContentID(id) {
 		return errors.New("invalid content ID")
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
@@ -1184,4 +1184,31 @@ func (s *Store) ListStored() ([]StoredItem, error) {
 	})
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
 	return result, err
+}
+
+// IsContentID reports whether id is a well-formed content address: exactly 64
+// LOWERCASE HEX characters, nothing else.
+//
+// A length check alone is not this. Sixty-four characters of "../" escape the
+// shard directory entirely, because shardPath runs them through filepath.Join
+// which cleans the path — so a length-only check turns shard deletion into
+// arbitrary file deletion. That was reachable from the network: a validly
+// signed revocation carrying such an id unlinked a holder's p2p.key in a live
+// two-node test, and the holder answered "deleted: true".
+//
+// Every path that turns a caller-supplied id into a filesystem path must call
+// this. It lives here, at the store boundary, rather than only in the protocol
+// handler, because the dashboard's reject path reaches the same sink without
+// passing through the handler at all.
+func IsContentID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
