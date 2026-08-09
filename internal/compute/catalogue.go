@@ -26,6 +26,7 @@ package compute
 
 import (
 	"errors"
+	"sort"
 	"strings"
 )
 
@@ -40,6 +41,36 @@ type Workload struct {
 	// else: the node reads it from this table after matching a name, so there is
 	// no path from a request to an arbitrary image.
 	Image string
+
+	// Artifact is the published file that CONTAINS that image: a `docker save`
+	// tarball, served at <base>/dl/<Artifact> exactly the way the node binary
+	// is. A node that lacks the image fetches this, checks it, and loads it.
+	//
+	// Named here rather than derived from Image because the two are different
+	// namespaces — one is a container reference, the other is a filename on a
+	// web server — and deriving one from the other would mean a rename in
+	// either place silently changed the other.
+	Artifact string
+
+	// Digest is the SHA-256 of that tarball, in hex, and it is the whole
+	// reason a node may load an image it downloaded.
+	//
+	// COMPILED IN, NEVER FETCHED. This is the one field that must not travel
+	// beside the bytes it describes. A digest served from the same place as the
+	// artifact proves the two agree and nothing else; a digest baked into the
+	// binary the operator chose to install means the site can publish new bytes
+	// under this name and every node will refuse them until its operator
+	// installs a build that expects them. The set of images a node will load is
+	// therefore fixed at the same moment the set of workloads it will run is —
+	// which is the closed-table property this file already has, extended to the
+	// bytes rather than stopping at the name.
+	//
+	// It is the digest of the PUBLISHED TARBALL, not a claim that `docker save`
+	// is reproducible from a Dockerfile. Measured: two `docker save` runs of one
+	// image on Docker 29.4.2 produced identical bytes, so a rebuild from the
+	// same image can be re-derived; a rebuild from the Dockerfile cannot, and
+	// nothing here pretends otherwise.
+	Digest string
 
 	// Class is what this work IS — media, index, train, infer, science. It is
 	// what an operator's JobClasses allowlist filters on and what the "what has
@@ -95,8 +126,16 @@ type Workload struct {
 // whose results cannot be checked stay out however useful they would be.
 var Workloads = map[string]Workload{
 	"embed": {
-		Name:            "embed",
-		Image:           "registry.local/compute-embed:latest",
+		Name:     "embed",
+		Image:    "registry.local/compute-embed:latest",
+		Artifact: "compute-embed.tar",
+		// Measured on 2026-08-09 from the built image, Docker 29.4.2:
+		// 194,401,280 bytes, and the same digest on two consecutive saves.
+		// backend/scripts/publish_compute_images.py REFUSES to publish a
+		// tarball whose hash is not this one, so the artifact a node downloads
+		// and the artifact this line describes cannot drift apart silently —
+		// the publish fails instead of a fleet of nodes refusing.
+		Digest:          "a5643d5a718f18697b3847616f122ded7bdd063d45751439a4412215d4fd65f7",
 		Class:           "index",
 		Deterministic:   true,
 		InputFile:       "input.jsonl",
@@ -120,6 +159,62 @@ var ErrUnknownWorkload = errors.New("compute: not a catalogue workload")
 func LookupWorkload(name string) (Workload, bool) {
 	w, ok := Workloads[strings.TrimSpace(name)]
 	return w, ok
+}
+
+// CatalogueWorkloads lists every workload, in a stable order.
+//
+// Stable because the caller is the image loader, and a node that fetched its
+// catalogue in map-iteration order would log a different sequence every start
+// for no reason — which makes two runs of the same failure look like two
+// different failures.
+func CatalogueWorkloads() []Workload {
+	names := make([]string, 0, len(Workloads))
+	for name := range Workloads {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]Workload, 0, len(names))
+	for _, name := range names {
+		out = append(out, Workloads[name])
+	}
+	return out
+}
+
+// Fetchable reports whether this workload's image can be obtained over the
+// network, and says why not when it cannot.
+//
+// A workload with no Artifact or no well-formed Digest is NOT fetchable, and
+// that is a refusal rather than a best effort: downloading an executable image
+// with nothing to check it against is the one thing the digest exists to
+// prevent. Such a workload can still run on a node whose operator built the
+// image by hand — it simply cannot be distributed, which is a true statement
+// about the catalogue rather than a failure of the node.
+func (w Workload) Fetchable() (bool, string) {
+	if strings.TrimSpace(w.Artifact) == "" {
+		return false, "no published artifact"
+	}
+	if !isHexDigest(w.Digest) {
+		return false, "no published sha256"
+	}
+	return true, ""
+}
+
+// isHexDigest checks the shape of a sha256, and only the shape. A digest that
+// is the wrong length or carries a stray "sha256:" prefix would fail every
+// comparison later, at which point the message is about downloaded bytes rather
+// than about a typo in this file.
+func isHexDigest(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // IsCatalogueRuntime reports whether a string is the pinned reference of a

@@ -17,6 +17,14 @@ func originURLs(cfg *config.Config) map[string]*string {
 		"gateway registration API": &cfg.Gateway.RegistrationAPI,
 		"validator origin":         &cfg.Gateway.Validator.OriginURL,
 		"content gateway origin":   &cfg.Gateway.Content.OriginURL,
+		// Only when the operator SET it. An unset value resolves to
+		// computeimage.DefaultBaseURL, a compiled-in constant that no directive
+		// can move — the same property heartbeat.Endpoint has, and for the same
+		// reason: a node that could be told where to download executable images
+		// by something it received over the network would be trusting the wrong
+		// half of the pair. The digest is what makes the download safe, and the
+		// digest is compiled in.
+		"compute image source": &cfg.Compute.ImageBaseURL,
 	}
 }
 

@@ -182,6 +182,22 @@ type Node struct {
 	gpuCompute bool
 	cpuCompute bool
 	microVM    bool
+	// computeCatalogueReady is the MEASURED half of the compute claim: this node
+	// holds every image the catalogue names, so any workload it is sent can
+	// actually be run.
+	//
+	// Both switches above are ANDed with it, because a node that offers compute
+	// does not get to pick which catalogue workloads it takes — so "I lend CPU"
+	// and "I can run the catalogue" are one claim, not two, and a node that
+	// cannot make the second must stop making the first. False until something
+	// checks, which is the right way round: a node fetching its images has not
+	// yet earned the advertisement, and a node with no container runtime never
+	// will.
+	//
+	// Atomic because it is written by the image loader's goroutine minutes after
+	// start and read by the heartbeat's, where every other field here is written
+	// once before either exists.
+	computeCatalogueReady atomic.Bool
 
 	// computePeers is what this node knows about where compute lives, refreshed
 	// from the signed bootstrap document. Held locally so a node can ask "who
@@ -200,10 +216,10 @@ type Node struct {
 	computeMu      sync.RWMutex
 	computeHandler ComputeHandler
 	host           host.Host
-	dht              *dht.IpfsDHT
-	store            *store.Store
-	logger           *log.Logger
-	bootstrap        string
+	dht            *dht.IpfsDHT
+	store          *store.Store
+	logger         *log.Logger
+	bootstrap      string
 	// bootstrapConfig is nil until SetBootstrapConfig is called, which is what
 	// keeps an upgraded node on its existing behaviour instead of refusing the
 	// only source it has.
@@ -808,6 +824,34 @@ func (n *Node) SetComputeRoles(enabled, cpu, gpu bool) {
 	n.gpuCompute = enabled && gpu
 }
 
+// SetComputeCatalogueReady records whether this node holds every catalogue
+// image, which is what decides whether the compute switches above are a claim
+// it can honour.
+//
+// Called by the image loader, and called with FALSE as readily as with true: an
+// image that disappears between sweeps takes the advertisement down with it,
+// because the alternative is a node that keeps being chosen for work it will
+// fail. Withdrawing a capability is the correct response to losing it.
+func (n *Node) SetComputeCatalogueReady(ready bool) {
+	n.computeCatalogueReady.Store(ready)
+}
+
+// ComputeCatalogueReady reports the last thing the loader said.
+func (n *Node) ComputeCatalogueReady() bool { return n.computeCatalogueReady.Load() }
+
+// computeClaim is what this node may honestly advertise about compute.
+//
+// One function rather than two expressions in the heartbeat snapshot, because
+// this is the rule the whole D.2 change exists to state: an operator who offers
+// compute does not choose which catalogue workloads they take, so being unable
+// to run the catalogue is being unable to offer compute. Any future field that
+// affects that belongs here, where it is one rule, and not beside a struct
+// literal where it would be two.
+func (n *Node) computeClaim() (cpu, gpu bool) {
+	ready := n.computeCatalogueReady.Load()
+	return n.cpuCompute && ready, n.gpuCompute && ready
+}
+
 // SetMicroVM records MEASURED hardware isolation.
 //
 // Takes the probe's verdict, not a config flag: an operator cannot declare
@@ -824,6 +868,11 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 			n.gatewayMu.RLock()
 			registration := n.gatewayRegistration
 			n.gatewayMu.RUnlock()
+			// Read fresh on every beat rather than latched at start, so a node
+			// whose images arrive five minutes in begins advertising on the next
+			// beat without a restart, and one that loses them stops on the next
+			// beat too.
+			cpuCompute, gpuCompute := n.computeClaim()
 			state := heartbeat.State{
 				CapacityBytes:   n.store.Capacity(),
 				UsedBytes:       usedBytesOrZero(n.store),
@@ -833,8 +882,8 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 				Registration:    registration,
 				DCSWorker:       n.dcsWorker.Load(),
 				Monitor:         n.monitorEnabled,
-				GPUCompute:      n.gpuCompute,
-				CPUCompute:      n.cpuCompute,
+				GPUCompute:      gpuCompute,
+				CPUCompute:      cpuCompute,
 				MicroVM:         n.microVM,
 				I2PDestination:  n.I2PDestination(),
 				// Read from the cached last pass -- no ledger walk and no peer

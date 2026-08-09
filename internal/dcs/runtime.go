@@ -23,6 +23,7 @@ import (
 
 type DockerClient struct {
 	http     *http.Client
+	long     *http.Client
 	endpoint string
 	apiBase  string
 }
@@ -32,18 +33,27 @@ func NewDockerClient(endpoint string) (*DockerClient, error) {
 	if socket == "" || !strings.HasPrefix(endpoint, "unix://") {
 		return nil, fmt.Errorf("dcs: only unix:// docker endpoints are supported, got %q", endpoint)
 	}
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", socket)
+	}
 	return &DockerClient{
 		endpoint: endpoint,
 		apiBase:  "http://docker",
 		http: &http.Client{
-			Timeout: 60 * time.Second,
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					var d net.Dialer
-					return d.DialContext(ctx, "unix", socket)
-				},
-			},
+			Timeout:   60 * time.Second,
+			Transport: &http.Transport{DialContext: dial},
 		},
+		// No client-side deadline: the CALLER's context is the deadline.
+		//
+		// Loading a catalogue image means handing the daemon ~190 MB and
+		// waiting while it unpacks several hundred megabytes of layers, which on
+		// a Raspberry Pi takes minutes. The 60-second client above would abort
+		// that mid-stream every time, and the failure would arrive as a
+		// transport error rather than as anything mentioning a timeout — so the
+		// operator would see an image that "cannot be loaded" on exactly the
+		// hardware most likely to be volunteering.
+		long: &http.Client{Transport: &http.Transport{DialContext: dial}},
 	}, nil
 }
 
@@ -265,6 +275,89 @@ func (c *DockerClient) BuildImage(ctx context.Context, contextBlob []byte, tag s
 		}
 		if msg.Error != "" {
 			return fmt.Errorf("dcs: docker build failed: %s", msg.Error)
+		}
+	}
+	return nil
+}
+
+// ImageExists reports whether a reference resolves to an image the daemon
+// already holds.
+//
+// The question a node asks before deciding to download 190 MB, and the question
+// it asks again afterwards to confirm the load actually produced the tag it was
+// promised. A 404 is a normal answer here — "no, and that is not a problem" —
+// so it is returned as (false, nil); anything else is the daemon failing, which
+// is a different thing and must not be reported as a missing image.
+func (c *DockerClient) ImageExists(ctx context.Context, reference string) (bool, error) {
+	if strings.TrimSpace(reference) == "" {
+		return false, ErrEmptyImage
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.apiBase+"/images/"+url.PathEscape(reference)+"/json", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("dcs: docker inspect image %s: %w", reference, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return false, nil
+	case resp.StatusCode >= 400:
+		return false, fmt.Errorf("dcs: docker inspect image %s: HTTP %d",
+			reference, resp.StatusCode)
+	}
+	return true, nil
+}
+
+// LoadImage installs an image from a `docker save` tarball.
+//
+// THE CALLER MUST HAVE VERIFIED THE BYTES FIRST. This hands a whole filesystem
+// image to a root daemon, which will then run it; there is nothing this function
+// can check that would make unverified input safe, and a verification done in
+// here would be a verification against a digest that arrived with the bytes.
+// See internal/computeimage, which is the only caller and which hashes the
+// complete file against a digest compiled into this binary before opening it.
+//
+// Takes a Reader rather than a []byte because the file is ~190 MB and the
+// machines that most need this are the ones that cannot spare that twice.
+func (c *DockerClient) LoadImage(ctx context.Context, tarball io.Reader) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.apiBase+"/images/load?quiet=1", tarball)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := c.long.Do(req)
+	if err != nil {
+		return fmt.Errorf("dcs: docker load: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		var msg struct {
+			Message string `json:"message"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 8<<10)).Decode(&msg)
+		return fmt.Errorf("dcs: docker load: HTTP %d: %s", resp.StatusCode, msg.Message)
+	}
+	// Like /build, /images/load answers 200 and then streams newline-delimited
+	// JSON whose LAST object may be an error. A caller that trusted the status
+	// code would report a successful load of an image the daemon rejected, and
+	// the node would go on to advertise a workload it cannot run — which is the
+	// exact failure this whole path exists to remove.
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
+	for {
+		var msg struct {
+			Error string `json:"error"`
+		}
+		if err := dec.Decode(&msg); err != nil {
+			break // EOF, or output past the cap; either way there is no more to read
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("dcs: docker load failed: %s", msg.Error)
 		}
 	}
 	return nil

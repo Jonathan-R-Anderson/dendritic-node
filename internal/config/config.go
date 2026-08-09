@@ -289,6 +289,18 @@ type ComputeConfig struct {
 	// over the machine in the act of protecting it.
 	MicroVMKernel string `json:"microvm_kernel"`
 	MicroVMRootFS string `json:"microvm_rootfs,omitempty"`
+
+	// ImageBaseURL is where published catalogue-image artifacts are fetched
+	// from. Empty means computeimage.DefaultBaseURL, which is the ordinary case
+	// — this exists for a fork or a test origin, not for tuning.
+	//
+	// Note what it does NOT decide: whether a downloaded image is loaded. That
+	// is settled by a SHA-256 compiled into the binary (see
+	// internal/compute/catalogue.go), so pointing this somewhere else does not
+	// let anything new onto the machine — it only changes where the node looks
+	// for bytes it already knows the hash of. Which is why this is allowed to be
+	// a config field at all, where MicroVMKernel above deliberately is not.
+	ImageBaseURL string `json:"image_base_url,omitempty"`
 }
 
 // CanRunArbitrary reports whether this node may accept arbitrary code.

@@ -143,7 +143,7 @@ func testComputeAPI(t *testing.T, policy compute.Policy) (*computeAPI, *recordin
 	policy = policy.Normalise()
 	profile := compute.Profile{CPU: compute.CPUInfo{PhysicalCores: 8, LogicalCores: 16}}
 	runtime := &recordingRuntime{seen: make(chan dcs.ContainerSpec, 8)}
-	return &computeAPI{
+	api := &computeAPI{
 		worker: computeworker.New(runtime, compute.NewGovernor(policy, profile, steadySensors{}), policy),
 		// Container isolation, and micro deliberately nil: this is the ordinary
 		// node, the one that must refuse arbitrary code rather than fall back.
@@ -151,7 +151,14 @@ func testComputeAPI(t *testing.T, policy compute.Policy) (*computeAPI, *recordin
 		policy:    policy,
 		results:   map[string]computeworker.Result{},
 		running:   map[string]bool{},
-	}, runtime
+	}
+	// These tests are about the catalogue rule, the isolation rule and the
+	// governor — every one of which is asked AFTER the node has established it
+	// holds its images. A node that has not is refused before any of them, which
+	// is the subject of TestCatalogueImages, so it is set here rather than left
+	// at its zero value and defeating everything else in this file.
+	api.SetComputeCatalogueReady(true)
+	return api, runtime
 }
 
 func submitTo(t *testing.T, api *computeAPI, body map[string]any) (*httptest.ResponseRecorder, map[string]any) {

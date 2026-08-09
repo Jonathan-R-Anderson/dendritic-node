@@ -35,6 +35,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/syndichan/maniwani/storage-client/internal/compute"
@@ -88,9 +89,45 @@ type computeAPI struct {
 	// workload name is not a device.
 	policy compute.Policy
 
+	// catalogueReady is the same fact the heartbeat advertises: this node holds
+	// every image the catalogue names. Kept here as well so the node's answer to
+	// "would you take this?" and its answer to "what do you offer?" come from
+	// one fact rather than two that can disagree.
+	//
+	// It matters even though the advertisement is the real fix, because the
+	// site's listing is a cache: a node whose images went away a minute ago is
+	// still in it, and accepting a job it will die on is precisely the shape
+	// that made placement keep choosing a broken node. False until the loader
+	// says otherwise.
+	catalogueReady atomic.Bool
+
 	mu      sync.Mutex
 	results map[string]computeworker.Result
 	running map[string]bool
+}
+
+// SetComputeCatalogueReady records whether the catalogue images are present.
+// Named to match p2p.Node's method so one loader can tell both without knowing
+// which is which.
+func (c *computeAPI) SetComputeCatalogueReady(ready bool) { c.catalogueReady.Store(ready) }
+
+// catalogueRefusal is the answer when this node's images are not there.
+//
+// RETRYABLE, unlike the operator's own refusals: this is a node in the middle of
+// fetching, or one that could not reach the origin, and both clear on their own.
+// A caller that recorded it as permanent would take a node out of the pool for a
+// download that finishes a minute later.
+func (c *computeAPI) catalogueRefusal(w http.ResponseWriter) bool {
+	if c.catalogueReady.Load() {
+		return false
+	}
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		"admitted": false,
+		"reason": "this node does not yet hold the catalogue images, so it " +
+			"cannot run catalogue work",
+		"retryable": true,
+	})
+	return true
 }
 
 type computeSubmitRequest struct {
@@ -135,6 +172,12 @@ func (c *computeAPI) handleAdmit(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	// Asked first, because it is the one refusal that is about this node being
+	// unable rather than unwilling, and answering "admitted" here is what used
+	// to turn a missing image into a failed execution.
+	if c.catalogueRefusal(w) {
+		return
+	}
 	if err := c.worker.Admit(req.Device); err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"admitted":  false,
@@ -162,6 +205,12 @@ func (c *computeAPI) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.JobID == "" {
 		writeErr(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+	// The same check admit makes, made again here rather than trusted from
+	// there: a submitter is free to skip admit entirely, and the site's dispatch
+	// does exactly that when it already has a recent listing.
+	if c.catalogueRefusal(w) {
 		return
 	}
 	// The isolation rule, checked before anything else about the job. A node

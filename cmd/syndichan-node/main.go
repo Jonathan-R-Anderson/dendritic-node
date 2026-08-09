@@ -823,6 +823,11 @@ func main() {
 		// would leave such a node advertising a device nothing could dispatch
 		// to. Returns nil when the operator lends nothing.
 		computeNode := startComputePeerService(cfg, node, logger)
+		// The images that make that offer true. Both are told the answer: the
+		// node, whose heartbeat stops claiming a capability it cannot honour,
+		// and the API, which stops accepting work it would die on. Runs in the
+		// background — nothing else here waits on a download.
+		startCatalogueImages(ctx, cfg, logger, node, computeNode)
 		// The bridge API lets a co-located website deploy on its users' behalf
 		// through this one node. Independent of the worker role: a node can be a
 		// bridge without running containers itself.
