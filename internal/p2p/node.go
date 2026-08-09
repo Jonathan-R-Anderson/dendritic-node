@@ -142,6 +142,17 @@ type responseHeader struct {
 	// purge report treats "the holder refused" and "the holder never answered"
 	// as different, true outcomes, so the wire has to keep them apart too.
 	Refused bool `json:"refused,omitempty"`
+	// Status carries a compute answer's result code, in the HTTP vocabulary the
+	// node's own /compute/* endpoints already speak. Present on compute frames
+	// and absent everywhere else.
+	//
+	// It is on the wire rather than being reconstructed from Error and Refused
+	// because it is the thing that keeps a refusal a refusal all the way to the
+	// site: "busy, ask again" and "you named a workload I do not have" are both
+	// declines and the site does different things with them. A zero Status on a
+	// compute frame therefore means the peer did not answer AS a compute node --
+	// see SendCompute in compute.go, which is the only place that reads it.
+	Status int `json:"status,omitempty"`
 }
 
 type leaseRequest struct {
@@ -182,7 +193,13 @@ type Node struct {
 	// handler would answer challenges with the wrong node's data.
 	challengeMu      sync.RWMutex
 	challengeHandler func(ctx context.Context, payload []byte) ([]byte, error)
-	host             host.Host
+	// computeHandler answers compute frames from peers, and is nil on every node
+	// that lends no compute -- which is most of them, and why the handler is
+	// checked rather than assumed. Its own mutex for the same reason the
+	// challenge handler has one: a process can run more than one Node.
+	computeMu      sync.RWMutex
+	computeHandler ComputeHandler
+	host           host.Host
 	dht              *dht.IpfsDHT
 	store            *store.Store
 	logger           *log.Logger
@@ -1090,6 +1107,24 @@ func (n *Node) handleStream(stream network.Stream) {
 		// Proof-of-Facilitation audit. Answering costs a Merkle proof over
 		// chunks we already hold, so it is served regardless of cacheOnly.
 		n.handleChallengeFrame(stream, reader, header.Size)
+	case ComputeAdmit, ComputeSubmit, ComputeResult:
+		// Compute, riding this protocol as three more operations for the same
+		// reason pof-challenge does: a second protocol ID means a second I2P
+		// tunnel to build and keep alive, reaching strictly fewer peers.
+		//
+		// Listed as exact cases, not matched by prefix. A prefix test would pull
+		// every "compute-*" name out of the default branch below, so a peer
+		// speaking a verb this build has never heard of would get silence-shaped
+		// nonsense instead of "unsupported operation".
+		//
+		// Nothing about storage is reachable from here. The branch reads its own
+		// bounded payload off this stream and writes its own answer; a malformed
+		// or hostile compute frame costs this one stream and nothing else.
+		//
+		// The remote peer is passed down from the CONNECTION, the same way the
+		// delete verb takes it: it is the one identity on this stream libp2p has
+		// proved, and nothing in the frame may be substituted for it.
+		n.handleComputeFrame(stream, reader, header, stream.Conn().RemotePeer())
 	case "store":
 		if n.cacheOnly {
 			// This node contributes no storage to the network. It keeps only

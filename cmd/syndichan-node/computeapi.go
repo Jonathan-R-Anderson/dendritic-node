@@ -284,8 +284,10 @@ func (c *computeAPI) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Scoped to the submitter, so two peers using the same job id are two jobs.
+	key := submitterKey(r, req.JobID)
 	c.mu.Lock()
-	if c.running[req.JobID] {
+	if c.running[key] {
 		c.mu.Unlock()
 		// Resubmission of something already in flight. Answered with the same
 		// ticket rather than started twice: the site retries on a timeout it
@@ -294,7 +296,7 @@ func (c *computeAPI) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ticket": ticket, "accepted": true})
 		return
 	}
-	c.running[req.JobID] = true
+	c.running[key] = true
 	c.mu.Unlock()
 
 	job := computeworker.Job{
@@ -327,10 +329,12 @@ func (c *computeAPI) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		if err != nil && result.Error == "" {
 			result.Error = err.Error()
 		}
+		// The RESULT still carries the plain job id: that is the submitter's own
+		// name for it and what the site matches on. Only the map key is scoped.
 		result.JobID = job.ID
 		c.mu.Lock()
-		c.results[job.ID] = result
-		delete(c.running, job.ID)
+		c.results[key] = result
+		delete(c.running, key)
 		c.mu.Unlock()
 	}()
 
@@ -349,14 +353,18 @@ func (c *computeAPI) handleResult(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	// The same scoping submit used. A peer asking for a job id it did not submit
+	// looks up a key that does not exist and is told the node has never heard of
+	// it — which is true, of that peer.
+	key := submitterKey(r, req.JobID)
 	c.mu.Lock()
-	result, done := c.results[req.JobID]
-	stillRunning := c.running[req.JobID]
+	result, done := c.results[key]
+	stillRunning := c.running[key]
 	if done {
 		// Delivered once, then forgotten. Holding every result forever would
 		// grow without bound, and the site is the system of record — this node
 		// only needs to hand it over.
-		delete(c.results, req.JobID)
+		delete(c.results, key)
 	}
 	c.mu.Unlock()
 
@@ -372,6 +380,28 @@ func (c *computeAPI) handleResult(w http.ResponseWriter, r *http.Request) {
 			"done": false, "error": "unknown job",
 		})
 	}
+}
+
+// submitterKey scopes a job id to whoever submitted it.
+//
+// A job id is chosen by the submitter — the site sends its own small integers —
+// so the id alone is not a name for anything once more than one submitter can
+// reach this node. Before compute rode the peer protocol only the co-located
+// site could, and an unscoped map was simply the site's own namespace. Now any
+// peer can submit, and any peer polling "11" would have been handed whatever
+// job 11 produced for somebody else.
+//
+// The peer is taken from the CONNECTION by the p2p layer and put on this
+// synthetic request; a submitter cannot set it, because a real HTTP caller
+// reaching a loopback listener has no such header and gets the unscoped key —
+// which is the behaviour the site has always had, unchanged.
+func submitterKey(r *http.Request, jobID string) string {
+	if from := r.Header.Get(peerHeader); from != "" {
+		// NUL as the separator: a peer id cannot contain one, so no pair of
+		// (peer, job) can collide with another by concatenation.
+		return from + "\x00" + jobID
+	}
+	return jobID
 }
 
 // retryable reports whether a caller should try this node again.

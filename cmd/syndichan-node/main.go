@@ -816,10 +816,17 @@ func main() {
 	// storage node (host, DHT, I2P, store), so it is wired here in that path.
 	if !noStorage {
 		startDCSWorker(ctx, cfg, node, storageNode, logger)
+		// Compute, made reachable from the network rather than from loopback
+		// only. Built here rather than inside the bridge because a volunteer
+		// lending a CPU has no reason to have configured a bridge for a site it
+		// does not host, and gating peer-reachable compute on dcs.api_listen
+		// would leave such a node advertising a device nothing could dispatch
+		// to. Returns nil when the operator lends nothing.
+		computeNode := startComputePeerService(cfg, node, logger)
 		// The bridge API lets a co-located website deploy on its users' behalf
 		// through this one node. Independent of the worker role: a node can be a
 		// bridge without running containers itself.
-		startDCSBridge(ctx, cfg, node, storageNode, logger)
+		startDCSBridge(ctx, cfg, node, storageNode, computeNode, logger)
 	}
 	// Tray icon when built with -tags tray; nil otherwise. It does not keep the
 	// node alive -- the node is a service and outlives any window -- it just

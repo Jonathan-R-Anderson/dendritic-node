@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/syndichan/maniwani/storage-client/internal/config"
 	"github.com/syndichan/maniwani/storage-client/internal/dcs"
 	"github.com/syndichan/maniwani/storage-client/internal/p2p"
@@ -42,12 +44,24 @@ type bridgeAPI struct {
 	manager *dcs.Manager
 	blobs   dcs.BlobStore
 	logger  *log.Logger
+	// peers carries compute to ANOTHER node. It is the node itself in
+	// production. An interface because the compute relay is almost entirely
+	// about what it does with the two possible outcomes — the peer answered, the
+	// peer could not be reached — and proving it keeps those apart should not
+	// require an I2P router and two garlic tunnels.
+	peers computePeer
+}
+
+// computePeer is the part of the node the compute relay uses.
+type computePeer interface {
+	AddPeerDestination(peer.ID, string) error
+	SendCompute(ctx context.Context, target peer.ID, operation string, payload []byte) (int, []byte, error)
 }
 
 // startDCSBridge opens (reuses) the node and serves the loopback deploy API. It
 // runs only when cfg.DCS.APIListen is set. Unlike the worker, the bridge does
 // not need Docker -- it never runs a container itself; it asks workers to.
-func startDCSBridge(ctx context.Context, cfg config.Config, node *p2p.Node, storage *store.Store, logger *log.Logger) {
+func startDCSBridge(ctx context.Context, cfg config.Config, node *p2p.Node, storage *store.Store, compute *computeAPI, logger *log.Logger) {
 	if cfg.DCS.APIListen == "" {
 		return
 	}
@@ -73,6 +87,7 @@ func startDCSBridge(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 		manager: dcs.NewManager(node, dcs.NewStreamTransport(node.Host())),
 		blobs:   blobs,
 		logger:  logger,
+		peers:   node,
 	}
 
 	mux := http.NewServeMux()
@@ -88,13 +103,36 @@ func startDCSBridge(ctx context.Context, cfg config.Config, node *p2p.Node, stor
 	// Compute endpoints ride the same listener. Registered only when the
 	// operator actually lends a device — a node that lends nothing should not
 	// answer "would you take this?" at all, rather than answering "no" forever.
-	if compute := newComputeAPI(cfg, logger); compute != nil {
+	// The API object is built by startComputePeerService and shared, so the
+	// loopback caller and a peer see one node with one result map rather than
+	// two independent ones that disagree about what is running.
+	if compute != nil {
 		mux.HandleFunc("/compute/admit", compute.handleAdmit)
 		mux.HandleFunc("/compute/submit", compute.handleSubmit)
 		mux.HandleFunc("/compute/result", compute.handleResult)
 		logger.Printf("dcs-bridge: compute endpoints enabled (cpu=%v gpu=%v)",
 			cfg.Compute.OfferCPU, cfg.Compute.OfferGPU)
 	}
+	// The compute RELAY: the same three verbs, aimed at a named peer and carried
+	// over libp2p/I2P. This is how the site dispatches to volunteers, which it
+	// cannot do itself — it speaks no libp2p, and a volunteer behind home NAT
+	// has no address it could dial if it did.
+	//
+	// Registered UNCONDITIONALLY, unlike the endpoints above. The node the site
+	// talks to is a relay, not a worker: it usually lends no device at all, and
+	// gating the relay on `compute != nil` would switch the feature off on
+	// exactly the machine that has to provide it.
+	//
+	// Authorisation is the listener's, not its own. Its neighbours here —
+	// /dcs/deploy, which starts containers on remote workers, and /dcs/blob,
+	// which writes to the DHT — are unauthenticated at the HTTP layer because
+	// the deployment model is that only the co-located site process can reach
+	// this address. Compute is a strictly weaker verb than deploy (it asks a
+	// remote node to run a catalogue image its own policy already agreed to),
+	// so a token here would protect nothing its neighbours do not already hand
+	// out, while adding a second trust model to keep correct. Do not expose
+	// dcs.api_listen publicly; that rule was already load-bearing.
+	mux.HandleFunc("/compute/peer/", api.handleComputePeer)
 
 	srv := &http.Server{
 		Addr:              cfg.DCS.APIListen,
