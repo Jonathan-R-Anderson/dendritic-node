@@ -433,6 +433,47 @@ func (s *Store) AllRecalls() ([]RecallRecord, int, error) {
 	return rows, unreadable, err
 }
 
+// RecallSummary is the whole-node recall picture.
+//
+// Counted in ONE place so the two things that report it -- the gateway's
+// GET /?placement and the heartbeat the coordinator draws the admin panel from
+// -- cannot disagree. Two independent loops over the same ledger is two chances
+// to classify "deferred" differently, and an operator comparing the page against
+// the gateway would have no way to tell which of them was lying.
+type RecallSummary struct {
+	Records     int `json:"recalls"`
+	Outstanding int `json:"recalls_outstanding"`
+	// Tombstones the background pass has backed off on. Separate from
+	// Outstanding so "outstanding and being chased" is not read off the same
+	// number as "outstanding and now retried every six hours".
+	Deferred int `json:"recalls_deferred"`
+	// Rows that would not parse. Reported rather than skipped: an unreadable row
+	// used to disappear from every count, which makes an unknown look like zero.
+	Unreadable  int `json:"recalls_unreadable"`
+	HoldersLeft int `json:"recall_holders_left"`
+}
+
+// RecallSummary counts the recall ledger.
+func (s *Store) RecallSummary() (RecallSummary, error) {
+	recalls, unreadable, err := s.AllRecalls()
+	if err != nil {
+		// Zero counts with an error, never zero counts alone: the caller must
+		// not publish this as "nothing outstanding".
+		return RecallSummary{}, err
+	}
+	summary := RecallSummary{Records: len(recalls), Unreadable: unreadable}
+	for _, record := range recalls {
+		if !record.Resolved() {
+			summary.Outstanding++
+		}
+		if record.Deferred() {
+			summary.Deferred++
+		}
+		summary.HoldersLeft += record.Outstanding()
+	}
+	return summary, nil
+}
+
 func (s *Store) updateRecall(objectID string, mutate func(*RecallRecord) error) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		recalls := tx.Bucket(bucketRecall)

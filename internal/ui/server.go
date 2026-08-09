@@ -290,7 +290,40 @@ func (s *Server) status(w http.ResponseWriter) {
 		out["used_bytes"] = used
 		out["capacity_bytes"] = s.store.Capacity()
 	}
+	s.drainStatus(out)
 	writeJSON(w, out)
+}
+
+// drainStatus is "may I switch this machine off", answered for the page and for
+// anything scripting against /api/status.
+//
+// Absent rather than false when the node is not draining, and the counts are
+// separate from the verdict on purpose: safe_to_stop is only ever true when both
+// halves are known AND both are zero, so a read error can never round down into
+// permission to unplug.
+func (s *Server) drainStatus(out map[string]any) {
+	node, ok := s.node.(interface{ Draining() bool })
+	if !ok || node == nil || !node.Draining() {
+		return
+	}
+	out["draining"] = true
+	if s.store == nil {
+		return
+	}
+	held, heldErr := s.store.HeldForOthers()
+	summary, summaryErr := s.store.PlacementStatus()
+	if heldErr != nil {
+		out["drain_held_unknown"] = true
+	} else {
+		out["drain_shards_held"] = held.Shards
+		out["drain_bytes_held"] = held.Bytes
+	}
+	if summaryErr == nil {
+		out["drain_objects"] = summary.Objects
+		out["drain_under_replicated"] = summary.UnderReplicated
+	}
+	out["drain_safe_to_stop"] = heldErr == nil && summaryErr == nil &&
+		held.Shards == 0 && summary.UnderReplicated == 0
 }
 
 // The node is nil in no-storage-with-file-identity paths; keep the page alive.
@@ -483,6 +516,14 @@ td code{font-family:var(--sc-mono);font-size:.82rem;color:var(--sc-muted);word-b
 <p class="muted">Only encrypted shards are stored here. Nothing is readable without the
 site's keys, and rejecting an item deletes its bytes and refuses that content ID in future.</p>
 
+<!-- Hidden unless this node is being retired. It is the one panel that answers a
+     question with a consequence -- may I switch the machine off -- so it says the
+     numbers rather than a colour, and it never says "done" while anything is left. -->
+<section class="panel" id="drain-panel" hidden>
+  <h2>Draining</h2>
+  <div id="drain">&mdash;</div>
+</section>
+
 <section class="panel">
   <h2>Node</h2>
   <div class="grid" id="stats">
@@ -565,6 +606,13 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
       </label>
       <label class="chk"><input type="checkbox" name="cache_only" value="1"{{if .Cfg.CacheOnly}} checked{{end}}> Cache-only (host no other peers' shards)</label>
     </div>
+    <div class="row">
+      <label class="chk"><input type="checkbox" name="draining" value="1"{{if .Cfg.Draining}} checked{{end}}> Draining &mdash; retiring this machine</label>
+    </div>
+    <div class="eff">Draining takes effect immediately, not at the next start. The node stops
+      accepting new shards, tells the network it is leaving, and the owners of everything it
+      already holds move those shards elsewhere. Leave it running and connected until the
+      panel above says it holds nothing &mdash; the shards can only leave while it is up.</div>
     <div class="row">
       <label>TLS certificate (for a non-loopback S3 listen)
         <input name="tls_cert" value="{{.Cfg.TLSCert}}" placeholder="/path/fullchain.pem">
@@ -767,6 +815,33 @@ function render(s,data){
   el("nodeid").textContent=s.node_id||"";
   if(s.data_dir&&!el("datadir").value)el("datadir").value=s.data_dir;
   el("capacity").value=(s.capacity_bytes/1073741824).toFixed(2).replace(/\.?0+$/,"");
+  const panel=el("drain-panel");
+  if(panel){
+    panel.hidden=!s.draining;
+    if(s.draining){
+      // Three separate sentences because they are three separate facts, and
+      // collapsing them into one verdict is how "drained" gets said over shards
+      // that are still on the disk.
+      let out="";
+      if(s.drain_held_unknown){
+        out="<p class=danger>This node cannot count what it holds for other peers. "+
+          "Do <b>not</b> switch it off until this reads a number.</p>";
+      }else if(s.drain_shards_held>0){
+        out="<p>Still holding <b>"+s.drain_shards_held+"</b> shard(s) ("+
+          bytes(s.drain_bytes_held)+") for other peers. Their owners move them off, "+
+          "so leave this node running and connected.</p>";
+      }else{
+        out="<p>No shards held for other peers.</p>";
+      }
+      if(s.drain_under_replicated>0){
+        out+="<p class=danger><b>"+s.drain_under_replicated+"</b> of this node's own "+
+          s.drain_objects+" object(s) are not yet recoverable without it. "+
+          "Switching it off now loses them.</p>";
+      }
+      if(s.drain_safe_to_stop)out+="<p><b>Drained. It is safe to switch this machine off.</b></p>";
+      el("drain").innerHTML=out;
+    }
+  }
   const items=data.items||[];
   el("items").innerHTML=items.length?
     "<table><thead><tr><th>Shard</th><th>Type</th><th>Size</th><th></th></tr></thead><tbody>"+

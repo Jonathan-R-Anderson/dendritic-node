@@ -89,7 +89,19 @@ type ObjectPlacement struct {
 	// immediately -- correct, since they have never been levelled.
 	LastRebalance time.Time `json:"last_rebalance,omitempty"`
 	Rebalances    int       `json:"rebalances,omitempty"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	// LastDrain is when the drain mover last examined this object for shards on
+	// a peer that is being retired.
+	//
+	// A THIRD clock, for the same reason LastRebalance is a second one, and it is
+	// what makes a drain resumable: a drain runs for hours and the process will
+	// be restarted inside it -- that is precisely what the operator is preparing
+	// to do -- so the position has to be on disk. In memory it would restart at
+	// the top of the bucket on every restart, re-examining the same first few
+	// objects forever while the tail was never reached. Absent from older rows,
+	// which decode as the zero time and are therefore due immediately.
+	LastDrain time.Time `json:"last_drain,omitempty"`
+	Drains    int       `json:"drains,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // DurableRemoteHolders is how many DISTINCT PEERS must hold shards of a chunk

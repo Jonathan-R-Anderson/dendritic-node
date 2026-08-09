@@ -1,8 +1,10 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -200,5 +202,49 @@ func TestGatewayFrontendSaveLoadRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(loaded.Gateway.Frontend, cfg.Gateway.Frontend) {
 		t.Fatalf("frontend block changed during round trip:\n got %#v\nwant %#v",
 			loaded.Gateway.Frontend, cfg.Gateway.Frontend)
+	}
+}
+
+// A DRAIN MUST SURVIVE A RESTART, and this is the half of that which lives on
+// the machine being retired.
+//
+// The operator sets it and then, by definition, restarts or powers down this
+// node -- that is what a drain is FOR. An intent that lived only in the running
+// process would clear itself on the next start, the node would resume
+// advertising itself as a destination, and owners would go back to writing onto
+// a disk that is on its way out of the building. The config file is the whole of
+// the persistence needed here: what is left to move is measured from the disk on
+// every pass, so there is no progress to lose, only the intent.
+//
+// Reverted to prove it fails: `json:"-"` on Config.Draining. The flag is then
+// written nowhere and comes back false.
+func TestDrainingSurvivesASaveLoadRoundTrip(t *testing.T) {
+	cfg := validTestConfig(t)
+	cfg.Draining = true
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Save(path, cfg, RoleStorage); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := LoadOrCreate(path, RoleStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Draining {
+		t.Fatal("a node told to drain came back from a restart not draining; it would start accepting shards again")
+	}
+	// And the field is present in the file even when false, so an operator
+	// looking for the switch can find it without knowing its name in advance.
+	off := validTestConfig(t)
+	off.Draining = false
+	offPath := filepath.Join(t.TempDir(), "config.json")
+	if err := Save(offPath, off, RoleStorage); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(offPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"draining"`) {
+		t.Fatal("the draining switch is absent from a written config, so nobody can find it by reading the file")
 	}
 }

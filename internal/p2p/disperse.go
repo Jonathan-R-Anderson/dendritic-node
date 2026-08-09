@@ -121,12 +121,20 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 			// here would make the fullest machines on the network the only ones
 			// the mover cannot see.
 			fresh = append(fresh, record)
+			if record.Draining {
+				// Remembered before the filters below, so it survives the record
+				// ageing out of the DHT while the drain is still running.
+				n.markDraining(record.NodeID)
+			}
 			// Teach the host how to reach it, so the push does not fail on
 			// "no addresses" for a peer we are not currently connected to.
 			if _, dialErr := n.DialStoragePeer(ctx, record); dialErr != nil {
 				continue
 			}
 			if n.refusingPeer(record.NodeID) {
+				continue
+			}
+			if n.isDraining(record.NodeID) {
 				continue
 			}
 			byID[record.NodeID] = placement.Candidate{
@@ -152,6 +160,15 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 		// four peers still drew ~170 attempts each in twenty minutes with the
 		// filter "on".
 		if n.refusingPeer(id) {
+			continue
+		}
+		// The draining filter belongs on BOTH tiers, exactly as the refusal
+		// filter had to learn to. A peer that is retiring is one this node is
+		// almost certainly still CONNECTED to -- it stays up for the whole drain
+		// -- so filtering only the DHT-record branch above would let every
+		// draining node walk straight back in through this fallback and keep
+		// being offered shards it is about to hand back.
+		if n.isDraining(id) {
 			continue
 		}
 		byID[id] = placement.Candidate{PeerID: id}
@@ -386,8 +403,8 @@ func (n *Node) placeShards(
 					// completed does not. Absence is already handled by the peer
 					// dropping out of the candidate set, and counting it here
 					// would punish a healthy volunteer for one bad tunnel.
-					if answeredNo(err) {
-						n.noteRefusal(target.String())
+					if reason := refusalReason(err); reason != "" {
+						n.noteRefusal(target.String(), reason)
 					}
 					mu.Lock()
 					result.Failed++
@@ -530,12 +547,19 @@ const (
 type peerRefusal struct {
 	count int
 	last  time.Time
+	// reason is the peer's own answer, classified. Kept because a count on its
+	// own is undiagnosable: "3 failures" sends an operator to SSH and grep,
+	// which is exactly how three peers spent a week refusing every round (one
+	// cache-only, one out of capacity, one rejecting the coordinator's lease
+	// signature) while the numbers on the admin page looked identical for all
+	// three. See roadmap/dht-storage-roadmap.md phase 4.3.
+	reason string
 }
 
-// noteRefusal records that a peer explicitly declined a shard. Only for answers
-// -- an unreachable peer is not refusing, it is absent, and the difference
-// matters because absence is already handled by the dial failing.
-func (n *Node) noteRefusal(peerID string) {
+// noteRefusal records that a peer explicitly declined a shard, and WHY. Only for
+// answers -- an unreachable peer is not refusing, it is absent, and the
+// difference matters because absence is already handled by the dial failing.
+func (n *Node) noteRefusal(peerID, reason string) {
 	n.refusalMu.Lock()
 	defer n.refusalMu.Unlock()
 	if n.refusals == nil {
@@ -545,6 +569,11 @@ func (n *Node) noteRefusal(peerID string) {
 	if entry == nil {
 		entry = &peerRefusal{}
 		n.refusals[peerID] = entry
+	}
+	if reason != "" {
+		// Latest wins. A peer that was full and is now cache-only should read as
+		// cache-only; the previous answer is no longer why it is refusing.
+		entry.reason = reason
 	}
 	// A refusal after the cooldown starts the count again rather than adding to
 	// an old grudge: three refusals spread over a week is a peer having bad
@@ -589,26 +618,48 @@ func (n *Node) refusingPeer(peerID string) bool {
 	return time.Since(entry.last) <= refusalCooldown
 }
 
-// answeredNo distinguishes a peer that DECLINED from one that could not be
-// reached. Only the former says anything about whether the next attempt will
-// also fail; a dial failure says the network was busy, which is not the peer's
-// fault and not predictive.
-func answeredNo(err error) bool {
+// refusalReasons maps the substring a peer's answer contains onto the phrase an
+// operator reads. Ordered, because the first match wins and the list is scanned
+// in order.
+//
+// A CLOSED vocabulary rather than the raw error text. The reason is reported to
+// the coordinator in the heartbeat and rendered on the admin panel, so it must be
+// bounded in length, stable enough to group by across the fleet, and incapable of
+// carrying whatever a remote peer chose to put in an error string onto an
+// operator's page.
+var refusalReasons = [][2]string{
+	{"cache-only", "node is cache-only"},
+	{"capacity exceeded", "storage capacity exceeded"},
+	// A retiring node refuses every store frame. Counting it lets an owner that
+	// has not yet seen the draining record reach the same conclusion from
+	// behaviour, which is the belt to the advertisement's braces.
+	{"is draining", "node is draining"},
+	{"invalid coordinator lease signature", "invalid coordinator lease signature"},
+	{"recalled recently", "shard was recalled recently"},
+	{"unsupported operation", "unsupported operation"},
+	// Last: the most general phrasing, so a peer that says both "rejected by this
+	// node: capacity exceeded" and nothing else is still classified by the
+	// specific half.
+	{"rejected by this node", "rejected by this node"},
+}
+
+// refusalReason classifies a peer that DECLINED, and returns "" for one that
+// could not be reached. Only the former says anything about whether the next
+// attempt will also fail; a dial failure says the network was busy, which is not
+// the peer's fault and not predictive.
+func refusalReason(err error) string {
 	if err == nil {
-		return false
+		return ""
 	}
 	text := err.Error()
-	for _, refusal := range []string{
-		"cache-only",
-		"capacity exceeded",
-		"invalid coordinator lease signature",
-		"rejected by this node",
-		"recalled recently",
-		"unsupported operation",
-	} {
-		if strings.Contains(text, refusal) {
-			return true
+	for _, refusal := range refusalReasons {
+		if strings.Contains(text, refusal[0]) {
+			return refusal[1]
 		}
 	}
-	return false
+	return ""
 }
+
+// answeredNo is refusalReason's yes/no form, kept because most callers only need
+// to know whether the count should move.
+func answeredNo(err error) bool { return refusalReason(err) != "" }

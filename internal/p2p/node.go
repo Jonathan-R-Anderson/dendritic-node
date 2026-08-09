@@ -204,10 +204,16 @@ type Node struct {
 	// refusals tracks peers that answered "no" to a shard, so the planner stops
 	// spending one of a chunk's nine slots on a peer that will refuse again. See
 	// noteRefusal in disperse.go for why it is neither permanent nor persisted.
-	refusalMu      sync.Mutex
-	refusals       map[string]*peerRefusal
-	candidateMu    sync.Mutex
-	candidateCache []placement.Candidate
+	refusalMu sync.Mutex
+	refusals  map[string]*peerRefusal
+	// placementHealth is the last completed replicate pass, and nil until there
+	// has been one. Nil rather than a zero struct on purpose -- the heartbeat
+	// omits the block entirely so the coordinator can say "not reporting"
+	// instead of drawing an unmeasured node as a healthy one. See health.go.
+	healthMu        sync.RWMutex
+	placementHealth *PlacementHealth
+	candidateMu     sync.Mutex
+	candidateCache  []placement.Candidate
 	// capacityRecords is the UNFILTERED half of the same discovery: every fresh
 	// capacity record, including peers this node will not currently write to.
 	// Levelling reads occupancy from here rather than from candidateCache; see
@@ -231,7 +237,18 @@ type Node struct {
 	shardMoves *shardMoveBudget
 	// cacheOnly nodes serve their own content but host nothing for anyone
 	// else; see the "store" branch of handleStream.
-	cacheOnly           bool
+	cacheOnly bool
+	// draining marks this node as being retired: it accepts no new shards and
+	// says so in its capacity record, so owners move what it already holds off it.
+	// Atomic rather than plain, unlike cacheOnly, because the management page can
+	// flip it while the node is running -- an operator deciding to retire a
+	// machine should not have to restart it to start the drain.
+	draining atomic.Bool
+	// drainingPeers is what OTHER nodes have said about themselves, with the
+	// deadline their record stops being trusted at. See markDraining.
+	drainingMu    sync.Mutex
+	drainingUntil map[string]time.Time
+
 	gatewayEnabled      atomic.Bool
 	gatewayVerified     atomic.Bool
 	dcsWorker           atomic.Bool
@@ -247,6 +264,14 @@ type Node struct {
 // SetCacheOnly makes this node refuse to host other peers' shards. Set once at
 // startup, before the stream handler can see traffic.
 func (n *Node) SetCacheOnly(value bool) { n.cacheOnly = value }
+
+// SetDraining retires (or un-retires) this node. See config.Config.Draining and
+// drain.go; the persistent copy of the intent is the config file, this is the
+// running node acting on it.
+func (n *Node) SetDraining(value bool) { n.draining.Store(value) }
+
+// Draining reports whether this node is being retired.
+func (n *Node) Draining() bool { return n.draining.Load() }
 
 // SetDCSWorker marks the node as accepting container deployments, so its
 // heartbeat reports the DCS role and the operator's map draws it yellow.
@@ -434,6 +459,13 @@ func finishNode(
 		// is under-replicated) and per half hour (a rate limit it shares with
 		// repair).
 		go n.RebalanceStored(ctx)
+		// Draining is levelling with a target of zero, for a machine that is
+		// leaving. It runs whether or not THIS node is being retired: the mover
+		// belongs to the OWNER of the shards, and the node being retired is
+		// somebody else's peer. Both loops are no-ops until some peer says it is
+		// draining, or until this one is told it is.
+		go n.DrainStored(ctx)
+		go n.ReportDrainStatus(ctx)
 	}
 	return n, nil
 }
@@ -778,6 +810,7 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 			state := heartbeat.State{
 				CapacityBytes:   n.store.Capacity(),
 				UsedBytes:       usedBytesOrZero(n.store),
+				Draining:        n.draining.Load(),
 				GatewayEnabled:  n.gatewayEnabled.Load(),
 				GatewayVerified: n.gatewayVerified.Load(),
 				Registration:    registration,
@@ -787,6 +820,10 @@ func (n *Node) sendHeartbeat(ctx context.Context, endpoint string) {
 				CPUCompute:      n.cpuCompute,
 				MicroVM:         n.microVM,
 				I2PDestination:  n.I2PDestination(),
+				// Read from the cached last pass -- no ledger walk and no peer
+				// contact on the heartbeat path. Nil until a pass has completed,
+				// and nil is sent as an absent field.
+				Placement: placementBeacon(n.PlacementHealth(), time.Now()),
 			}
 			// The ONE legitimate drain. Window() resets, so a second caller
 			// would silently take a slice of this one's interval and the
@@ -1062,6 +1099,22 @@ func (n *Node) handleStream(stream network.Stream) {
 			writeJSONFrame(stream, responseHeader{Error: "node is cache-only and does not host shards"})
 			return
 		}
+		if n.draining.Load() {
+			// This machine is being retired. The capacity record already says so,
+			// and every owner running this build has dropped it from their
+			// candidate sets -- but the record has a ten-minute TTL, an owner on an
+			// older build ignores the field entirely, and none of that is a reason
+			// to accept bytes onto a disk that is about to be switched off. The
+			// refusal here is the guarantee; the advertisement is only the polite
+			// way to avoid spending a lease to reach it.
+			//
+			// ONLY the "store" branch. "have", "get" and "delete" must keep
+			// working, and are exactly what a drain runs on: the owner fetches the
+			// shard bytes from this node to copy them elsewhere, probes the
+			// destination, and then recalls from here.
+			writeJSONFrame(stream, responseHeader{Error: "node is draining and does not accept new shards"})
+			return
+		}
 		if header.Size <= 0 || header.Size > maxNetworkShard || len(header.ShardID) != 64 {
 			writeJSONFrame(stream, responseHeader{Error: "invalid shard size or ID"})
 			return
@@ -1220,7 +1273,20 @@ const dispersalCooldown = 30 * time.Minute
 const enrolBatch = 1000
 
 func (n *Node) replicateOnce(ctx context.Context) {
-	if len(n.host.Network().Peers()) == 0 {
+	peers := len(n.host.Network().Peers())
+	if peers == 0 {
+		// RECORDED, not skipped. "Nowhere to push" is a diagnosis in its own
+		// right -- it is what an i2pd that has core-dumped looks like from here,
+		// and it is the difference between a node being refused and a node that
+		// is alone. Returning silently would leave this node reporting nothing,
+		// which the coordinator draws identically to a build too old to report.
+		if summary, err := n.store.PlacementStatus(); err == nil {
+			n.recordPlacementHealth(PlacementHealth{
+				Objects: summary.Objects, UnderReplicated: summary.UnderReplicated,
+				LocalOnly: summary.LocalOnly, FullyDispersed: summary.FullyDispersed,
+				Recalls: recallSummaryOrNil(n.store),
+			})
+		}
 		return
 	}
 	// Objects written before the ledger existed have no row, so they are
@@ -1243,6 +1309,11 @@ func (n *Node) replicateOnce(ctx context.Context) {
 		return
 	}
 	pushed, underReplicated := 0, 0
+	// Shard-level totals over the whole pass. The same arithmetic as the
+	// per-object "placed N, failed N" line, summed, because that line is what an
+	// operator greps for and it is the one number that would have shown the
+	// backfill counter was measuring attempts.
+	placed, failed, unassignable := 0, 0, 0
 	for _, row := range candidates {
 		if ctx.Err() != nil {
 			return
@@ -1276,9 +1347,30 @@ func (n *Node) replicateOnce(ctx context.Context) {
 		if !result.Durable {
 			underReplicated++
 		}
+		placed += result.Placed
+		failed += result.Failed
+		unassignable += result.Unassignable
 		pushed++
 	}
 	summary, summaryErr := n.store.PlacementStatus()
+	if summaryErr != nil {
+		// Logged rather than swallowed. This used to fall through silently, so a
+		// ledger that would not open looked exactly like a node with nothing to
+		// report -- and the placement line simply stopped appearing.
+		n.logger.Printf("replicate: cannot summarise the placement ledger: %v", summaryErr)
+	} else {
+		// Published BEFORE the early return below, because "nothing to do" is a
+		// measurement: a node whose whole corpus is dispersed must report that
+		// it looked and found nothing wrong, not go quiet and be indistinguishable
+		// from one that never ran a pass at all.
+		n.recordPlacementHealth(PlacementHealth{
+			Objects: summary.Objects, UnderReplicated: summary.UnderReplicated,
+			LocalOnly: summary.LocalOnly, FullyDispersed: summary.FullyDispersed,
+			Placed: placed, Failed: failed, Unassignable: unassignable,
+			Attempted: pushed, Peers: peers,
+			Recalls: recallSummaryOrNil(n.store),
+		})
+	}
 	if pushed == 0 && summaryErr == nil && summary.UnderReplicated == 0 {
 		return
 	}

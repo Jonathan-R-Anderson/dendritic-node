@@ -176,3 +176,118 @@ func TestDirectClientHasNoProxy(t *testing.T) {
 		t.Fatal("heartbeat transport would honour a proxy")
 	}
 }
+
+// A node that has never completed a dispersal pass must send NO placement key at
+// all. The coordinator draws an absent block as "not reporting"; a present block
+// full of zeros draws as a node with no failures and a fully dispersed corpus.
+// That substitution -- an unknown rendered as a number -- is the single most
+// common failure shape in this project, and is exactly how a backlog counter
+// passed for replication while every node stayed empty.
+func TestANodeWithNoObservedPassSendsNoPlacementKey(t *testing.T) {
+	server, seen := capture(t)
+	client := &Client{
+		Signer: newTestSigner(t), Endpoint: server.URL, HTTP: server.Client(),
+		Snapshot: func() State {
+			return State{CapacityBytes: 20 << 30, Placement: nil}
+		},
+	}
+	client.Send(context.Background())
+
+	item := <-seen
+	var payload map[string]any
+	if err := json.Unmarshal(item.body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := payload["placement"]; present {
+		t.Fatalf("an unmeasured node reported placement health anyway: %s", item.body)
+	}
+}
+
+// And the reason must reach the coordinator, in the signed body. "3 failures" is
+// undiagnosable; "3 failures: storage capacity exceeded" is the whole point of
+// phase 4.3.
+func TestPlacementHealthAndItsRefusalReasonsAreSignedAndSent(t *testing.T) {
+	server, seen := capture(t)
+	signer := newTestSigner(t)
+	outstanding, deferred, unreadable := 2, 1, 0
+	client := &Client{
+		Signer: signer, Endpoint: server.URL, HTTP: server.Client(),
+		Snapshot: func() State {
+			return State{
+				CapacityBytes: 20 << 30,
+				Placement: &Placement{
+					Objects: 11640, UnderReplicated: 402, LocalOnly: 7,
+					FullyDispersed: 11238, Placed: 6, Failed: 3,
+					Attempted: 40, Peers: 9, AgeSeconds: 118,
+					RecallsOutstanding: &outstanding,
+					RecallsDeferred:    &deferred,
+					RecallsUnreadable:  &unreadable,
+					Refusals: []Refusal{
+						{Peer: "12D3KooWFullDis", Count: 3, Reason: "storage capacity exceeded"},
+					},
+				},
+			}
+		},
+	}
+	client.Send(context.Background())
+
+	item := <-seen
+	var payload struct {
+		Placement *Placement `json:"placement"`
+	}
+	if err := json.Unmarshal(item.body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Placement == nil {
+		t.Fatalf("the placement block never made it onto the wire: %s", item.body)
+	}
+	if payload.Placement.UnderReplicated != 402 || payload.Placement.Failed != 3 {
+		t.Fatalf("counters did not survive the round trip: %+v", payload.Placement)
+	}
+	if len(payload.Placement.Refusals) != 1 ||
+		payload.Placement.Refusals[0].Reason != "storage capacity exceeded" {
+		t.Fatalf("the refusal reason did not survive: %+v", payload.Placement.Refusals)
+	}
+	if payload.Placement.RecallsOutstanding == nil || *payload.Placement.RecallsOutstanding != 2 {
+		t.Fatalf("recall counters did not survive: %+v", payload.Placement)
+	}
+	// The added fields must not break the one guarantee the coordinator relies
+	// on: the signature covers the exact bytes it received.
+	signature, err := base64.RawStdEncoding.DecodeString(item.signature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := signer.key.GetPublic().Verify(item.body, signature)
+	if err != nil || !ok {
+		t.Fatalf("a heartbeat carrying placement health does not verify: %v", err)
+	}
+}
+
+// An unreadable recall ledger sends no recall keys rather than zeros: "nothing
+// outstanding" and "I could not tell" must not arrive as the same document.
+func TestAnUnreadableRecallLedgerSendsNoRecallCounts(t *testing.T) {
+	server, seen := capture(t)
+	client := &Client{
+		Signer: newTestSigner(t), Endpoint: server.URL, HTTP: server.Client(),
+		Snapshot: func() State {
+			return State{CapacityBytes: 20 << 30, Placement: &Placement{Objects: 5}}
+		},
+	}
+	client.Send(context.Background())
+
+	item := <-seen
+	var payload struct {
+		Placement map[string]any `json:"placement"`
+	}
+	if err := json.Unmarshal(item.body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"recalls_outstanding", "recalls_deferred", "recalls_unreadable"} {
+		if _, present := payload.Placement[key]; present {
+			t.Errorf("%s was reported without the ledger being readable: %s", key, item.body)
+		}
+	}
+	if _, present := payload.Placement["objects"]; !present {
+		t.Error("the counters that WERE measured went missing with the ones that were not")
+	}
+}

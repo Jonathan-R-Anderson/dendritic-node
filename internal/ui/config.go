@@ -115,8 +115,10 @@ func (s *Server) setStorageSettings(w http.ResponseWriter, r *http.Request) {
 	if !s.checkCSRF(w, r) {
 		return
 	}
+	draining := formBool(r, "draining")
 	err := s.cfgApply(func(c *config.Config) error {
 		c.CacheOnly = formBool(r, "cache_only")
+		c.Draining = draining
 		c.S3Listen = strings.TrimSpace(r.FormValue("s3_listen"))
 		c.TLSCert = strings.TrimSpace(r.FormValue("tls_cert"))
 		c.TLSKey = strings.TrimSpace(r.FormValue("tls_key"))
@@ -125,6 +127,17 @@ func (s *Server) setStorageSettings(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	// Draining takes effect NOW, unlike everything else on this form. The rest of
+	// these settings change what the node is; this one starts a process that ends
+	// with the machine being switched off, and telling an operator who has just
+	// asked to retire a node that it will begin at the next restart would mean the
+	// node kept accepting shards for as long as they left it running.
+	if node, ok := s.node.(interface{ SetDraining(bool) }); ok && node != nil {
+		node.SetDraining(draining)
+	}
+	if draining {
+		s.logger.Printf("draining: this node is being retired -- watch for the drain report before switching it off")
 	}
 	s.logger.Printf("storage/S3 settings updated (effective next start)")
 	http.Redirect(w, r, "/?saved=storage", http.StatusSeeOther)

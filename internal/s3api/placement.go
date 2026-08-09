@@ -74,37 +74,24 @@ func (s *Server) ledgerSummary(w http.ResponseWriter, requestID string) {
 		s3Error(w, "InternalError", "Could not read the placement ledger.", 500, requestID)
 		return
 	}
-	recalls, unreadable, err := s.store.AllRecalls()
+	// Counted by the store, which is also what the heartbeat reports to the
+	// coordinator. One implementation, so this page and the admin panel cannot
+	// disagree about how many recalls are outstanding.
+	recalls, err := s.store.RecallSummary()
 	if err != nil {
 		s3Error(w, "InternalError", "Could not read the recall ledger.", 500, requestID)
 		return
 	}
-	outstanding, holders, deferred := 0, 0, 0
-	for _, record := range recalls {
-		if !record.Resolved() {
-			outstanding++
-		}
-		if record.Deferred() {
-			deferred++
-		}
-		holders += record.Outstanding()
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"objects":             summary.Objects,
-		"under_replicated":    summary.UnderReplicated,
-		"fully_dispersed":     summary.FullyDispersed,
-		"local_only":          summary.LocalOnly,
-		"recalls":             len(recalls),
-		"recalls_outstanding": outstanding,
-		// Tombstones the background pass has backed off on. Counted separately
-		// so "outstanding and being chased" is not read off the same number as
-		// "outstanding and now retried every six hours".
-		"recalls_deferred": deferred,
-		// Rows that would not parse. Reported rather than skipped: an
-		// unreadable row used to disappear from every count above, which makes
-		// an unknown look like a zero.
-		"recalls_unreadable":    unreadable,
-		"recall_holders_left":   holders,
+		"objects":               summary.Objects,
+		"under_replicated":      summary.UnderReplicated,
+		"fully_dispersed":       summary.FullyDispersed,
+		"local_only":            summary.LocalOnly,
+		"recalls":               recalls.Records,
+		"recalls_outstanding":   recalls.Outstanding,
+		"recalls_deferred":      recalls.Deferred,
+		"recalls_unreadable":    recalls.Unreadable,
+		"recall_holders_left":   recalls.HoldersLeft,
 		"recall_verb_available": true,
 	})
 }

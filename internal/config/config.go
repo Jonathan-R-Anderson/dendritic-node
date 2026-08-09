@@ -122,8 +122,24 @@ type Config struct {
 	DataDir  string `json:"data_dir"`
 	S3Listen string `json:"s3_listen"`
 	// CacheOnly: serve our own content but host nothing for other peers.
-	CacheOnly bool   `json:"cache_only"`
-	UIListen  string `json:"ui_listen"`
+	CacheOnly bool `json:"cache_only"`
+	// Draining retires this machine: stop accepting new shards, tell the network
+	// so, and let the owners of everything already here move it off. Set it, wait
+	// for the node to report that it holds nothing for anybody else, then switch
+	// the machine off.
+	//
+	// IT LIVES IN THE CONFIG, and that is the whole of the persistence a drain
+	// needs on this side. A drain runs for hours across restarts -- the operator
+	// is by definition about to restart or power down this machine -- so an
+	// in-memory flag or a runtime-only API call would silently un-drain the node
+	// on the next start, at which point owners would resume writing to a disk
+	// that is on its way out. There is no progress to keep here beyond the
+	// intent: what is left to move is measured from the disk, not remembered.
+	//
+	// NO omitempty, like PayoutAddress and for the same reason: a field an
+	// operator has to go and find is a field that has to be visible in the file.
+	Draining bool   `json:"draining"`
+	UIListen string `json:"ui_listen"`
 	// UIUsername / UIPassword guard the management dashboard. They are only
 	// consulted -- and only REQUIRED -- when ui_listen is not loopback, because
 	// a loopback page is already limited to whoever is sitting at the machine.

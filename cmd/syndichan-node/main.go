@@ -250,6 +250,15 @@ func main() {
 		node.SetCacheOnly(true)
 		logger.Printf("cache-only: this node will not host shards for other peers")
 	}
+	if !noStorage && cfg.Draining {
+		// Retiring this machine. Applied from the config on every start, which is
+		// the whole point of keeping the intent there: a drain takes hours and the
+		// operator is about to restart or power down this node, so an intent that
+		// only lived in the running process would quietly clear itself and owners
+		// would resume writing to a disk on its way out.
+		node.SetDraining(true)
+		logger.Printf("draining: this node is being retired -- it will refuse new shards, tell the network so, and report what it still holds until it holds nothing")
+	}
 	var s3Server, uiServer *http.Server
 	if !noStorage {
 		storageNode.SetShardFetcher(node.FetchShard)

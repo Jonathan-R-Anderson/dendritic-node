@@ -19,12 +19,12 @@ func TestAPeerThatKeepsRefusingStopsBeingACandidate(t *testing.T) {
 	const peer = "12D3KooWRefusesEverything"
 
 	for i := 1; i < refusalsBeforeSkipping; i++ {
-		n.noteRefusal(peer)
+		n.noteRefusal(peer, "storage capacity exceeded")
 		if n.refusingPeer(peer) {
 			t.Fatalf("skipped after only %d refusals; a peer having one bad round must not be dropped", i)
 		}
 	}
-	n.noteRefusal(peer)
+	n.noteRefusal(peer, "storage capacity exceeded")
 	if !n.refusingPeer(peer) {
 		t.Fatalf("still a candidate after %d refusals", refusalsBeforeSkipping)
 	}
@@ -43,7 +43,7 @@ func TestRefusalsExpireSoAFixedPeerReturns(t *testing.T) {
 	n := &Node{}
 	const peer = "12D3KooWWasBrokenNowFixed"
 	for i := 0; i < refusalsBeforeSkipping; i++ {
-		n.noteRefusal(peer)
+		n.noteRefusal(peer, "storage capacity exceeded")
 	}
 	if !n.refusingPeer(peer) {
 		t.Fatal("expected the peer to be skipped")
@@ -112,7 +112,7 @@ func TestCrossingTheThresholdInvalidatesTheCandidateCache(t *testing.T) {
 	n.candidateAt = time.Now()
 	const peer = "12D3KooWJustWentBad"
 	for i := 0; i < refusalsBeforeSkipping; i++ {
-		n.noteRefusal(peer)
+		n.noteRefusal(peer, "storage capacity exceeded")
 	}
 	n.candidateMu.Lock()
 	cached := len(n.candidateCache)

@@ -111,21 +111,14 @@ func (p ObjectPlacement) ChunkHasDurabilityMargin(chunkIndex int) bool {
 
 // MovableChunkShards returns the shards of one chunk that levelling is allowed
 // to move off `from`. Empty when the chunk has no durability margin to spend.
+//
+// The margin test is the LEVELLING policy over ChunkShardsHeldBy's enumeration,
+// and draining deliberately applies a different one: see ChunkShardsHeldBy.
 func (p ObjectPlacement) MovableChunkShards(chunkIndex int, from string) []placement.Shard {
 	if !p.ChunkHasDurabilityMargin(chunkIndex) {
 		return nil
 	}
-	shards := p.PlacementSnapshot(chunkIndex)
-	var movable []placement.Shard
-	for _, shard := range shards {
-		for _, holder := range shard.Holders {
-			if holder == from {
-				movable = append(movable, shard)
-				break
-			}
-		}
-	}
-	return movable
+	return p.ChunkShardsHeldBy(chunkIndex, from)
 }
 
 // SurvivesLosingHolder reports whether one chunk would still be durable if a

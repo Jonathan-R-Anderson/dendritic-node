@@ -238,6 +238,14 @@ func (n *Node) storagePools(ctx context.Context) []placement.Pool {
 		if record.Capacity <= 0 {
 			continue
 		}
+		if record.Draining || n.isDraining(record.NodeID) {
+			// A retiring node is not part of the fleet this target describes. Its
+			// bytes are on their way back to everyone else, so counting them would
+			// set a mean the remaining machines cannot hold once they arrive, and
+			// counting its capacity would set one they are all permanently behind.
+			// The drain empties it; levelling must not also be trying to.
+			continue
+		}
 		used := record.Capacity - record.FreeBytes
 		if used < 0 {
 			used = 0
@@ -543,6 +551,11 @@ func holdsForSomeSource(shards []placement.Shard, surplus map[string]int64) bool
 }
 
 // moveShard is COPY, VERIFY, PROVE, THEN DELETE. In that order, every time.
+//
+// Shared with the drain (drain.go), which is this same move with the source's
+// target set to zero. The two callers differ in WHICH shard leaves and in what
+// they do when it cannot; the order of operations that makes a move safe is one
+// implementation, because a second one is a second chance to get it wrong.
 func (n *Node) moveShard(
 	ctx context.Context, row store.ObjectPlacement,
 	shard placement.Shard, source, destination string,
@@ -556,7 +569,7 @@ func (n *Node) moveShard(
 		return err
 	}
 	if target == n.host.ID() || from == n.host.ID() {
-		return errors.New("levelling does not move a shard to or from this node")
+		return errors.New("this mover does not move a shard to or from this node")
 	}
 
 	// 1. COPY. The bytes come from local disk when this node still has them and
@@ -656,7 +669,7 @@ func (n *Node) moveShard(
 		// DeleteRemoteShard), so remember it before anything tries to place
 		// there again.
 		if err := n.store.NoteShardMovedAway(row.ObjectID, shard.ID, source); err != nil {
-			n.logger.Printf("rebalance: could not record the move away from %s: %v", shortID(source), err)
+			n.logger.Printf("shard move: could not record the move away from %s: %v", shortID(source), err)
 		}
 		return n.store.DropShardHolder(row.ObjectID, shard.ID, source)
 	default:

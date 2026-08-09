@@ -61,7 +61,13 @@ type State struct {
 	// Measured from disk rather than from the placement ledger: the ledger
 	// records intent and disk records fact, they diverge on a failed delete or a
 	// manual removal, and levelling toward a fiction moves real bytes.
-	UsedBytes       int64
+	UsedBytes int64
+	// Draining is true when the operator is retiring this machine. The DHT
+	// capacity record is what makes OWNERS act on it (they are the ones that can
+	// move a shard); this copy is so the coordinator's own report does not go on
+	// proposing a node as a destination while the fleet has stopped using it as
+	// one, and so the operator of the site can see which machines are leaving.
+	Draining        bool
 	GatewayEnabled  bool
 	GatewayVerified bool
 	Registration    *gateway.Registration
@@ -92,6 +98,66 @@ type State struct {
 	// frontend cannot measure itself, because it never sees peer-to-peer shard
 	// transfers at all.
 	Traffic Traffic
+	// Placement is whether dispersal is WORKING on this node, as opposed to what
+	// it holds. NIL when the node has nothing to say -- no pass has completed, or
+	// this build has no storage role -- and nil is sent as an absent field, never
+	// as zeros. See the Placement type.
+	Placement *Placement
+}
+
+// Placement is this node's account of whether dispersal is working.
+//
+// WHY THE HEARTBEAT AND NOT A NEW ENDPOINT
+// ----------------------------------------
+// The alternative is the gateway's SigV4 ?placement surface, which already
+// answers all of this per object. But the coordinator would then have to ask
+// nine nodes over I2P to draw one admin page, inside a request handler, on a
+// panel that polls every three seconds -- and this site has already taken a 504
+// from exactly that shape (an inline sync in GET /). The heartbeat is a
+// background push that is already signed, already arrives every five minutes
+// from every node, and already carries capacity and usage. Putting a summary on
+// it means the admin request path reads a database row and nothing else.
+//
+// ?placement stays where per-object detail belongs. This is the summary; that is
+// the drill-down. Nothing new was invented for either.
+//
+// KEPT SMALL DELIBERATELY: every node on the network signs and sends this every
+// five minutes. Counters, and at most maxReportedRefusals refusing peers.
+type Placement struct {
+	Objects         int `json:"objects"`
+	UnderReplicated int `json:"under_replicated"`
+	LocalOnly       int `json:"local_only"`
+	FullyDispersed  int `json:"fully_dispersed"`
+	// The last pass, shard by shard. "placed 0, failed 9" was the signature of
+	// lease requests dying before they left the box, and it never reached anyone
+	// who was not tailing a journal.
+	Placed       int `json:"placed"`
+	Failed       int `json:"failed"`
+	Unassignable int `json:"unassignable"`
+	Attempted    int `json:"attempted"`
+	// Connected peers at the time of the pass. Zero placements with no peers is
+	// an isolated node; zero placements with nine peers is a node being refused.
+	Peers int `json:"peers"`
+	// How long ago the pass ran. Sent as an age rather than a timestamp so it
+	// needs no agreement about clocks: the node's own clock measures its own
+	// interval, and a node that has stopped passing goes visibly stale.
+	AgeSeconds int `json:"age_seconds"`
+	// Pointers, and omitted when nil: the recall ledger may not be readable, and
+	// "unreadable" must not arrive as "nothing outstanding".
+	RecallsOutstanding *int `json:"recalls_outstanding,omitempty"`
+	RecallsDeferred    *int `json:"recalls_deferred,omitempty"`
+	RecallsUnreadable  *int `json:"recalls_unreadable,omitempty"`
+	// Who is refusing, and WHAT THEY SAID. The reason is the entire point: "3
+	// failures" sends an operator to a journal, "3 failures: storage capacity
+	// exceeded" is a fix. Omitted when nobody is refusing.
+	Refusals []Refusal `json:"refusals,omitempty"`
+}
+
+// Refusal is one peer that answered no, and its answer.
+type Refusal struct {
+	Peer   string `json:"peer"`
+	Count  int    `json:"count"`
+	Reason string `json:"reason"`
 }
 
 // Traffic is a WINDOW, never a lifetime counter.
@@ -108,12 +174,17 @@ type Traffic struct {
 }
 
 type request struct {
-	Version             int                   `json:"version"`
-	NodeID              string                `json:"node_id"`
-	Timestamp           int64                 `json:"timestamp"`
-	Nonce               string                `json:"nonce"`
-	CapacityBytes       int64                 `json:"capacity_bytes"`
-	UsedBytes           int64                 `json:"used_bytes"`
+	Version       int    `json:"version"`
+	NodeID        string `json:"node_id"`
+	Timestamp     int64  `json:"timestamp"`
+	Nonce         string `json:"nonce"`
+	CapacityBytes int64  `json:"capacity_bytes"`
+	UsedBytes     int64  `json:"used_bytes"`
+	// Omitted when false so a node that is not retiring puts exactly the bytes on
+	// the wire it always has. The signature covers the marshalled body, so an
+	// added field is safe in both directions: a coordinator that does not know it
+	// still verifies, and simply ignores the key.
+	Draining            bool                  `json:"draining,omitempty"`
 	Platform            string                `json:"platform"`
 	GatewayEnabled      bool                  `json:"gateway_enabled"`
 	GatewayVerified     bool                  `json:"gateway_verified"`
@@ -139,6 +210,11 @@ type request struct {
 	// "not reporting" from "reported nothing", and sending zeros would claim
 	// the second when the first is true.
 	Traffic *Traffic `json:"traffic,omitempty"`
+	// Omitted for exactly the same reason, and it matters more here. A node with
+	// no completed dispersal pass sends no block at all, so the coordinator can
+	// render "not reporting" -- drawing an unmeasured node as one with zero
+	// failures is the single failure shape this whole field exists to end.
+	Placement *Placement `json:"placement,omitempty"`
 }
 
 // Client posts the signed beacon. Endpoint and HTTP are injected so tests can
@@ -207,6 +283,7 @@ func (c *Client) Send(ctx context.Context) {
 		Nonce:          base64.RawURLEncoding.EncodeToString(nonceBytes),
 		CapacityBytes:  state.CapacityBytes,
 		UsedBytes:      state.UsedBytes,
+		Draining:       state.Draining,
 		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
 		GatewayEnabled: state.GatewayEnabled,
 		// A registration is attached only when the node genuinely holds one;
@@ -227,6 +304,9 @@ func (c *Client) Send(ctx context.Context) {
 		traffic := state.Traffic
 		payload.Traffic = &traffic
 	}
+	// Attached only when the node has actually observed a pass. A nil State
+	// field stays a missing JSON key; see the field comment on request.Placement.
+	payload.Placement = state.Placement
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return

@@ -70,7 +70,17 @@ func (n *Node) PublishStorageCapacity(ctx context.Context, freeBytes, capacity i
 		Destination: n.I2PDestination(),
 		FreeBytes:   freeBytes,
 		Capacity:    capacity,
-		Published:   time.Now().UTC(),
+		// A DRAINING node keeps publishing, and keeps publishing HONEST figures.
+		//
+		// Going silent would be the obvious way to stop receiving writes and it is
+		// wrong twice over: this record is the only channel by which owners learn
+		// the node wants emptying, so a silent node is one nobody drains; and its
+		// occupancy is what tells the fleet how much is about to come back, so
+		// zeroing FreeBytes to discourage writers would corrupt the same
+		// arithmetic levelling reads. The flag says "do not send" in one field
+		// that cannot be confused with a measurement.
+		Draining:  n.draining.Load(),
+		Published: time.Now().UTC(),
 	}
 	value, err := json.Marshal(record)
 	if err != nil {
