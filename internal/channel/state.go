@@ -173,8 +173,15 @@ func StateDigestV1(chainID *big.Int, contract Address, id [32]byte,
 // stripped: the signature verifies, the two balances appear to conserve on their
 // own, and the locked value is simply gone. There is deliberately no second,
 // lock-free digest to choose between — with no locks the root is zero.
+//
+// The withdrawal amounts are in for the same reason again: a checkpoint takes
+// value OUT of the channel, and a state separated from the amount leaving under
+// it could be submitted asking for a different one. An ordinary payment signs
+// zeros, which is not a special case but the true statement that it moves
+// nothing out of the contract.
 func StateDigest(chainID *big.Int, contract Address, id [32]byte,
-	nonce uint64, balanceA, balanceB *big.Int, htlcRoot [32]byte) [32]byte {
+	nonce uint64, balanceA, balanceB *big.Int, htlcRoot [32]byte,
+	withdrawA, withdrawB *big.Int) [32]byte {
 
 	var out [32]byte
 	copy(out[:], keccak(
@@ -185,6 +192,8 @@ func StateDigest(chainID *big.Int, contract Address, id [32]byte,
 		u256(balanceA),
 		u256(balanceB),
 		htlcRoot[:],
+		u256(withdrawA),
+		u256(withdrawB),
 	))
 	return out
 }
@@ -300,6 +309,14 @@ type State struct {
 	// Pending are the locks live at this nonce. Covered by the digest through
 	// HTLCRoot, so a signed state cannot be presented with its locks removed.
 	Pending []HTLC `json:"pending,omitempty"`
+
+	// WithdrawA and WithdrawB are value leaving the channel under this state —
+	// a checkpoint (ChannelManagerV2.checkpoint). Nil or zero on an ordinary
+	// payment, which is what every state carries until P6's payout path uses
+	// them. Covered by the digest, so a state cannot be submitted asking for a
+	// different amount than was agreed.
+	WithdrawA *big.Int `json:"withdraw_a,omitempty"`
+	WithdrawB *big.Int `json:"withdraw_b,omitempty"`
 }
 
 // Digest is the value both parties sign.
@@ -309,7 +326,7 @@ type State struct {
 // encoding to pick between and no path where the locks are silently left out.
 func (s State) Digest(chainID *big.Int, contract Address) [32]byte {
 	return StateDigest(chainID, contract, s.Channel, s.Nonce,
-		s.BalanceA, s.BalanceB, s.HTLCRoot())
+		s.BalanceA, s.BalanceB, s.HTLCRoot(), s.WithdrawA, s.WithdrawB)
 }
 
 // HTLCRoot commits to the pending locks in a canonical order.
@@ -365,6 +382,11 @@ func (s State) lockedTotal() *big.Int {
 func (s State) Conserved(depositA, depositB *big.Int) bool {
 	total := new(big.Int).Add(orZero(s.BalanceA), orZero(s.BalanceB))
 	total.Add(total, s.lockedTotal())
+	// Value leaving under a checkpoint is neither a balance nor a lock, and the
+	// contract counts it the same way: old collateral == new collateral + what
+	// leaves. Omitting it here would make every checkpoint look unconserved.
+	total.Add(total, orZero(s.WithdrawA))
+	total.Add(total, orZero(s.WithdrawB))
 	want := new(big.Int).Add(orZero(depositA), orZero(depositB))
 	return total.Cmp(want) == 0
 }

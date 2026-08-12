@@ -57,8 +57,11 @@ const (
 
 	// stateDigest(id, 5, 340e18, 160e18, root) with an empty root and with the
 	// root above. The two must differ, or the locks are not being committed to.
-	goldenDigestNoLocks = "d9f3ab121302074010785537ef149f1073f1b2a09f640b24eebba5ee6b5eb257"
-	goldenDigestLocked  = "42ded98927e27fdd41c9c84c8b6b6b56459226d28ed2f622517c3f12c4c45348"
+	goldenDigestNoLocks = "3f1bf2e8e5456fe31a092177c1f0bda2f95004b38bb2ea12276bb5a00c03ef01"
+	goldenDigestLocked  = "48c16e2554db9447dfdd38a94f0a3e58a8a53b4e381156d8e5ebf4b1feac7daa"
+
+	// stateDigest(id, 5, 340e18, 160e18, emptyRoot, 0, 75e18) — a checkpoint.
+	goldenDigestDraw = "752cea0a7f93b3057c7a10d7df154f516199a7ac53b35e930347b173c7dd7cf7"
 )
 
 // goldenLocks mirrors the lock set in scripts/v2-golden-vectors.ts exactly.
@@ -176,6 +179,18 @@ func TestStateDigestMatchesTheContract(t *testing.T) {
 	// with its locks stripped off.
 	if goldenDigestNoLocks == goldenDigestLocked {
 		t.Fatal("locks do not change the digest; they are not being committed to")
+	}
+
+	// And the same again for a withdrawal: a state that takes 75 out signs to a
+	// different value than one that takes nothing, so a checkpoint cannot be
+	// submitted asking for an amount nobody agreed to.
+	draw := bare
+	draw.WithdrawB = anon(75)
+	if got := draw.Digest(big.NewInt(v2ChainID), contract); hexOf(got[:]) != goldenDigestDraw {
+		t.Fatalf("digest with a withdrawal\n got  %s\n want %s", hexOf(got[:]), goldenDigestDraw)
+	}
+	if goldenDigestDraw == goldenDigestNoLocks {
+		t.Fatal("withdrawals do not change the digest; they are not being committed to")
 	}
 }
 
