@@ -168,7 +168,7 @@ func TestAHopsOnionInstructionCarriesNoScalar(t *testing.T) {
 		t.Fatalf("PlanPayment: %v", err)
 	}
 	for i, cand := range plan.Route {
-		shared := derive("syndichan/payment/hopsecret/v1", req.Seed[:], []byte(cand.NodeID))
+		shared := HopSharedSecret(req.Seed, plan.Packet.EphemeralPublicKey, cand.NodeID)
 		hop, err := plan.Packet.Peel(shared)
 		if err != nil {
 			t.Fatalf("hop %d peel: %v", i, err)
@@ -267,7 +267,7 @@ func TestTwoPaymentsOverOneRouteProduceDifferentOnions(t *testing.T) {
 	}
 	// And a hop's shared secret differs, so a replayed onion does not peel.
 	for _, cand := range planA.Route {
-		sharedA := derive("syndichan/payment/hopsecret/v1", reqA.Seed[:], []byte(cand.NodeID))
+		sharedA := HopSharedSecret(reqA.Seed, planA.Packet.EphemeralPublicKey, cand.NodeID)
 		if _, err := planB.Packet.Peel(sharedA); err == nil {
 			t.Fatal("payment A's hop secret peeled payment B's onion")
 		}
@@ -399,5 +399,368 @@ func TestClaimIntentDependsOnEveryLockField(t *testing.T) {
 	alt.Lock.Expiry = 2_000_000_001
 	if claimUpstreamIntent(alt) == want {
 		t.Fatal("the expiry does not affect the claim intent")
+	}
+}
+
+// ---- FINDING 2: the eleven cross-payment attacks ---------------------------
+//
+// Constructed as ordered by the corrective phase. Each builds TWO independent
+// payments, because the multipath audit proved that perturbing one payment
+// cannot see an attack that needs two.
+//
+// What the binding must cover, and where each comes from:
+//
+//	specific payment   ephemeral key (fresh from z, crypto/rand per plan)
+//	specific hop       node id in the shared secret; own lock point in the
+//	                   commitment
+//	specific channel   the channel id is inside every signed state digest
+//	specific amount    the amount is inside the state digest and, for multipath,
+//	                   inside the intent that keys the preimage
+//	specific leg       per-fragment lock chains and per-leg intents
+//	downstream first   the vault: no downstream reveal, no preimage, no claim
+
+// 1. Payment A's scalar must not satisfy payment B's lock.
+func TestX1ScalarFromADoesNotSatisfyB(t *testing.T) {
+	c := DefaultCurve()
+	zA, ZA, _ := NewSecret(c)
+	_, ZB, _ := NewSecret(c)
+	a, _ := BuildLocks(c, ZA, 3)
+	b, _ := BuildLocks(c, ZB, 3)
+
+	scalars, err := SettleRoute(c, a, zA)
+	if err != nil {
+		t.Fatalf("SettleRoute: %v", err)
+	}
+	for i := range b.Locks {
+		if err := Satisfies(c, b.Locks[i], scalars[i]); err == nil {
+			t.Fatalf("A's scalar for hop %d satisfied B's lock", i)
+		}
+	}
+}
+
+// 2. Payment A's onion must not peel with B's hop secrets, and vice versa —
+//    INCLUDING when the payer reuses its seed.
+//
+// This is the attack that was live: the shared secret ignored the ephemeral key,
+// so one seed gave a hop the same secret on every payment and it could peel an
+// onion it was never handed.
+func TestX2OnionFromADoesNotPeelWithBsSecrets(t *testing.T) {
+	reqA, reqB := planReq(t), planReq(t)
+	reqB.Amount = 200
+	if reqA.Seed != reqB.Seed {
+		t.Fatal("precondition: this test needs the SAME seed on both payments")
+	}
+	planA, err := PlanPayment(reqA)
+	if err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	planB, err := PlanPayment(reqB)
+	if err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	if planA.Packet.EphemeralPublicKey == planB.Packet.EphemeralPublicKey {
+		t.Fatal("two payments shared an ephemeral key")
+	}
+	for _, cand := range planA.Route {
+		secretA := HopSharedSecret(reqA.Seed, planA.Packet.EphemeralPublicKey, cand.NodeID)
+		if _, err := planB.Packet.Peel(secretA); err == nil {
+			t.Fatalf("hop %s peeled payment B's onion using its payment-A secret; "+
+				"the two payments are linkable and B's routing instruction is exposed",
+				cand.NodeID)
+		}
+	}
+}
+
+// 3. Settlement material from A must not settle B, on a real channel.
+func TestX3SettlementMaterialFromADoesNotSettleB(t *testing.T) {
+	payer, payee, id := wiredPair(t, anon(500))
+	ctx := context.Background()
+	const now = int64(1_000_000)
+	payer.clock, payee.clock = now, now
+
+	preA, preB := [32]byte{31: 0x41}, [32]byte{31: 0x42}
+	var hA, hB [32]byte
+	copy(hA[:], keccak(preA[:]))
+	copy(hB[:], keccak(preB[:]))
+	for i, h := range [][32]byte{hA, hB} {
+		tr := StateTransition{Kind: KindLockAdd, Amount: anon(50),
+			LockID: [32]byte{31: byte(i + 1)}, Hash: h, Expiry: now + 3600}
+		if _, err := payer.coord.Pay(ctx, id, derive("x3/lock", []byte{byte(i)}),
+			tr, directPeer{t, payee.coord}); err != nil {
+			t.Fatalf("lock %d: %v", i, err)
+		}
+	}
+	cross := StateTransition{Kind: KindLockSettle, LockID: [32]byte{31: 2}, Preimage: preA}
+	if _, err := payee.coord.Pay(ctx, id, derive("x3/cross", nil),
+		cross, directPeer{t, payer.coord}); err == nil {
+		t.Fatal("payment A's preimage settled payment B's lock")
+	}
+}
+
+// 4. Same recipient secret, different payment id, must not share a hash.
+func TestX4SameSecretDifferentPaymentID(t *testing.T) {
+	f := newMPFixture(t, 2, anon(500))
+	a := f.payment(t, [32]byte{31: 0x51}, 40, 60)
+	b := f.payment(t, [32]byte{31: 0x52}, 40, 60)
+	for i := range a.Legs {
+		if a.Legs[i].Hash == b.Legs[i].Hash {
+			t.Fatalf("leg %d shares a hash across payment ids on one secret", i)
+		}
+		if a.Legs[i].Intent == b.Legs[i].Intent {
+			t.Fatalf("leg %d shares an intent across payment ids", i)
+		}
+	}
+}
+
+// 5. Same route, different payment: no authorization material may repeat.
+func TestX5SameRouteDifferentPayment(t *testing.T) {
+	reqA, reqB := planReq(t), planReq(t)
+	reqB.Amount = 300
+	planA, _ := PlanPayment(reqA)
+	planB, _ := PlanPayment(reqB)
+
+	// The routes are the same candidates; the material must not be.
+	seen := map[string]bool{}
+	for i := range planA.Locks.Locks {
+		p := planA.Locks.Locks[i]
+		seen[p.X.String()+":"+p.Y.String()] = true
+	}
+	for i := range planB.Locks.Locks {
+		p := planB.Locks.Locks[i]
+		if seen[p.X.String()+":"+p.Y.String()] {
+			t.Fatalf("hop %d reused a lock point across two payments on one route", i)
+		}
+	}
+}
+
+// 6. Same fragment index, different payment.
+func TestX6SameIndexDifferentPayment(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	a := f.payment(t, [32]byte{31: 0x61}, 20, 30, 50)
+	b := f.payment(t, [32]byte{31: 0x62}, 20, 30, 50)
+	for i := range a.Legs {
+		if a.Legs[i].LockID == b.Legs[i].LockID {
+			t.Fatalf("index %d produced the same lock id in two payments", i)
+		}
+	}
+}
+
+// 7. A downstream FAILURE must not leave an upstream authorization usable.
+func TestX7DownstreamFailureLeavesNoUpstreamAuthorization(t *testing.T) {
+	vault, err := OpenPreimageVault(t.TempDir())
+	if err != nil {
+		t.Fatalf("vault: %v", err)
+	}
+	hub, upstream, in := wiredPair(t, anon(500))
+	fwd := NewForwarder(hub.coord, vault, hub.key.address())
+
+	pre := [32]byte{31: 0x71}
+	var h [32]byte
+	copy(h[:], keccak(pre[:]))
+	incoming := Incoming{Channel: in, Lock: HTLC{
+		ID: [32]byte{31: 1}, Hash: h, Amount: anon(50), Expiry: 2_000_000_000}}
+
+	// The downstream never settled, so the vault never learned the secret.
+	if _, err := fwd.ClaimUpstream(context.Background(), incoming,
+		claimUpstreamIntent(incoming), directPeer{t, upstream.coord}); err == nil {
+		t.Fatal("the hub claimed upstream after a downstream failure")
+	}
+}
+
+// 8. Replay after a SUCCESSFUL settlement must not settle again.
+func TestX8ReplayAfterSuccessfulSettlement(t *testing.T) {
+	f := newMPFixture(t, 2, anon(500))
+	ctx := context.Background()
+	pay := f.payment(t, [32]byte{31: 0x81}, 40, 60)
+	if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	if _, err := f.exec.Settle(ctx, pay, f.secret, f.peers(t)); err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	before := f.exec.Summarise(pay).SettledAmount
+
+	// Replay the exact settle transition on leg 0.
+	leg := pay.Legs[0]
+	tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
+		Preimage: FragmentPreimage(f.secret, leg.Intent)}
+	if _, err := f.payer.coord.Pay(ctx, leg.Channel, derive("x8/replay", nil),
+		tr, directPeer{t, f.payees[0].coord}); err == nil {
+		t.Fatal("a settled lock was settled a second time")
+	}
+	if f.exec.Summarise(pay).SettledAmount.Cmp(before) != 0 {
+		t.Fatal("a replay moved value")
+	}
+}
+
+// 9. Replay after a REFUND must not settle the refunded lock.
+func TestX9ReplayAfterRefund(t *testing.T) {
+	f := newMPFixture(t, 2, anon(500))
+	ctx := context.Background()
+	pay := f.payment(t, [32]byte{31: 0x91}, 40, 60)
+	if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	f.advanceTo(mpExpiry + 120)
+	if _, err := f.exec.Refund(ctx, pay, f.peers(t)); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	// The secret still exists; the lock does not.
+	leg := pay.Legs[0]
+	tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
+		Preimage: FragmentPreimage(f.secret, leg.Intent)}
+	if _, err := f.payer.coord.Pay(ctx, leg.Channel, derive("x9/replay", nil),
+		tr, directPeer{t, f.payees[0].coord}); err == nil {
+		t.Fatal("a refunded lock was then settled")
+	}
+	out := f.exec.Summarise(pay)
+	if out.SettledAmount.Sign() != 0 {
+		t.Fatalf("a refunded payment delivered %s", out.SettledAmount)
+	}
+}
+
+// 10. A payer constructing INCONSISTENT blinding must not produce a chain that
+//     validates, so a hop is never handed a lock it cannot satisfy.
+func TestX10InconsistentBlindingDoesNotValidate(t *testing.T) {
+	c := DefaultCurve()
+	z, Z, _ := NewSecret(c)
+	chain, err := BuildLocks(c, Z, 3)
+	if err != nil {
+		t.Fatalf("BuildLocks: %v", err)
+	}
+	// A well-formed chain settles at every hop.
+	scalars, err := SettleRoute(c, chain, z)
+	if err != nil {
+		t.Fatalf("SettleRoute: %v", err)
+	}
+	for i := range chain.Locks {
+		if err := Satisfies(c, chain.Locks[i], scalars[i]); err != nil {
+			t.Fatalf("honest chain failed at hop %d: %v", i, err)
+		}
+	}
+	// Now corrupt one hop's lock, as a malicious payer would. The scalar the
+	// unwinding produces must NOT satisfy it — the mismatch has to be visible
+	// to the hop before it forwards, which is what Satisfies is for.
+	tampered := *chain
+	tampered.Locks = append([]Point(nil), chain.Locks...)
+	tampered.Locks[1] = chain.Locks[2] // hop 1 handed hop 2's point
+	if err := Satisfies(c, tampered.Locks[1], scalars[1]); err == nil {
+		t.Fatal("a hop's scalar satisfied a lock the payer had swapped; " +
+			"the hop could not detect the mismatch")
+	}
+}
+
+// 11. A malicious intermediary must not turn the mismatch into a claim.
+//
+// Even holding its own instruction, its own secret and a sibling's material, a
+// hop cannot settle upstream without the preimage the downstream reveals.
+func TestX11MaliciousHopCannotExploitAMismatch(t *testing.T) {
+	vault, err := OpenPreimageVault(t.TempDir())
+	if err != nil {
+		t.Fatalf("vault: %v", err)
+	}
+	hub, upstream, in := wiredPair(t, anon(500))
+	fwd := NewForwarder(hub.coord, vault, hub.key.address())
+
+	// The hub knows a DIFFERENT payment's secret and tries to use it.
+	other := [32]byte{31: 0xB1}
+	if err := vault.Learn(other); err != nil {
+		t.Fatalf("Learn: %v", err)
+	}
+	pre := [32]byte{31: 0xB2}
+	var h [32]byte
+	copy(h[:], keccak(pre[:]))
+	incoming := Incoming{Channel: in, Lock: HTLC{
+		ID: [32]byte{31: 1}, Hash: h, Amount: anon(50), Expiry: 2_000_000_000}}
+
+	// The vault is keyed by hash, so an unrelated secret is simply not found.
+	if _, err := fwd.ClaimUpstream(context.Background(), incoming,
+		claimUpstreamIntent(incoming), directPeer{t, upstream.coord}); err == nil {
+		t.Fatal("a hub claimed upstream using an unrelated payment's secret")
+	}
+}
+
+// 12. Within ONE payment, a hop must peel only its own instruction.
+//
+// Cross-payment isolation was tested and within-payment isolation was not, so
+// dropping the node id from the derivation — making every hop on a route share
+// one secret — survived the first mutation pass. That collapse would hand each
+// hop the whole route, which is the single property onion routing exists for.
+func TestX12EachHopPeelsOnlyItsOwnInstruction(t *testing.T) {
+	req := planReq(t)
+	plan, err := PlanPayment(req)
+	if err != nil {
+		t.Fatalf("PlanPayment: %v", err)
+	}
+	if len(plan.Route) < 2 {
+		t.Fatalf("need at least two hops, got %d", len(plan.Route))
+	}
+
+	// Each hop's own secret must yield the instruction committing to ITS lock.
+	for i, cand := range plan.Route {
+		secret := HopSharedSecret(req.Seed, plan.Packet.EphemeralPublicKey, cand.NodeID)
+		hop, err := plan.Packet.Peel(secret)
+		if err != nil {
+			t.Fatalf("hop %d could not peel its own instruction: %v", i, err)
+		}
+		want := Commitment(derive("syndichan/payment/hopcommit/v1",
+			plan.Locks.Locks[i].X.Bytes(), plan.Locks.Locks[i].Y.Bytes()))
+		if hop.OutgoingCommitment != want {
+			t.Fatalf("hop %d peeled an instruction committing to another hop's lock", i)
+		}
+	}
+
+	// And no hop's secret may yield another hop's instruction. With a shared
+	// secret every hop reads every slot, so this is what collapses first.
+	for i, ci := range plan.Route {
+		si := HopSharedSecret(req.Seed, plan.Packet.EphemeralPublicKey, ci.NodeID)
+		got, err := plan.Packet.Peel(si)
+		if err != nil {
+			t.Fatalf("hop %d peel: %v", i, err)
+		}
+		for j := range plan.Route {
+			if i == j {
+				continue
+			}
+			other := Commitment(derive("syndichan/payment/hopcommit/v1",
+				plan.Locks.Locks[j].X.Bytes(), plan.Locks.Locks[j].Y.Bytes()))
+			if got.OutgoingCommitment == other {
+				t.Fatalf("hop %d's secret peeled hop %d's instruction; the route is "+
+					"visible to every hop on it", i, j)
+			}
+		}
+	}
+}
+
+// 13. The hop secret must depend on EVERY input that scopes it.
+//
+// Dropping the seed leaves derive(ephemeral, nodeID) — and the ephemeral key
+// travels in the packet in clear, so anyone who observes a payment could compute
+// every hop's secret and peel the whole onion. That mutation also survived the
+// first pass, because nothing asserted the seed was an input at all.
+//
+// Tested at the derivation the way a key schedule is, rather than through a
+// behaviour that happens to depend on it.
+func TestX13HopSecretDependsOnEveryInput(t *testing.T) {
+	seed := [32]byte{31: 0x01}
+	eph := [32]byte{31: 0x02}
+	const node = NodeID("hop-a")
+	base := HopSharedSecret(seed, eph, node)
+
+	if HopSharedSecret([32]byte{31: 0x09}, eph, node) == base {
+		t.Fatal("the seed does not affect the hop secret; an observer with the " +
+			"packet could derive it and peel the onion")
+	}
+	if HopSharedSecret(seed, [32]byte{31: 0x09}, node) == base {
+		t.Fatal("the ephemeral key does not affect the hop secret; one seed would " +
+			"give a hop the same secret on every payment")
+	}
+	if HopSharedSecret(seed, eph, NodeID("hop-b")) == base {
+		t.Fatal("the node id does not affect the hop secret; every hop on the " +
+			"route would share one and could read the whole path")
+	}
+	// Deterministic, or a router could never reproduce it.
+	if HopSharedSecret(seed, eph, node) != base {
+		t.Fatal("the hop secret derivation is not deterministic")
 	}
 }

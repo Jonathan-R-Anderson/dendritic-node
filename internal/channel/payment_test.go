@@ -109,7 +109,7 @@ func TestPlannedPacketPeelsCorrectlyPerHop(t *testing.T) {
 	}
 	var previous uint64
 	for i, c := range plan.Route {
-		shared := derive("syndichan/payment/hopsecret/v1", req.Seed[:], []byte(c.NodeID))
+		shared := HopSharedSecret(req.Seed, plan.Packet.EphemeralPublicKey, c.NodeID)
 		hop, err := plan.Packet.Peel(shared)
 		if err != nil {
 			t.Fatalf("hop %d could not peel its own instruction: %v", i, err)

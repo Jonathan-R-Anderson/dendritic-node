@@ -46,6 +46,20 @@ type Plan struct {
 	Invoice *BlindedInvoice
 }
 
+// HopSharedSecret derives the secret a hop uses to peel its own instruction.
+//
+// Exported and named so the binding can be asserted directly, and so callers
+// stop open-coding the derivation — five sites did, and a change to the inputs
+// silently broke none of them because they all repeated the same wrong thing.
+//
+// A PLACEHOLDER, and it says so: production replaces this with ECDH between the
+// packet's ephemeral key and the router's own key. What must survive that
+// substitution is the binding — per payment (via ephemeral), per hop (via the
+// node id), and not derivable by an observer (via the seed).
+func HopSharedSecret(seed, ephemeral [32]byte, node NodeID) [32]byte {
+	return derive("syndichan/payment/hopsecret/v2", seed[:], ephemeral[:], []byte(node))
+}
+
 // PlanRequest is what a caller supplies.
 type PlanRequest struct {
 	Invoice    *BlindedInvoice
@@ -134,14 +148,39 @@ func PlanPayment(req PlanRequest) (*Plan, error) {
 	}
 
 	// 5. Per-hop shared secrets. Supplied by ECDH with each router's key in a
-	// real deployment; derived here from the seed and the node id so the plan
-	// is reproducible in tests and the curve choice stays out of the packet.
+	// real deployment; derived here from the seed, the EPHEMERAL KEY and the
+	// node id so the plan is reproducible in tests and the curve choice stays
+	// out of the packet.
+	//
+	// THE EPHEMERAL KEY IS LOAD-BEARING, NOT DECORATION.
+	//
+	// This used to be derive(seed, nodeID) — no ephemeral, so the shared secret
+	// was a pure function of the payer's seed and the hop's identity. A payer
+	// that reused a seed therefore handed the same hop the SAME secret on two
+	// different payments, and that hop could peel an onion it was never given:
+	// correlating the two payments, and reading the second's routing
+	// instruction. Verified by constructing two payments under one seed.
+	//
+	// That defeats precisely the property the ephemeral key exists to provide.
+	// Packet says it plainly: "EphemeralPublicKey is fresh per payment. Reusing
+	// one links every payment sent under it, which would undo the whole
+	// construction in a single field." The key was fresh — and the secrets that
+	// actually gate peeling ignored it, so freshness bought nothing.
+	//
+	// The ephemeral key is derived from z, drawn from crypto/rand per plan, so
+	// it is per-payment even when the seed is not. Binding to it makes the shim
+	// payment-bound and matches the shape of the ECDH that replaces it: in
+	// production a router derives its secret from the ephemeral key in the
+	// packet and its own key, which is per-payment for the same reason.
+	//
+	// The seed stays in the derivation so the secret is not computable by
+	// somebody who merely observes the packet.
+	ephemeral := derive("syndichan/payment/ephemeral/v1", req.Seed[:], z.Bytes())
+
 	secrets := make([][32]byte, len(route))
 	for i, c := range route {
-		secrets[i] = derive("syndichan/payment/hopsecret/v1", req.Seed[:], []byte(c.NodeID))
+		secrets[i] = HopSharedSecret(req.Seed, ephemeral, c.NodeID)
 	}
-
-	ephemeral := derive("syndichan/payment/ephemeral/v1", req.Seed[:], z.Bytes())
 
 	packet, err := Build(ephemeral, hops, secrets)
 	if err != nil {
