@@ -50,7 +50,7 @@ func TestAnObservedReorgIsEvidence(t *testing.T) {
 		}
 	}
 	// And it must be filable against a budget that allows for it.
-	v := NewValidatedBudget(1, MainnetChallengeBudget())
+	v := NewValidatedBudget(1, MainnetChallengeBudget(), testEnvelope())
 	e.Samples = MinEvidenceSamples
 	if err := v.Record(e); err != nil {
 		t.Fatalf("the evidence was rejected by the gate: %v", err)
@@ -64,7 +64,7 @@ func TestASingleEndpointCannotValidateTheRPCTerm(t *testing.T) {
 		Endpoints:     []EndpointHealth{{Endpoint: "https://one.example"}},
 		WorstFailover: time.Second,
 	}
-	if _, err := single.AsEvidence(1, time.Now().Unix()); err == nil {
+	if _, err := single.AsEvidence(1, time.Now().Unix(), "attested"); err == nil {
 		t.Fatal("a single endpoint validated a term that assumes failover")
 	}
 }
@@ -74,12 +74,13 @@ func TestASingleEndpointCannotValidateTheRPCTerm(t *testing.T) {
 func TestARoundWhereNobodyAnsweredBlocksValidation(t *testing.T) {
 	flaky := FailoverObservation{
 		Endpoints: []EndpointHealth{
-			{Endpoint: "a", Attempts: 100}, {Endpoint: "b", Attempts: 100},
+			{Endpoint: "https://a.example", Attempts: 100},
+			{Endpoint: "https://b.example", Attempts: 100},
 		},
 		WorstFailover: 2 * time.Second,
 		AllFailed:     1,
 	}
-	_, err := flaky.AsEvidence(1, time.Now().Unix())
+	_, err := flaky.AsEvidence(1, time.Now().Unix(), "attested")
 	if err == nil {
 		t.Fatal("a total outage was folded into a measured worst case")
 	}
@@ -91,12 +92,12 @@ func TestARoundWhereNobodyAnsweredBlocksValidation(t *testing.T) {
 func TestHealthyFailoverIsEvidence(t *testing.T) {
 	healthy := FailoverObservation{
 		Endpoints: []EndpointHealth{
-			{Endpoint: "a", Attempts: 60, WorstLatency: 400 * time.Millisecond},
-			{Endpoint: "b", Attempts: 4, WorstLatency: 900 * time.Millisecond},
+			{Endpoint: "https://a.example", Attempts: 60, WorstLatency: 400 * time.Millisecond},
+			{Endpoint: "https://b.example", Attempts: 4, WorstLatency: 900 * time.Millisecond},
 		},
 		WorstFailover: 3 * time.Second,
 	}
-	e, err := healthy.AsEvidence(1, time.Now().Unix())
+	e, err := healthy.AsEvidence(1, time.Now().Unix(), "two unrelated providers, separate accounts")
 	if err != nil {
 		t.Fatalf("AsEvidence: %v", err)
 	}
@@ -200,5 +201,56 @@ func TestFailoverRecordsATotalOutage(t *testing.T) {
 	got := ObserveFailover(context.Background(), []string{dead.URL, dead.URL}, 3, 0)
 	if got.AllFailed != 3 {
 		t.Fatalf("AllFailed %d, want 3", got.AllFailed)
+	}
+}
+
+// Two URLs at one provider fail together. That is not failover.
+func TestEndpointsAtOneProviderAreNotFailover(t *testing.T) {
+	sameProvider := FailoverObservation{
+		Endpoints: []EndpointHealth{
+			{Endpoint: "https://eth-mainnet.g.alchemy.com/v2/keyA", Attempts: 100},
+			{Endpoint: "https://eth-sepolia.g.alchemy.com/v2/keyB", Attempts: 100},
+		},
+		WorstFailover: time.Second,
+	}
+	_, err := sameProvider.AsEvidence(1, time.Now().Unix(), "attested")
+	if err == nil {
+		t.Fatal("two Alchemy endpoints were accepted as failover evidence")
+	}
+	if !strings.Contains(err.Error(), "alchemy.com") {
+		t.Errorf("the refusal does not name the shared provider: %v", err)
+	}
+}
+
+// A probe cannot establish that two providers do not share an upstream, so the
+// operator has to say so.
+func TestUnattestedIndependenceIsRejected(t *testing.T) {
+	fine := FailoverObservation{
+		Endpoints: []EndpointHealth{
+			{Endpoint: "https://a.example", Attempts: 60},
+			{Endpoint: "https://b.example", Attempts: 60},
+		},
+		WorstFailover: time.Second,
+	}
+	if _, err := fine.AsEvidence(1, time.Now().Unix(), "   "); err == nil {
+		t.Fatal("independence was assumed rather than attested")
+	}
+}
+
+func TestIndependentEndpointsSpotsTheCommonMistake(t *testing.T) {
+	cases := []struct {
+		name string
+		urls []string
+		want bool
+	}{
+		{"two providers", []string{"https://a.example", "https://b.other"}, true},
+		{"same host", []string{"https://a.example/1", "https://a.example/2"}, false},
+		{"same provider, different subdomain",
+			[]string{"https://eth.g.alchemy.com", "https://poly.g.alchemy.com"}, false},
+	}
+	for _, tc := range cases {
+		if got, _ := IndependentEndpoints(tc.urls); got != tc.want {
+			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
+		}
 	}
 }

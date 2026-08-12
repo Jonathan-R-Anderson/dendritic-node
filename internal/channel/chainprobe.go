@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -254,12 +255,71 @@ func (o ReorgObservation) AsEvidence(chainID int64, takenAt int64) (Evidence, er
 	}, nil
 }
 
+// providerOf reduces an endpoint URL to the operator it most likely belongs to.
+//
+// The last two labels of the host: eth-mainnet.g.alchemy.com and
+// eth-sepolia.g.alchemy.com both reduce to alchemy.com, which is the point —
+// two URLs at one provider fail together, so listing both is not failover.
+//
+// A HEURISTIC, and it says so where it matters. It cannot see that two
+// different companies resell the same upstream, or share a datacentre, or use
+// the same DNS. It catches the common mistake and no more, which is why
+// AsEvidence asks for an explicit attestation as well.
+func providerOf(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Hostname() == "" {
+		return endpoint
+	}
+	host := strings.ToLower(u.Hostname())
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return host
+	}
+	return strings.Join(labels[len(labels)-2:], ".")
+}
+
+// IndependentEndpoints reports whether a list looks like genuine failover.
+//
+// Returns the duplicated provider when it does not.
+func IndependentEndpoints(endpoints []string) (bool, string) {
+	seen := map[string]bool{}
+	for _, e := range endpoints {
+		p := providerOf(e)
+		if seen[p] {
+			return false, p
+		}
+		seen[p] = true
+	}
+	return true, ""
+}
+
 // AsEvidence turns a failover observation into a validation record.
-func (o FailoverObservation) AsEvidence(chainID int64, takenAt int64) (Evidence, error) {
+//
+// `attested` is the operator stating that these endpoints are genuinely
+// independent — different providers, not two URLs at one. It is required
+// because no probe can establish it: two hostnames can resolve into the same
+// datacentre, and the measurement would look perfect right up until they failed
+// together. The host check below catches the obvious case; the attestation
+// covers the one that matters.
+func (o FailoverObservation) AsEvidence(chainID int64, takenAt int64, attested string) (Evidence, error) {
 	if len(o.Endpoints) < 2 {
 		return Evidence{}, fmt.Errorf(
 			"chainprobe: %d endpoint(s); the rpc-failure term assumes failover is possible",
 			len(o.Endpoints))
+	}
+	urls := make([]string, 0, len(o.Endpoints))
+	for _, e := range o.Endpoints {
+		urls = append(urls, e.Endpoint)
+	}
+	if ok, provider := IndependentEndpoints(urls); !ok {
+		return Evidence{}, fmt.Errorf(
+			"chainprobe: two endpoints share the provider %q; they fail together, "+
+				"so this is not failover evidence", provider)
+	}
+	if strings.TrimSpace(attested) == "" {
+		return Evidence{}, fmt.Errorf(
+			"chainprobe: no attestation that these endpoints are independent; " +
+				"a probe cannot establish that two providers do not share an upstream")
 	}
 	if o.AllFailed > 0 {
 		return Evidence{}, fmt.Errorf(
@@ -273,6 +333,7 @@ func (o FailoverObservation) AsEvidence(chainID int64, takenAt int64) (Evidence,
 	return Evidence{
 		Term: "rpc failure", Measured: o.WorstFailover, Samples: attempts,
 		ChainID: chainID, TakenAt: takenAt,
-		Method: fmt.Sprintf("failover sampling across %d endpoints", len(o.Endpoints)),
+		Method: fmt.Sprintf("failover sampling across %d endpoints; independence attested: %s",
+			len(o.Endpoints), attested),
 	}, nil
 }

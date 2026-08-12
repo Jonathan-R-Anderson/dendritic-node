@@ -33,6 +33,7 @@ package channel
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -54,6 +55,10 @@ type Evidence struct {
 	// TakenAt is a unix timestamp, PASSED IN rather than read from a clock, so
 	// a validation record is reproducible.
 	TakenAt int64
+	// AtChannels is the workload the measurement was taken under. Required for
+	// the detection term, where it is the whole meaning of the number: a sweep
+	// that completes in seconds over 100 channels says nothing about 100,000.
+	AtChannels int
 }
 
 // MinEvidenceSamples is the fewest observations that count.
@@ -88,18 +93,75 @@ var termsNeedingEvidence = map[string]string{
 	"reorg depth":       "how deep a reorganisation the target chain actually sustains",
 }
 
+// OperatingEnvelope is the deployment the budget is FOR.
+//
+// Two of the terms are not properties of a network at all, and validating them
+// without saying under what conditions would be meaningless:
+//
+//	detection  depends on the workload. One watchtower sweeping 100 channels
+//	           and one sweeping 100,000 are different systems, and a 30-minute
+//	           detection budget validated on the first says nothing about the
+//	           second.
+//	outage     is a PROMISE about people. "Four hours" is a claim that somebody
+//	           is paged and responds within four hours. If the real answer is
+//	           "whenever somebody notices", the honest term is days.
+//
+// So the envelope is recorded alongside the evidence, and evidence gathered
+// outside it does not count. A budget is validated for a deployment, not in the
+// abstract.
+type OperatingEnvelope struct {
+	// Channels is the most one watchtower is expected to hold.
+	Channels int
+	// Watchtowers is how many independent ones will run. One is a single point
+	// of failure whose outage term is its own recovery time.
+	Watchtowers int
+	// SweepInterval is what they will actually be configured with.
+	SweepInterval time.Duration
+	// OnCall states the commitment in words, for whoever reads this later.
+	// Empty means nobody has made one.
+	OnCall string
+	// OnCallResponse is how quickly a human is expected to act. This is what
+	// the outage term is really asserting.
+	OnCallResponse time.Duration
+}
+
+// Stated reports whether an envelope says enough to validate against.
+func (e OperatingEnvelope) Stated() error {
+	if e.Channels <= 0 {
+		return fmt.Errorf("envelope: the channel count this deployment will hold is not stated")
+	}
+	if e.Watchtowers <= 0 {
+		return fmt.Errorf("envelope: the number of watchtowers is not stated")
+	}
+	if e.SweepInterval <= 0 {
+		return fmt.Errorf("envelope: the sweep interval is not stated")
+	}
+	if strings.TrimSpace(e.OnCall) == "" || e.OnCallResponse <= 0 {
+		return fmt.Errorf(
+			"envelope: no on-call commitment stated; the outage term is a promise about " +
+				"people and cannot be validated without one")
+	}
+	return nil
+}
+
 // ValidatedBudget is a budget plus what has been checked about it.
 type ValidatedBudget struct {
 	Budget ChallengeBudget
 	// ChainID is the deployment this validation is FOR. Evidence from anywhere
 	// else does not count towards it.
-	ChainID  int64
+	ChainID int64
+	// Envelope is the workload and operational commitment the evidence was
+	// gathered under. Evidence outside it does not count.
+	Envelope OperatingEnvelope
 	Evidence map[string]Evidence
 }
 
-// NewValidatedBudget starts an empty validation for a chain.
-func NewValidatedBudget(chainID int64, budget ChallengeBudget) *ValidatedBudget {
-	return &ValidatedBudget{Budget: budget, ChainID: chainID, Evidence: map[string]Evidence{}}
+// NewValidatedBudget starts an empty validation for a chain and a deployment.
+func NewValidatedBudget(chainID int64, budget ChallengeBudget, envelope OperatingEnvelope) *ValidatedBudget {
+	return &ValidatedBudget{
+		Budget: budget, ChainID: chainID, Envelope: envelope,
+		Evidence: map[string]Evidence{},
+	}
 }
 
 // Record files evidence for a term.
@@ -126,6 +188,21 @@ func (v *ValidatedBudget) Record(e Evidence) error {
 	}
 	if e.Method == "" {
 		return fmt.Errorf("validation: %q has no method recorded; an unrepeatable measurement is not evidence", e.Term)
+	}
+	if err := v.Envelope.Stated(); err != nil {
+		return fmt.Errorf("validation: %q cannot be validated: %w", e.Term, err)
+	}
+	if e.Term == "detection" && e.AtChannels < v.Envelope.Channels {
+		return fmt.Errorf(
+			"validation: detection was measured over %d channels but this deployment "+
+				"expects %d; measure at the real workload",
+			e.AtChannels, v.Envelope.Channels)
+	}
+	if e.Term == "watchtower outage" && v.Envelope.OnCallResponse > budgetedOr(v, e.Term) {
+		return fmt.Errorf(
+			"validation: the on-call commitment is %s but the outage term budgets %s; "+
+				"the term is a promise about people and must not be shorter than the promise",
+			v.Envelope.OnCallResponse, budgetedOr(v, e.Term))
 	}
 	budgeted, _ := v.budgeted(e.Term)
 	if e.Measured > budgeted {
@@ -215,4 +292,9 @@ func exemptReason(term string) string {
 		return "padding for unmodelled failure; nothing to measure"
 	}
 	return "no evidence required"
+}
+
+func budgetedOr(v *ValidatedBudget, term string) time.Duration {
+	d, _ := v.budgeted(term)
+	return d
 }

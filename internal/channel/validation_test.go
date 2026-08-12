@@ -14,17 +14,27 @@ import (
 
 const testChain = 1
 
+// testEnvelope is a deployment that has actually been described: a workload and
+// an on-call commitment. Without one, nothing validates — see OperatingEnvelope.
+func testEnvelope() OperatingEnvelope {
+	return OperatingEnvelope{
+		Channels: 1000, Watchtowers: 2, SweepInterval: DefaultWatchInterval,
+		OnCall: "primary paged, secondary escalates after 1h", OnCallResponse: 4 * time.Hour,
+	}
+}
+
 func goodEvidence(term string, measured time.Duration, now int64) Evidence {
 	return Evidence{
 		Term: term, Measured: measured, Samples: MinEvidenceSamples,
 		ChainID: testChain, Method: "measured against a live chain", TakenAt: now,
+		AtChannels: testEnvelope().Channels,
 	}
 }
 
 // THE GATE. Nothing has been measured against a real chain, so the system must
 // refuse to produce a number to deploy with.
 func TestTheSystemIsNotYetDeployable(t *testing.T) {
-	v := NewValidatedBudget(testChain, MainnetChallengeBudget())
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
 
 	seconds, err := v.DeployableChallengePeriod(time.Now().Unix())
 	if err == nil {
@@ -42,7 +52,7 @@ func TestTheSystemIsNotYetDeployable(t *testing.T) {
 func TestAFullyValidatedBudgetIsDeployable(t *testing.T) {
 	now := time.Now().Unix()
 	budget := MainnetChallengeBudget()
-	v := NewValidatedBudget(testChain, budget)
+	v := NewValidatedBudget(testChain, budget, testEnvelope())
 
 	for _, term := range v.Budget.Terms() {
 		if _, needs := termsNeedingEvidence[term.Name]; !needs {
@@ -67,7 +77,7 @@ func TestAFullyValidatedBudgetIsDeployable(t *testing.T) {
 // confirmation would be the exact failure this gate exists to prevent.
 func TestEvidenceThatRefutesTheBudgetIsRejected(t *testing.T) {
 	now := time.Now().Unix()
-	v := NewValidatedBudget(testChain, MainnetChallengeBudget())
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
 
 	err := v.Record(goodEvidence("inclusion", 45*time.Minute, now))
 	if err == nil {
@@ -87,7 +97,7 @@ func TestRaisingARefutedTermMakesItValidatable(t *testing.T) {
 	budget := MainnetChallengeBudget()
 	budget.Inclusion = time.Hour
 
-	v := NewValidatedBudget(testChain, budget)
+	v := NewValidatedBudget(testChain, budget, testEnvelope())
 	if err := v.Record(goodEvidence("inclusion", 45*time.Minute, now)); err != nil {
 		t.Fatalf("45m still refused against a raised 1h budget: %v", err)
 	}
@@ -100,7 +110,7 @@ func TestRaisingARefutedTermMakesItValidatable(t *testing.T) {
 // A measurement from somewhere else does not validate this deployment.
 func TestEvidenceFromAnotherChainIsRejected(t *testing.T) {
 	now := time.Now().Unix()
-	v := NewValidatedBudget(testChain, MainnetChallengeBudget())
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
 
 	e := goodEvidence("inclusion", 10*time.Minute, now)
 	e.ChainID = 11155111 // a testnet
@@ -112,7 +122,7 @@ func TestEvidenceFromAnotherChainIsRejected(t *testing.T) {
 // One observation is an anecdote.
 func TestThinEvidenceIsRejected(t *testing.T) {
 	now := time.Now().Unix()
-	v := NewValidatedBudget(testChain, MainnetChallengeBudget())
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
 
 	e := goodEvidence("inclusion", 10*time.Minute, now)
 	e.Samples = 3
@@ -124,7 +134,7 @@ func TestThinEvidenceIsRejected(t *testing.T) {
 // A measurement nobody can repeat is not evidence.
 func TestEvidenceWithoutAMethodIsRejected(t *testing.T) {
 	now := time.Now().Unix()
-	v := NewValidatedBudget(testChain, MainnetChallengeBudget())
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
 
 	e := goodEvidence("inclusion", 10*time.Minute, now)
 	e.Method = ""
@@ -139,7 +149,7 @@ func TestExpiredEvidenceReopensTheGate(t *testing.T) {
 	old := now - int64((EvidenceMaxAge+24*time.Hour)/time.Second)
 
 	budget := MainnetChallengeBudget()
-	v := NewValidatedBudget(testChain, budget)
+	v := NewValidatedBudget(testChain, budget, testEnvelope())
 	for _, term := range v.Budget.Terms() {
 		if _, needs := termsNeedingEvidence[term.Name]; !needs {
 			continue
@@ -170,7 +180,7 @@ func TestExpiredEvidenceReopensTheGate(t *testing.T) {
 // satisfiable by filing evidence at them either.
 func TestTheExemptTermsAreExemptForAReason(t *testing.T) {
 	now := time.Now().Unix()
-	v := NewValidatedBudget(testChain, MainnetChallengeBudget())
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
 
 	for _, term := range []string{"local work", "safety"} {
 		if _, needs := termsNeedingEvidence[term]; needs {
@@ -183,7 +193,7 @@ func TestTheExemptTermsAreExemptForAReason(t *testing.T) {
 }
 
 func TestUnknownTermsAreRejected(t *testing.T) {
-	v := NewValidatedBudget(testChain, MainnetChallengeBudget())
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
 	if err := v.Record(goodEvidence("vibes", time.Second, time.Now().Unix())); err == nil {
 		t.Fatal("evidence was filed against a term that does not exist")
 	}
@@ -209,7 +219,7 @@ func TestEveryBudgetTermIsAccountedForByTheGate(t *testing.T) {
 // that it is not deployable.
 func TestTheReportSaysWhereThingsStand(t *testing.T) {
 	now := time.Now().Unix()
-	v := NewValidatedBudget(testChain, MainnetChallengeBudget())
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
 	if err := v.Record(goodEvidence("inclusion", 20*time.Minute, now)); err != nil {
 		t.Fatalf("record: %v", err)
 	}
@@ -219,5 +229,46 @@ func TestTheReportSaysWhereThingsStand(t *testing.T) {
 		if !strings.Contains(report, want) {
 			t.Errorf("the report is missing %q:\n%s", want, report)
 		}
+	}
+}
+
+// Nothing validates until the deployment has been described. A budget validated
+// "in the abstract" is validated for nothing.
+func TestAnUndescribedDeploymentValidatesNothing(t *testing.T) {
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), OperatingEnvelope{})
+	if err := v.Record(goodEvidence("inclusion", 10*time.Minute, time.Now().Unix())); err == nil {
+		t.Fatal("evidence was filed against a deployment nobody has described")
+	}
+}
+
+// The outage term is a promise about people, and must not be shorter than the
+// promise actually made.
+func TestTheOutageTermCannotUndercutTheOnCallCommitment(t *testing.T) {
+	envelope := testEnvelope()
+	// Nobody is really on call: the honest response time is a day.
+	envelope.OnCall = "somebody will notice eventually"
+	envelope.OnCallResponse = 24 * time.Hour
+
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), envelope)
+	err := v.Record(goodEvidence("watchtower outage", 4*time.Hour, time.Now().Unix()))
+	if err == nil {
+		t.Fatal("a 4h outage term validated against a 24h on-call reality")
+	}
+	if !strings.Contains(err.Error(), "promise about people") {
+		t.Errorf("the refusal does not name the problem: %v", err)
+	}
+}
+
+// Detection measured on a toy workload says nothing about the real one.
+func TestDetectionMeasuredOnTheWrongWorkloadIsRejected(t *testing.T) {
+	envelope := testEnvelope()
+	envelope.Channels = 100_000
+
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), envelope)
+	e := goodEvidence("detection", 5*time.Minute, time.Now().Unix())
+	e.AtChannels = 100 // measured on a laptop with a handful of channels
+
+	if err := v.Record(e); err == nil {
+		t.Fatal("a 100-channel sweep validated a 100,000-channel deployment")
 	}
 }
