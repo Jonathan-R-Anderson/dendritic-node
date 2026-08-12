@@ -593,14 +593,36 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
   <div class="chan">
     <h3>{{if .Peer}}{{.Peer}}{{else}}{{.ID}}{{end}}</h3>
     <table>
-      <tr><td>Yours</td><td class="num">{{.Mine}}</td></tr>
-      <tr><td>Theirs</td><td class="num">{{.Theirs}}</td></tr>
-      <tr><td>In flight</td><td class="num">{{.Locked}}</td></tr>
+      <tr><td>Available</td><td class="num">{{.Mine}}</td></tr>
+      <tr><td>Incoming, in flight</td><td class="num">{{.Incoming}}</td></tr>
+      {{if .Outgoing}}<tr><td>Yours, at risk</td><td class="num">{{.Outgoing}}</td></tr>{{end}}
+      <tr><td>Total exposure</td><td class="num">{{.Total}}</td></tr>
       <tr><td>Updates</td><td class="num">{{.Nonce}}</td></tr>
       <tr><td>Settlement</td><td>{{.Mode}} &mdash; {{.Phase}}</td></tr>
       {{if .TxHash}}<tr><td>Transaction</td><td class="mono">{{.TxHash}}</td></tr>{{end}}
       {{if .LastError}}<tr><td>Last problem</td><td class="warn">{{.LastError}}</td></tr>{{end}}
     </table>
+    {{if .Locks}}
+    <h4>Payments in flight</h4>
+    <p class="muted">Conditional on a secret. None of this is spendable yet, and
+      &ldquo;incoming&rdquo; may never arrive &mdash; which is why it is not in the
+      available figure above.</p>
+    <table class="locks">
+      <tr><th>Payment</th><th>Direction</th><th>Amount</th><th>Expires in</th><th>Status</th></tr>
+      {{range .Locks}}
+      <tr>
+        <td class="mono">{{.ID}}</td>
+        <td>{{.Direction}}</td>
+        <td class="num">{{.Amount}}</td>
+        <td class="num">{{if lt .ExpiresIn 0}}expired{{else}}{{.ExpiresIn}}s{{end}}</td>
+        <td>{{.Status}}</td>
+      </tr>
+      {{end}}
+    </table>
+    <p class="muted">The node settles and refunds these itself. There is nothing
+      to do here.</p>
+    {{end}}
+
     {{if .Conflicted}}
     <p class="warn">This channel is stopped: two different states were signed at one
       update number. It needs closing on chain with the best state held. No further

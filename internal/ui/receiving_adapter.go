@@ -56,6 +56,29 @@ func (p *PaymentNode) Channels(_ context.Context) ([]ReceivingChannel, error) {
 			Mode:       string(channel.PayoutOnClose),
 			Phase:      string(channel.PhaseNone),
 		}
+		// The node works out what is claimable and what is merely in flight —
+		// this only renders the answer. See internal/channel/locks.go for why
+		// that decision does not live here.
+		if exp, err := p.Coord.Exposure(id); err == nil {
+			row.Mine, row.Incoming = exp.Available, exp.Incoming
+			row.Outgoing, row.Total = exp.Outgoing, exp.Total
+		}
+		if locks, err := p.Coord.Locks(id); err == nil {
+			for _, l := range locks {
+				direction := "outgoing"
+				if l.Incoming {
+					direction = "incoming"
+				}
+				row.Locks = append(row.Locks, PendingLock{
+					ID:        hex.EncodeToString(l.ID[:]),
+					Direction: direction,
+					Amount:    l.Amount,
+					Status:    string(l.Status),
+					Expiry:    l.Expiry,
+					ExpiresIn: l.ExpiresIn,
+				})
+			}
+		}
 		if p.Payout != nil {
 			if st, err := p.Payout.Status(id); err == nil {
 				row.Mode = string(st.Mode)

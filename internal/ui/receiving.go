@@ -41,6 +41,14 @@ type ReceivingChannel struct {
 	Nonce      uint64 `json:"nonce"`
 	Conflicted bool   `json:"conflicted"`
 
+	// Exposure, kept apart on purpose. Available is settled and spendable;
+	// Incoming may never arrive; Outgoing is this node's own money at risk.
+	// Adding them would tell a recipient they hold money they might not get.
+	Incoming string        `json:"incoming"`
+	Outgoing string        `json:"outgoing"`
+	Total    string        `json:"total"`
+	Locks    []PendingLock `json:"locks,omitempty"`
+
 	// Settlement, as the local record has it.
 	Mode      string `json:"mode"`
 	Phase     string `json:"phase"`
@@ -48,6 +56,26 @@ type ReceivingChannel struct {
 	DueAt     int64  `json:"due_at,omitempty"`
 	Attempts  int    `json:"attempts,omitempty"`
 	LastError string `json:"last_error,omitempty"`
+}
+
+// PendingLock is one conditional payment, as an operator reads it.
+//
+// Observational. There is deliberately nothing here that would let a page
+// construct a settlement or a refund: those are co-signed state transitions and
+// they belong to the coordinator. A UI that could build one would be a second
+// way to move money, arriving through a form.
+type PendingLock struct {
+	ID string `json:"id"`
+	// Direction is "incoming" (offered to this node) or "outgoing" (offered by
+	// it). The same lock reads differently from each end.
+	Direction string `json:"direction"`
+	Amount    string `json:"amount"`
+	// Status is waiting | claimable | lapsed | offered | refundable | settling.
+	Status string `json:"status"`
+	Expiry int64  `json:"expiry"`
+	// ExpiresIn is seconds remaining, negative once past. Computed by the node,
+	// whose clock is the one that decides.
+	ExpiresIn int64 `json:"expires_in"`
 }
 
 // Receiving is everything the panel needs from the payment node.

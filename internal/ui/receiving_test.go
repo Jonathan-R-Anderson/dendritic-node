@@ -287,3 +287,102 @@ func TestThePanelIsAbsentWithoutAPaymentNode(t *testing.T) {
 		t.Fatal("a node that cannot receive showed a receiving panel")
 	}
 }
+
+// ---- pending HTLCs in the panel (P7-c) -------------------------------------------
+
+func TestPendingLocksAreShownWithTheirStatus(t *testing.T) {
+	rec := &fakeReceiving{channels: []ReceivingChannel{{
+		ID: "aa", Mine: "425", Incoming: "100", Outgoing: "75", Total: "525", Nonce: 12,
+		Locks: []PendingLock{
+			{ID: "abc123", Direction: "incoming", Amount: "100", Status: "claimable", ExpiresIn: 240},
+			{ID: "def456", Direction: "outgoing", Amount: "75", Status: "offered", ExpiresIn: 900},
+		},
+	}}}
+	s := receivingServer(t, rec)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "127.0.0.1:9090"
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	page := w.Body.String()
+
+	for _, want := range []string{
+		"Payments in flight", "abc123", "claimable", "def456", "offered",
+		"Available", "Incoming, in flight", "Total exposure",
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("the page does not show %q", want)
+		}
+	}
+}
+
+// The panel reports exposure as three separate figures. Collapsing them would
+// tell a recipient they hold money that may never arrive.
+func TestExposureIsNotCollapsedIntoOneBalance(t *testing.T) {
+	rec := &fakeReceiving{channels: []ReceivingChannel{{
+		ID: "aa", Mine: "425", Incoming: "100", Outgoing: "0", Total: "525",
+	}}}
+	code, body := getJSON(t, receivingServer(t, rec), "/api/receiving")
+	if code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	row := body["channels"].([]any)[0].(map[string]any)
+	if row["mine"] != "425" || row["incoming"] != "100" || row["total"] != "525" {
+		t.Fatalf("exposure came back as %v", row)
+	}
+}
+
+// An expired lock says so rather than showing a negative countdown.
+func TestAnExpiredLockReadsAsExpired(t *testing.T) {
+	rec := &fakeReceiving{channels: []ReceivingChannel{{
+		ID: "aa", Mine: "0", Incoming: "0", Total: "0",
+		Locks: []PendingLock{{ID: "old", Direction: "outgoing", Amount: "50",
+			Status: "refundable", ExpiresIn: -120}},
+	}}}
+	s := receivingServer(t, rec)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "127.0.0.1:9090"
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	page := w.Body.String()
+	if !strings.Contains(page, "expired") || !strings.Contains(page, "refundable") {
+		t.Fatal("an expired lock was not shown as expired and refundable")
+	}
+	if strings.Contains(page, "-120s") {
+		t.Fatal("a negative countdown was rendered")
+	}
+}
+
+// The panel is observational: it offers no route that would construct a
+// settlement or a refund. Those are co-signed transitions owned by the
+// coordinator, and a form that could build one would be a second way to move
+// money.
+func TestThePanelOffersNoLockActions(t *testing.T) {
+	rec := &fakeReceiving{channels: []ReceivingChannel{{
+		ID: "aa", Locks: []PendingLock{{ID: "abc", Direction: "incoming",
+			Amount: "100", Status: "claimable", ExpiresIn: 60}},
+	}}}
+	s := receivingServer(t, rec)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "127.0.0.1:9090"
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	page := w.Body.String()
+
+	for _, forbidden := range []string{
+		"/receiving/settle-lock", "/receiving/claim", "/receiving/refund",
+		"LOCK_SETTLE", "LOCK_REFUND", "preimage",
+	} {
+		if strings.Contains(page, forbidden) {
+			t.Fatalf("the panel exposes %q, which would let a form move money", forbidden)
+		}
+	}
+	// And no such routes exist.
+	for _, path := range []string{"/receiving/claim", "/receiving/refund", "/receiving/settle-lock"} {
+		if w := post(t, s, path, url.Values{"channel": {"aa"}}, ""); w.Code != http.StatusNotFound {
+			t.Fatalf("%s answered %d, want 404", path, w.Code)
+		}
+	}
+}

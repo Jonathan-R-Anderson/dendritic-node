@@ -61,6 +61,12 @@ type Coordinator struct {
 
 	sess *PeerSession
 
+	// vault answers "does this node hold the secret for that lock", which is
+	// what separates a claimable payment from one still in flight. Optional.
+	vault *PreimageVault
+	// now is the coordinator's clock, for expiry reasoning.
+	now func() int64
+
 	// adopting serialises chain reads per channel so two concurrent messages
 	// about an unknown channel do not both go and fetch it.
 	adopting sync.Mutex

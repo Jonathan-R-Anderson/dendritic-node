@@ -53,6 +53,8 @@ func (n *routedNode) open(chain *FakeChain, contract Address) {
 		func(raw [32]byte) ([]byte, error) { return n.key.sign(raw), nil })
 	coord.Session().SetClock(func() int64 { return n.clock }, 30, 60)
 	coord.Session().SetPreimageVault(vault)
+	coord.SetPreimageVault(vault)
+	coord.SetClock(func() int64 { return n.clock })
 
 	fwd := NewForwarder(coord, vault, n.key.address())
 	fwd.SetClock(func() int64 { return n.clock }, 3600)
@@ -514,5 +516,206 @@ func TestACorruptVaultStopsTheNode(t *testing.T) {
 	}
 	if _, err := OpenPreimageVault(dir); err == nil {
 		t.Fatal("the node started with a preimage that does not match its hash")
+	}
+}
+
+// ---- what an operator sees while a payment is in flight (P7-c) -----------------
+//
+// Driven through the REAL routing engine rather than injected records: a lock
+// appears because a payment created it, and disappears because that payment
+// resolved. Two independently-built representations of HTLC state would agree
+// in tests and diverge in production.
+
+func TestALockAppearsAndResolvesInTheOperatorView(t *testing.T) {
+	r := newRoute(t, 1000)
+	defer r.stop()
+	ctx := context.Background()
+	preimage, hash := secret("visible")
+
+	// Before anything, B has nothing and nothing pending.
+	before, err := r.b.coord.Exposure(r.downstream)
+	if err != nil {
+		t.Fatalf("exposure: %v", err)
+	}
+	if before.Available != "0" || before.Incoming != "0" {
+		t.Fatalf("B starts at %+v", before)
+	}
+
+	// A pays B through the hub. The lock reaches B.
+	if _, err := r.a.coord.Pay(ctx, r.upstream, intent(1), StateTransition{
+		Kind: KindLockAdd, Amount: anon(100), LockID: [32]byte{31: 1},
+		Hash: hash, Expiry: r.clock + 20000,
+	}, peerAt(r.hub)); err != nil {
+		t.Fatalf("A→Hub: %v", err)
+	}
+	pending := r.hub.fwd.Pending()
+	if _, err := r.hub.fwd.Forward(ctx, pending[0], r.downstream, intent(2), peerAt(r.b)); err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+
+	// B sees value in flight — and it is NOT in the available balance.
+	locks, err := r.b.coord.Locks(r.downstream)
+	if err != nil {
+		t.Fatalf("locks: %v", err)
+	}
+	if len(locks) != 1 {
+		t.Fatalf("B sees %d locks", len(locks))
+	}
+	if !locks[0].Incoming || locks[0].Status != LockWaiting {
+		t.Fatalf("B sees %+v, want an incoming lock waiting", locks[0])
+	}
+	if locks[0].ExpiresIn <= 0 {
+		t.Fatalf("expiry reported as %ds away", locks[0].ExpiresIn)
+	}
+
+	inflight, _ := r.b.coord.Exposure(r.downstream)
+	if inflight.Available != "0" {
+		t.Fatalf("a lock inflated B's available balance to %s", inflight.Available)
+	}
+	if inflight.Incoming != anon(100).String() {
+		t.Fatalf("incoming %s, want 100", inflight.Incoming)
+	}
+	if inflight.Total != anon(100).String() {
+		t.Fatalf("total exposure %s, want 100", inflight.Total)
+	}
+
+	// The hub's view of the SAME payment is the mirror image: its own money out.
+	hubLocks, _ := r.hub.coord.Locks(r.downstream)
+	if len(hubLocks) != 1 || hubLocks[0].Incoming || hubLocks[0].Status != LockOffered {
+		t.Fatalf("the hub sees %+v, want its own outgoing offer", hubLocks)
+	}
+	hubExp, _ := r.hub.coord.Exposure(r.downstream)
+	if hubExp.Outgoing != anon(100).String() {
+		t.Fatalf("hub outgoing %s, want 100 of its own at risk", hubExp.Outgoing)
+	}
+
+	// B settles. The lock leaves the pending view and the value becomes real.
+	if _, err := r.b.coord.Pay(ctx, r.downstream, intent(3), StateTransition{
+		Kind: KindLockSettle, LockID: [32]byte{31: 1}, Preimage: preimage,
+	}, peerAt(r.hub)); err != nil {
+		t.Fatalf("B settle: %v", err)
+	}
+	after, _ := r.b.coord.Exposure(r.downstream)
+	if after.Available != anon(100).String() {
+		t.Fatalf("available %s after settling, want 100", after.Available)
+	}
+	if after.Incoming != "0" {
+		t.Fatalf("incoming %s after settling, want nothing left in flight", after.Incoming)
+	}
+	settled, _ := r.b.coord.Locks(r.downstream)
+	if len(settled) != 0 {
+		t.Fatalf("%d locks still shown after settlement", len(settled))
+	}
+}
+
+// The other ending: nobody settles, the lock expires, and the view says so
+// before the refund and stops saying it afterwards.
+func TestAnExpiringLockIsShownAsRecoverableThenDisappears(t *testing.T) {
+	r := newRoute(t, 1000)
+	defer r.stop()
+	ctx := context.Background()
+	_, hash := secret("never claimed")
+
+	if _, err := r.hub.coord.Pay(ctx, r.downstream, intent(1), StateTransition{
+		Kind: KindLockAdd, Amount: anon(100), LockID: [32]byte{31: 1},
+		Hash: hash, Expiry: r.clock + 5000,
+	}, peerAt(r.b)); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+
+	// Live: the hub's own money, offered.
+	live, _ := r.hub.coord.Locks(r.downstream)
+	if len(live) != 1 || live[0].Status != LockOffered {
+		t.Fatalf("%+v, want offered", live)
+	}
+	// And B, on the other side, is waiting for a secret nobody has.
+	waiting, _ := r.b.coord.Locks(r.downstream)
+	if len(waiting) != 1 || waiting[0].Status != LockWaiting {
+		t.Fatalf("%+v, want waiting", waiting)
+	}
+
+	// Past the expiry the same lock reads differently on each side: recoverable
+	// to the payer, lost to the payee.
+	r.advance(6000)
+	expired, _ := r.hub.coord.Locks(r.downstream)
+	if expired[0].Status != LockRefundable {
+		t.Fatalf("payer sees %s, want refundable", expired[0].Status)
+	}
+	if expired[0].ExpiresIn >= 0 {
+		t.Fatalf("ExpiresIn %d, want negative once past", expired[0].ExpiresIn)
+	}
+	lapsed, _ := r.b.coord.Locks(r.downstream)
+	if lapsed[0].Status != LockLapsed {
+		t.Fatalf("payee sees %s, want lapsed", lapsed[0].Status)
+	}
+
+	// The refund clears it, and the value comes back to available.
+	if problems := r.hub.fwd.RefundExpired(ctx, func([32]byte) (Peer, error) {
+		return peerAt(r.b), nil
+	}); len(problems) != 0 {
+		t.Fatalf("refund: %v", problems)
+	}
+	gone, _ := r.hub.coord.Locks(r.downstream)
+	if len(gone) != 0 {
+		t.Fatalf("%d locks after the refund", len(gone))
+	}
+	exp, _ := r.hub.coord.Exposure(r.downstream)
+	if exp.Available != anon(1000).String() || exp.Outgoing != "0" {
+		t.Fatalf("after refund %+v, want the whole 1000 available and nothing at risk", exp)
+	}
+}
+
+// A hub mid-route holds a secret it has paid for. Its upstream lock reads
+// claimable and its downstream one reads settling — the same secret, opposite
+// meanings, which is the pair an operator most needs to understand.
+func TestAHubMidRouteSeesBothSidesOfOneSecret(t *testing.T) {
+	r := newRoute(t, 1000)
+	defer r.stop()
+	ctx := context.Background()
+	preimage, hash := secret("both sides")
+
+	if _, err := r.a.coord.Pay(ctx, r.upstream, intent(1), StateTransition{
+		Kind: KindLockAdd, Amount: anon(100), LockID: [32]byte{31: 1},
+		Hash: hash, Expiry: r.clock + 20000,
+	}, peerAt(r.hub)); err != nil {
+		t.Fatalf("A→Hub: %v", err)
+	}
+	pending := r.hub.fwd.Pending()
+	if _, err := r.hub.fwd.Forward(ctx, pending[0], r.downstream, intent(2), peerAt(r.b)); err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	// The hub learns the secret the only way it can: by paying downstream.
+	if err := r.hub.vault.Learn(preimage); err != nil {
+		t.Fatalf("learn: %v", err)
+	}
+
+	up, _ := r.hub.coord.Locks(r.upstream)
+	if len(up) != 1 || up[0].Status != LockClaimable {
+		t.Fatalf("upstream %+v, want claimable", up)
+	}
+	down, _ := r.hub.coord.Locks(r.downstream)
+	if len(down) != 1 || down[0].Status != LockSettling {
+		t.Fatalf("downstream %+v, want settling", down)
+	}
+}
+
+// A node with no vault cannot claim anything, and says so rather than implying
+// it could.
+func TestWithoutAVaultNothingReadsAsClaimable(t *testing.T) {
+	r := newRoute(t, 1000)
+	defer r.stop()
+	ctx := context.Background()
+	_, hash := secret("unknowable")
+
+	if _, err := r.a.coord.Pay(ctx, r.upstream, intent(1), StateTransition{
+		Kind: KindLockAdd, Amount: anon(100), LockID: [32]byte{31: 1},
+		Hash: hash, Expiry: r.clock + 20000,
+	}, peerAt(r.hub)); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	r.hub.coord.SetPreimageVault(nil)
+	locks, _ := r.hub.coord.Locks(r.upstream)
+	if len(locks) != 1 || locks[0].Status != LockWaiting {
+		t.Fatalf("%+v, want waiting without a vault", locks)
 	}
 }
