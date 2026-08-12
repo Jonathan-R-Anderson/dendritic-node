@@ -31,6 +31,7 @@ package channel
 // record the measurement and carry on.
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -144,6 +145,73 @@ func (e OperatingEnvelope) Stated() error {
 	return nil
 }
 
+// Canonicality is how a deployment establishes that the headers it reads belong
+// to Ethereum mainnet — roadmap P12-5.
+//
+// A separate axis from the challenge budget, and it gates deployment on its
+// own. No amount of excellent proof verification compensates for an untrusted
+// header: a fabricated chain produces storage proofs that verify perfectly,
+// because they are internally consistent. Post-merge there is no proof-of-work
+// to make fabrication expensive.
+type Canonicality string
+
+const (
+	// CanonicalityUnverified: headers are believed because a provider served
+	// them. Blocks deployment.
+	CanonicalityUnverified Canonicality = "unverified"
+	// CanonicalityVerified: a defined trust anchor validates canonical mainnet
+	// headers — a native verifier or a vendored light client. Which one is in
+	// use must be recorded, because a vendored one puts a third party on the
+	// security path and that is a different risk, not a smaller one.
+	CanonicalityVerified Canonicality = "verified"
+	// CanonicalityAcceptedRisk: unverified, and somebody has said so on the
+	// record. Permitted, but only with the same explicitness the budget terms
+	// require — an unnamed assumption is one nobody audits.
+	CanonicalityAcceptedRisk Canonicality = "accepted-risk"
+)
+
+// HeaderTrust records the canonicality position of a deployment.
+type HeaderTrust struct {
+	Status Canonicality
+	// Implementation names WHAT establishes canonicality — "native sync
+	// committee verifier", "helios sidecar v0.x". Required when verified, so
+	// that a vendored light client cannot pass as a native one.
+	Implementation string
+	// Anchor is where the trust anchor came from. Must not be the RPC being
+	// verified; see ethproof.HeaderVerifier.SetAnchor.
+	Anchor string
+	// AcceptedBy and Reason are required when the risk is being accepted, so
+	// the decision has a name against it.
+	AcceptedBy string
+	Reason     string
+}
+
+// Check reports whether this position permits deployment.
+func (h HeaderTrust) Check() error {
+	switch h.Status {
+	case CanonicalityVerified:
+		if strings.TrimSpace(h.Implementation) == "" {
+			return errors.New(
+				"validation: canonicality claims to be verified but does not say by what")
+		}
+		if strings.TrimSpace(h.Anchor) == "" {
+			return errors.New(
+				"validation: a verifier without a stated trust anchor is not verification")
+		}
+		return nil
+	case CanonicalityAcceptedRisk:
+		if strings.TrimSpace(h.AcceptedBy) == "" || strings.TrimSpace(h.Reason) == "" {
+			return errors.New(
+				"validation: accepting the header-trust risk requires a name and a reason")
+		}
+		return nil
+	default:
+		return errors.New(
+			"validation: header canonicality is UNVERIFIED — a fabricated chain would " +
+				"produce storage proofs that verify. See doc/trust-anchor.md")
+	}
+}
+
 // ValidatedBudget is a budget plus what has been checked about it.
 type ValidatedBudget struct {
 	Budget ChallengeBudget
@@ -153,6 +221,9 @@ type ValidatedBudget struct {
 	// Envelope is the workload and operational commitment the evidence was
 	// gathered under. Evidence outside it does not count.
 	Envelope OperatingEnvelope
+	// Headers is how canonicality is established. Gates deployment on its own,
+	// independently of the challenge budget — see Canonicality.
+	Headers  HeaderTrust
 	Evidence map[string]Evidence
 }
 
@@ -249,6 +320,12 @@ func (v *ValidatedBudget) Unvalidated(now int64) []string {
 // cannot get one while any term is a guess, which is a far stronger guarantee
 // than a person remembering to check.
 func (v *ValidatedBudget) DeployableChallengePeriod(now int64) (int64, error) {
+	// Canonicality first. A perfectly measured challenge period defends a
+	// channel on a chain we cannot prove is Ethereum, which is not a smaller
+	// problem than an unmeasured one.
+	if err := v.Headers.Check(); err != nil {
+		return 0, err
+	}
 	missing := v.Unvalidated(now)
 	if len(missing) > 0 {
 		return 0, fmt.Errorf(

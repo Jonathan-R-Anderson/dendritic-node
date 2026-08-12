@@ -23,6 +23,16 @@ func testEnvelope() OperatingEnvelope {
 	}
 }
 
+// testHeaders is a deployment whose canonicality is settled, so the BUDGET
+// tests reach the budget. Header trust is gated separately — see
+// TestUnverifiedCanonicalityBlocksDeploymentOnItsOwn.
+func testHeaders() HeaderTrust {
+	return HeaderTrust{
+		Status: CanonicalityVerified, Implementation: "test verifier",
+		Anchor: "https://beaconstate.example",
+	}
+}
+
 func goodEvidence(term string, measured time.Duration, now int64) Evidence {
 	return Evidence{
 		Term: term, Measured: measured, Samples: MinEvidenceSamples,
@@ -35,6 +45,8 @@ func goodEvidence(term string, measured time.Duration, now int64) Evidence {
 // refuse to produce a number to deploy with.
 func TestTheSystemIsNotYetDeployable(t *testing.T) {
 	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
+	// Canonicality settled, so this tests the BUDGET half of the gate.
+	v.Headers = testHeaders()
 
 	seconds, err := v.DeployableChallengePeriod(time.Now().Unix())
 	if err == nil {
@@ -53,6 +65,7 @@ func TestAFullyValidatedBudgetIsDeployable(t *testing.T) {
 	now := time.Now().Unix()
 	budget := MainnetChallengeBudget()
 	v := NewValidatedBudget(testChain, budget, testEnvelope())
+	v.Headers = testHeaders()
 
 	for _, term := range v.Budget.Terms() {
 		if _, needs := termsNeedingEvidence[term.Name]; !needs {
@@ -150,6 +163,7 @@ func TestExpiredEvidenceReopensTheGate(t *testing.T) {
 
 	budget := MainnetChallengeBudget()
 	v := NewValidatedBudget(testChain, budget, testEnvelope())
+	v.Headers = testHeaders()
 	for _, term := range v.Budget.Terms() {
 		if _, needs := termsNeedingEvidence[term.Name]; !needs {
 			continue
@@ -270,5 +284,66 @@ func TestDetectionMeasuredOnTheWrongWorkloadIsRejected(t *testing.T) {
 
 	if err := v.Record(e); err == nil {
 		t.Fatal("a 100-channel sweep validated a 100,000-channel deployment")
+	}
+}
+
+// ---- canonicality (P12-5) ---------------------------------------------------
+
+// The gate must refuse on header trust ALONE, however well the budget is
+// measured. A fabricated chain produces storage proofs that verify perfectly.
+func TestUnverifiedCanonicalityBlocksDeploymentOnItsOwn(t *testing.T) {
+	now := time.Now().Unix()
+	v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
+	for _, term := range v.Budget.Terms() {
+		if _, needs := termsNeedingEvidence[term.Name]; !needs {
+			continue
+		}
+		if err := v.Record(goodEvidence(term.Name, term.Dur, now)); err != nil {
+			t.Fatalf("record %q: %v", term.Name, err)
+		}
+	}
+	// Every budget term validated, and still refused.
+	_, err := v.DeployableChallengePeriod(now)
+	if err == nil {
+		t.Fatal("a fully measured budget deployed with unverified headers")
+	}
+	if !strings.Contains(err.Error(), "UNVERIFIED") {
+		t.Errorf("the refusal does not name the problem: %v", err)
+	}
+
+	v.Headers = HeaderTrust{
+		Status: CanonicalityVerified,
+		Implementation: "helios sidecar", Anchor: "https://beaconstate.info",
+	}
+	if _, err := v.DeployableChallengePeriod(now); err != nil {
+		t.Fatalf("still refusing with verified headers: %v", err)
+	}
+}
+
+// "Verified" must say by what and against which anchor, so a vendored light
+// client cannot quietly pass as a native one.
+func TestVerifiedCanonicalityMustNameItself(t *testing.T) {
+	for _, h := range []HeaderTrust{
+		{Status: CanonicalityVerified, Anchor: "https://beaconstate.info"},
+		{Status: CanonicalityVerified, Implementation: "helios"},
+	} {
+		if err := h.Check(); err == nil {
+			t.Errorf("an unnamed verifier passed: %+v", h)
+		}
+	}
+}
+
+// Accepting the risk is allowed, and requires a name against the decision.
+func TestAcceptingTheRiskRequiresANameAndAReason(t *testing.T) {
+	bare := HeaderTrust{Status: CanonicalityAcceptedRisk}
+	if err := bare.Check(); err == nil {
+		t.Fatal("the risk was accepted by nobody in particular")
+	}
+	named := HeaderTrust{
+		Status: CanonicalityAcceptedRisk, AcceptedBy: "operator",
+		Reason: "single-provider pilot, bounded funds",
+	}
+	if err := named.Check(); err != nil {
+		t.Fatalf("a properly recorded acceptance was refused: %v", err)
 	}
 }

@@ -80,6 +80,12 @@ type OnChainChannel struct {
 	fromChain bool
 }
 
+// ErrNotChannelManagerV2 means the address answered, but not in V2's shape.
+//
+// A configuration problem, not a connectivity one. The deployed V1 manager is
+// the likeliest cause: its Channel struct is nine words, not eleven.
+var ErrNotChannelManagerV2 = errors.New("channel: address is not a ChannelManagerV2")
+
 // ChainReader reads authoritative channel facts.
 type ChainReader interface {
 	ReadChannel(ctx context.Context, contract Address, id [32]byte) (OnChainChannel, error)
@@ -172,12 +178,20 @@ func decodeChannelsReturn(id [32]byte, result string) (OnChainChannel, error) {
 	if err != nil {
 		return OnChainChannel{}, fmt.Errorf("%w: result is not hex", ErrChainUnreachable)
 	}
-	// Eleven words is the whole Channel struct. A shorter return means the
-	// address is not the contract we think it is — and reading only the first
-	// five, as this once did, would leave a watchtower silently blind to the
+	// Eleven words is the whole ChannelManagerV2 Channel struct. Reading only
+	// the first five, as this once did, left a watchtower silently blind to the
 	// dispute fields it exists to act on.
+	//
+	// A shorter return means this address is not V2 — the deployed V1 manager
+	// answers with nine. Reported as ErrNotChannelManagerV2 rather than as an
+	// unreachable chain, because the two send an operator to opposite places: a
+	// wrong address is a configuration mistake and a dead RPC is an outage, and
+	// telling somebody their node is down when they typed the wrong contract
+	// wastes the hour that matters.
 	if len(raw) < 11*32 {
-		return OnChainChannel{}, fmt.Errorf("%w: short return (%d bytes)", ErrChainUnreachable, len(raw))
+		return OnChainChannel{}, fmt.Errorf(
+			"%w: got %d bytes (%d words), want 11 words",
+			ErrNotChannelManagerV2, len(raw), len(raw)/32)
 	}
 
 	wordAt := func(i int) []byte { return raw[i*32 : (i+1)*32] }

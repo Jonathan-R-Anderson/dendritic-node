@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 )
@@ -16,11 +17,13 @@ func TestLiveChainReadAgainstTheDeployedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := NewRPCChainReader(os.Getenv("ETH_RPC_URL"))
-	// A channel that certainly does not exist: the getter answers all zeros,
-	// which must decode as "not on chain" rather than as a zero-deposit channel.
 	_, err = r.ReadChannel(context.Background(), contract, [32]byte{0xde, 0xad, 0xbe, 0xef})
-	if err != ErrChannelNotOnChain {
-		t.Fatalf("got %v, want ErrChannelNotOnChain", err)
+
+	// This address is the deployed V1 manager, whose Channel struct is nine
+	// words. A V2 reader must refuse it — and must say WHY in a way that sends
+	// an operator to the address rather than to their RPC.
+	if !errors.Is(err, ErrNotChannelManagerV2) {
+		t.Fatalf("got %v, want ErrNotChannelManagerV2", err)
 	}
-	t.Log("live eth_call reached the contract and decoded an empty channel correctly")
+	t.Log("live eth_call reached the chain; the V1 address was correctly refused as not-V2")
 }
