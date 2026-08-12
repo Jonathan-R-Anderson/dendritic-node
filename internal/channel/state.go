@@ -472,6 +472,10 @@ type Channel struct {
 	// not have one — it stops and preserves the evidence.
 	Conflict *ConflictRecord `json:"conflict,omitempty"`
 
+	// History is the payment log — observability, never authority. See
+	// history.go: a balance is never computed from it.
+	History []PaymentRecord `json:"history,omitempty"`
+
 	// Payout is this node's record of turning off-chain value into on-chain
 	// value. OBSERVABILITY, NOT AUTHORITY: the chain decides what settled, and
 	// the worker asks it rather than trusting this. See settlement.go.
@@ -535,6 +539,9 @@ func (c *Channel) Clone() *Channel {
 		k.Mine = cloneSigned(c.Conflict.Mine)
 		k.Theirs = cloneSigned(c.Conflict.Theirs)
 		out.Conflict = &k
+	}
+	if c.History != nil {
+		out.History = append([]PaymentRecord(nil), c.History...)
 	}
 	if c.Payout != nil {
 		// Copied like everything else here. Sharing the pointer would let

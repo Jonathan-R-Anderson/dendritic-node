@@ -176,6 +176,10 @@ func (s *PeerSession) Propose(id [32]byte, intent [32]byte, tr StateTransition) 
 	if err := s.store.Commit(id, func(c *Channel) error {
 		c.Pending = pending
 		c.NoteSigned(next.Nonce, raw)
+		// Recorded as INITIATED, not as anything better: this node has signed
+		// its half and knows nothing about the other. History follows the
+		// engine rather than anticipating it.
+		c.NotePayment(recordFor(intent, tr, false, PayInitiated, nowOr(s.now)))
 		return nil
 	}); err != nil {
 		return Envelope{}, err
@@ -231,6 +235,7 @@ func (s *PeerSession) HandleAccept(env Envelope) error {
 		}
 		c.NoteApplied(p.Intent, p.State.Nonce)
 		c.Pending = nil
+		c.NotePayment(outcomeRecord(p.Intent, p.Transition, false, p.State.Nonce, nowOr(s.now)))
 		return nil
 	})
 }
@@ -251,6 +256,9 @@ func (s *PeerSession) HandleReject(env Envelope) (RejectCode, error) {
 	}
 	err = s.store.Commit(id, func(c *Channel) error {
 		if c.Pending != nil && hex.EncodeToString(c.Pending.Intent[:]) == body.Intent {
+			rec := recordFor(c.Pending.Intent, c.Pending.Transition, false, PayRejected, nowOr(s.now))
+			rec.ResolvedAt, rec.Detail = nowOr(s.now), string(body.Code)
+			c.NotePayment(rec)
 			// The signed-nonce record deliberately SURVIVES. This node signed
 			// that state; forgetting it would let it sign a different one at the
 			// same nonce later, which is exactly what I4 forbids.
@@ -365,6 +373,9 @@ func (s *PeerSession) HandlePropose(env Envelope) (Envelope, error) {
 		}
 		c.NoteApplied(intent, proposed.Nonce)
 		c.NoteSigned(proposed.Nonce, raw)
+		// From this side the value came inward, so the record is the mirror of
+		// the payer's.
+		c.NotePayment(outcomeRecord(intent, tr, true, proposed.Nonce, nowOr(s.now)))
 		return nil
 	}); err != nil {
 		return s.reject(id, body.Intent, codeFor(err), err.Error())
@@ -515,6 +526,12 @@ func (s *PeerSession) HandleResponse(env Envelope) (ResyncOutcome, error) {
 			// either it completed and this IS it, or it lost to another state.
 			if c.Pending != nil && c.Pending.State.Nonce <= theirs.State.Nonce {
 				c.NoteApplied(c.Pending.Intent, c.Pending.State.Nonce)
+				// THE POINT OF THE HISTORY PHASE: an unknown becomes what it
+				// really was. The state this node just adopted is the evidence,
+				// and it says the payment landed — so the record stops saying
+				// nobody knows.
+				c.NotePayment(outcomeRecord(c.Pending.Intent, c.Pending.Transition,
+					false, c.Pending.State.Nonce, nowOr(s.now)))
 				c.Pending = nil
 			}
 			return nil

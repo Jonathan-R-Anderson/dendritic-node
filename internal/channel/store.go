@@ -398,6 +398,22 @@ type storedConflict struct {
 	TheirsB string      `json:"theirs_sig_b,omitempty"`
 }
 
+// storedPayment is one history entry on disk. Same encoding rules as
+// everything else here: amounts are decimal strings, 32-byte values are hex.
+type storedPayment struct {
+	Intent     string `json:"intent"`
+	Kind       string `json:"kind,omitempty"`
+	Route      string `json:"route,omitempty"`
+	Incoming   bool   `json:"incoming,omitempty"`
+	Amount     string `json:"amount,omitempty"`
+	Status     string `json:"status"`
+	LockID     string `json:"lock_id,omitempty"`
+	Nonce      uint64 `json:"nonce,omitempty"`
+	CreatedAt  int64  `json:"created_at,omitempty"`
+	ResolvedAt int64  `json:"resolved_at,omitempty"`
+	Detail     string `json:"detail,omitempty"`
+}
+
 type storedChannel struct {
 	Version  int         `json:"version"`
 	ID       string      `json:"id"`
@@ -417,6 +433,7 @@ type storedChannel struct {
 	Applied  map[string]uint64 `json:"applied,omitempty"`
 	Pending  *storedPending    `json:"pending,omitempty"`
 	Conflict *storedConflict   `json:"conflict,omitempty"`
+	History  []storedPayment   `json:"history,omitempty"`
 }
 
 func decString(n *big.Int) string {
@@ -482,6 +499,16 @@ func encodeChannel(ch *Channel) ([]byte, error) {
 			State:      encodeStateWire(p.State),
 			Sig:        hex.EncodeToString(p.Sig),
 		}
+	}
+	for _, h := range ch.History {
+		rec.History = append(rec.History, storedPayment{
+			Intent: hex.EncodeToString(h.Intent[:]),
+			Kind:   string(h.Kind), Route: string(h.Route),
+			Incoming: h.Incoming, Amount: h.Amount, Status: string(h.Status),
+			LockID: hex.EncodeToString(h.LockID[:]),
+			Nonce:  h.Nonce, CreatedAt: h.CreatedAt,
+			ResolvedAt: h.ResolvedAt, Detail: h.Detail,
+		})
 	}
 	if c := ch.Conflict; c != nil {
 		rec.Conflict = &storedConflict{
@@ -599,6 +626,22 @@ func decodeChannel(raw []byte) (*Channel, error) {
 			return nil, err
 		}
 		ch.Pending = &PendingProposal{Intent: intent, Transition: tr, State: state, Sig: sig}
+	}
+	for _, h := range rec.History {
+		intent, err := parseBytes32(h.Intent)
+		if err != nil {
+			return nil, err
+		}
+		lockID, err := parseBytes32(h.LockID)
+		if err != nil {
+			return nil, err
+		}
+		ch.History = append(ch.History, PaymentRecord{
+			Intent: intent, Kind: TransitionKind(h.Kind), Route: PayRoute(h.Route),
+			Incoming: h.Incoming, Amount: h.Amount, Status: PayStatus(h.Status),
+			LockID: lockID, Nonce: h.Nonce, CreatedAt: h.CreatedAt,
+			ResolvedAt: h.ResolvedAt, Detail: h.Detail,
+		})
 	}
 	if c := rec.Conflict; c != nil {
 		mine, err := decodeSignedWire(c.Mine, c.MineA, c.MineB)

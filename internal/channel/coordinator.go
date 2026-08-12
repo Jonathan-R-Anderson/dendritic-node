@@ -241,6 +241,16 @@ func (c *Coordinator) Pay(ctx context.Context, id [32]byte, intent [32]byte,
 	if err != nil {
 		// The message may or may not have arrived. Resolving that is resync's
 		// job, not a guess made here — see Recover.
+		//
+		// Recorded as UNKNOWN rather than failed, and deliberately not as a
+		// terminal state: the record is expected to change once Recover
+		// establishes what actually happened.
+		_ = c.store.Update(id, func(ch *Channel) error {
+			rec := recordFor(intent, tr, false, PayUnknown, c.clock())
+			rec.Detail = err.Error()
+			ch.NotePayment(rec)
+			return nil
+		})
 		return PaymentResult{}, err
 	}
 
