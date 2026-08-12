@@ -540,3 +540,219 @@ func TestOnePassCoversEveryChannel(t *testing.T) {
 		t.Fatalf("report %v", report)
 	}
 }
+
+// ---- resolving locks, then taking the money out -------------------------------
+//
+// Two paths, and they are not interchangeable:
+//
+//	cooperative   both parties co-sign LOCK_SETTLE / LOCK_REFUND. The lock
+//	              resolves into balances off chain and no transaction happens.
+//	force close   claimLock / expireLock against the contract, for when the
+//	              counterparty is gone and the channel is closing unilaterally.
+//
+// These test the first, because it is the one every ordinary payment takes.
+
+// LOCK_ADD → settle with the preimage → checkpoint. Value that arrived through
+// a lock can be drawn down like any other.
+func TestALockSettlesThenTheValueIsDrawnDown(t *testing.T) {
+	r := newPayoutRig(t, 1000)
+	ctx := context.Background()
+	if err := r.worker.SetPolicy(r.id, PayoutPolicy{Mode: PayoutOnInterval, IntervalSeconds: 3600}); err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+
+	var preimage [32]byte
+	copy(preimage[:], []byte("a routed tip"))
+	var hash [32]byte
+	copy(hash[:], keccak(preimage[:]))
+
+	r.agree(StateTransition{
+		Kind: KindLockAdd, Amount: anon(120), LockID: [32]byte{31: 1},
+		Hash: hash, Expiry: r.clock + 9000,
+	}, r.me)
+
+	// The peer learned the secret; the settle is CO-SIGNED, not a transaction.
+	r.agree(StateTransition{Kind: KindLockSettle, LockID: [32]byte{31: 1}, Preimage: preimage}, r.peer)
+
+	st := r.channel().Latest.State
+	if len(st.Pending) != 0 {
+		t.Fatal("the lock survived its settlement")
+	}
+	if n := len(r.writer.Calls()); n != 0 {
+		t.Fatalf("%d transactions sent to settle a lock cooperatively", n)
+	}
+	if got := r.channel().BalanceOf(r.peer.address()); got.Cmp(anon(120)) != 0 {
+		t.Fatalf("peer holds %s after the lock settled, want 120", got)
+	}
+
+	// And now that value can be checkpointed out like any other.
+	r.agree(StateTransition{Kind: KindCheckpoint, Amount: anon(120)}, r.peer)
+	r.clock += 4000
+	if outcome, err := r.worker.Settle(ctx, r.id); err != nil || outcome != OutcomeSubmitted {
+		t.Fatalf("checkpoint: %v %v", outcome, err)
+	}
+	calls := r.writer.Calls()
+	if len(calls) != 1 || calls[0].Op != "checkpoint" {
+		t.Fatalf("submitted %+v", calls)
+	}
+	// The channel stays open, so the lock → balance → chain journey did not
+	// cost a close.
+	r.setChainDeposits(anon(880), new(big.Int))
+	r.refresh()
+	if r.channel().Status != StatusOpen {
+		t.Fatal("the channel closed")
+	}
+}
+
+// LOCK_ADD → the expiry passes → refund → close. The payer gets it back and the
+// channel can still be settled normally.
+func TestALockRefundsThenTheChannelCloses(t *testing.T) {
+	r := newPayoutRig(t, 1000)
+	ctx := context.Background()
+
+	r.agree(StateTransition{
+		Kind: KindLockAdd, Amount: anon(120), LockID: [32]byte{31: 1},
+		Hash: [32]byte{31: 9}, Expiry: r.clock + 1000,
+	}, r.me)
+
+	// Nobody ever produced the secret. Past the expiry, the payer takes it back
+	// — again co-signed, not submitted.
+	r.clock += 2000
+	r.agree(StateTransition{Kind: KindLockRefund, LockID: [32]byte{31: 1}}, r.me)
+
+	if len(r.channel().Latest.State.Pending) != 0 {
+		t.Fatal("the lock survived its refund")
+	}
+	if got := r.channel().BalanceOf(r.me.address()); got.Cmp(anon(1000)) != 0 {
+		t.Fatalf("payer holds %s after a refund, want the whole 1000", got)
+	}
+
+	// A close now works, because nothing is outstanding.
+	if err := r.worker.RequestClose(r.id); err != nil {
+		t.Fatalf("request close: %v", err)
+	}
+	if outcome, err := r.worker.Settle(ctx, r.id); err != nil || outcome != OutcomeSubmitted {
+		t.Fatalf("close: %v %v", outcome, err)
+	}
+	if calls := r.writer.Calls(); calls[len(calls)-1].Op != "closeCooperative" {
+		t.Fatalf("submitted %+v", calls)
+	}
+}
+
+// The force-close path: the counterparty is gone, so the locks are resolved
+// against the CONTRACT rather than by agreement.
+func TestResolveLocksGoesToTheChainWhenNobodyWillCoSign(t *testing.T) {
+	r := newPayoutRig(t, 1000)
+	ctx := context.Background()
+
+	var preimage [32]byte
+	copy(preimage[:], []byte("known"))
+	var hash [32]byte
+	copy(hash[:], keccak(preimage[:]))
+
+	r.agree(StateTransition{
+		Kind: KindLockAdd, Amount: anon(100), LockID: [32]byte{31: 1},
+		Hash: hash, Expiry: r.clock + 9000,
+	}, r.me)
+	r.agree(StateTransition{
+		Kind: KindLockAdd, Amount: anon(50), LockID: [32]byte{31: 2},
+		Hash: [32]byte{31: 0xee}, Expiry: r.clock + 100,
+	}, r.me)
+
+	// One secret is known; the other lock has expired.
+	r.clock += 500
+	claimed, refunded, err := r.worker.ResolveLocks(ctx, r.id,
+		map[[32]byte][32]byte{hash: preimage})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if claimed != 1 || refunded != 1 {
+		t.Fatalf("claimed %d refunded %d, want 1 and 1", claimed, refunded)
+	}
+
+	ops := map[string]int{}
+	for _, c := range r.writer.Calls() {
+		ops[c.Op]++
+	}
+	if ops["claimLock"] != 1 || ops["expireLock"] != 1 {
+		t.Fatalf("calls %v", ops)
+	}
+}
+
+// A lock that is neither openable nor expired is somebody's live claim, and is
+// left exactly where it is.
+func TestALiveUnopenableLockIsLeftAlone(t *testing.T) {
+	r := newPayoutRig(t, 1000)
+	r.agree(StateTransition{
+		Kind: KindLockAdd, Amount: anon(100), LockID: [32]byte{31: 1},
+		Hash: [32]byte{31: 0xaa}, Expiry: r.clock + 9000,
+	}, r.me)
+
+	claimed, refunded, err := r.worker.ResolveLocks(context.Background(), r.id, nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if claimed != 0 || refunded != 0 {
+		t.Fatalf("claimed %d refunded %d, want nothing touched", claimed, refunded)
+	}
+	if n := len(r.writer.Calls()); n != 0 {
+		t.Fatalf("%d transactions sent against a live lock", n)
+	}
+}
+
+// ---- the regression class the Clone bug belongs to ---------------------------
+
+// Every money-bearing field must survive Clone independently of the original.
+//
+// Written to fail loudly when a NEW field is added and forgotten: the Payout
+// field was added late and shared its pointer, which let Store.Update's trial
+// mutate the live record before the write it was trialling had succeeded. Add a
+// field, add it here.
+func TestCloneSharesNothingMutable(t *testing.T) {
+	r := newPayoutRig(t, 1000)
+	r.agree(StateTransition{Kind: KindPay, Amount: anon(100)}, r.me)
+	if err := r.worker.SetPolicy(r.id, PayoutPolicy{Mode: PayoutOnInterval, IntervalSeconds: 60}); err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+	if err := r.store.Update(r.id, func(c *Channel) error {
+		c.NoteSigned(99, [32]byte{1})
+		c.NoteApplied([32]byte{2}, 1)
+		c.Pending = &PendingProposal{Intent: [32]byte{3}, State: State{Nonce: 99}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	live := r.channel()
+	clone := live.Clone()
+
+	// Mutate every mutable thing on the clone.
+	clone.DepositA.SetInt64(1)
+	clone.DepositB.SetInt64(1)
+	clone.ChainID.SetInt64(999)
+	clone.Latest.State.BalanceA.SetInt64(1)
+	clone.Latest.State.Nonce = 4242
+	clone.Signed[99] = [32]byte{0xff}
+	clone.Applied[[32]byte{2}] = 4242
+	clone.Pending.State.Nonce = 4242
+	clone.Payout.Phase = PhaseConfirmed
+	clone.Payout.DueAt = 4242
+
+	again := r.channel()
+	switch {
+	case again.DepositA.Cmp(live.DepositA) != 0, again.DepositB.Cmp(live.DepositB) != 0:
+		t.Fatal("deposits are shared")
+	case again.ChainID.Cmp(big.NewInt(1)) != 0:
+		t.Fatal("chain id is shared")
+	case again.Latest.State.Nonce == 4242:
+		t.Fatal("the latest state is shared")
+	case again.Signed[99] == [32]byte{0xff}:
+		t.Fatal("the signed-nonce ledger is shared")
+	case again.Applied[[32]byte{2}] == 4242:
+		t.Fatal("the applied-intent set is shared")
+	case again.Pending != nil && again.Pending.State.Nonce == 4242:
+		t.Fatal("the pending proposal is shared")
+	case again.Payout != nil && (again.Payout.Phase == PhaseConfirmed || again.Payout.DueAt == 4242):
+		t.Fatal("the payout record is shared")
+	}
+}

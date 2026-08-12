@@ -10,7 +10,9 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -400,5 +402,160 @@ func TestListingChannelsShowsWhatIsTracked(t *testing.T) {
 	list, _ := body["channels"].([]any)
 	if code != http.StatusOK || len(list) != 1 {
 		t.Fatalf("status %d, %d channels", code, len(list))
+	}
+}
+
+// ---- the settlement routes ------------------------------------------------------
+
+// payoutAPI wires a node whose channel can actually be settled.
+func payoutAPI(t *testing.T) (*http.Client, string, *payoutRig, func()) {
+	t.Helper()
+	r := newPayoutRig(t, 1000)
+	coord := NewCoordinator(r.store, r.chain, big.NewInt(1), Address{}, r.me.address(),
+		func(raw [32]byte) ([]byte, error) { return r.me.sign(raw), nil })
+	api, err := NewAPI(coord, func(_ [32]byte, _ Address) (Peer, error) {
+		return nil, errors.New("no peer needed")
+	}, testToken)
+	if err != nil {
+		t.Fatalf("NewAPI: %v", err)
+	}
+	srv := httptest.NewServer(api.WithPayout(r.worker).Handler())
+	return srv.Client(), srv.URL, r, srv.Close
+}
+
+// A caller asks for a close. It does not supply balances, a nonce, a withdrawal
+// or a signature — there is no field for any of them.
+func TestClosingAChannelOverHTTP(t *testing.T) {
+	c, base, r, stop := payoutAPI(t)
+	defer stop()
+	r.agree(StateTransition{Kind: KindPay, Amount: anon(100)}, r.me)
+
+	code, body := do(t, c, http.MethodPost, base+"/v1/channels/"+hexID(r.id)+"/payout/close", nil, testToken)
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %v", code, body)
+	}
+	if body["outcome"] != string(OutcomeSubmitted) {
+		t.Fatalf("outcome %v", body["outcome"])
+	}
+	calls := r.writer.Calls()
+	if len(calls) != 1 || calls[0].Op != "closeCooperative" {
+		t.Fatalf("submitted %+v", calls)
+	}
+}
+
+func TestSettingAPayoutPolicyOverHTTP(t *testing.T) {
+	c, base, r, stop := payoutAPI(t)
+	defer stop()
+
+	code, body := do(t, c, http.MethodPost, base+"/v1/channels/"+hexID(r.id)+"/payout/policy",
+		payoutPolicyRequest{Mode: PayoutOnInterval, IntervalSeconds: 3600}, testToken)
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %v", code, body)
+	}
+	if body["mode"] != string(PayoutOnInterval) {
+		t.Fatalf("mode %v", body["mode"])
+	}
+
+	// A checkpoint the parties agreed to is then submitted on demand.
+	r.agree(StateTransition{Kind: KindPay, Amount: anon(100)}, r.me)
+	r.agree(StateTransition{Kind: KindCheckpoint, Amount: anon(75)}, r.peer)
+	r.clock += 4000
+
+	code, body = do(t, c, http.MethodPost, base+"/v1/channels/"+hexID(r.id)+"/payout/run", nil, testToken)
+	if code != http.StatusOK {
+		t.Fatalf("run status %d: %v", code, body)
+	}
+	calls := r.writer.Calls()
+	if len(calls) != 1 || calls[0].Op != "checkpoint" {
+		t.Fatalf("submitted %+v, want a checkpoint", calls)
+	}
+}
+
+func TestAnInvalidPolicyIsRefused(t *testing.T) {
+	c, base, r, stop := payoutAPI(t)
+	defer stop()
+	for _, tc := range []payoutPolicyRequest{
+		{Mode: "hourly-ish"},
+		{Mode: PayoutOnInterval}, // no interval given
+	} {
+		if code, _ := do(t, c, http.MethodPost,
+			base+"/v1/channels/"+hexID(r.id)+"/payout/policy", tc, testToken); code != http.StatusBadRequest {
+			t.Fatalf("%+v answered %d, want 400", tc, code)
+		}
+	}
+}
+
+// A settlement that cannot complete comes back WITH its outcome, so a caller can
+// tell "not due" from "the RPC is down" from "locks outstanding".
+func TestAnUnfinishedSettlementReportsItsOutcome(t *testing.T) {
+	c, base, r, stop := payoutAPI(t)
+	defer stop()
+
+	r.agree(StateTransition{Kind: KindPay, Amount: anon(200)}, r.me)
+	r.agree(StateTransition{
+		Kind: KindLockAdd, Amount: anon(50), LockID: [32]byte{31: 1},
+		Hash: [32]byte{31: 9}, Expiry: r.clock + 9000,
+	}, r.me)
+
+	code, body := do(t, c, http.MethodPost, base+"/v1/channels/"+hexID(r.id)+"/payout/close", nil, testToken)
+	if code != http.StatusAccepted {
+		t.Fatalf("status %d, want 202: %v", code, body)
+	}
+	if body["outcome"] != string(OutcomeLocksPending) {
+		t.Fatalf("outcome %v, want LOCKS_PENDING", body["outcome"])
+	}
+	if body["error"] == nil {
+		t.Fatal("no reason given")
+	}
+	if n := len(r.writer.Calls()); n != 0 {
+		t.Fatalf("%d transactions sent with a lock outstanding", n)
+	}
+}
+
+func TestPayoutStatusIsReadable(t *testing.T) {
+	c, base, r, stop := payoutAPI(t)
+	defer stop()
+	code, body := do(t, c, http.MethodGet, base+"/v1/channels/"+hexID(r.id)+"/payout", nil, testToken)
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %v", code, body)
+	}
+	if body["phase"] != string(PhaseNone) {
+		t.Fatalf("phase %v", body["phase"])
+	}
+	if body["locked"] != "0" {
+		t.Fatalf("locked %v — amounts must be decimal strings", body["locked"])
+	}
+}
+
+// A node with no settlement worker says so rather than accepting a request it
+// will never act on.
+func TestSettlementRoutesRefuseWithoutAWorker(t *testing.T) {
+	payer, _, id := wiredPair(t, anon(500))
+	api, err := NewAPI(payer.coord, nil, testToken)
+	if err != nil {
+		t.Fatalf("NewAPI: %v", err)
+	}
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	for _, path := range []string{"/payout", "/payout/close", "/payout/run"} {
+		method := http.MethodPost
+		if path == "/payout" {
+			method = http.MethodGet
+		}
+		if code, _ := do(t, srv.Client(), method,
+			srv.URL+"/v1/channels/"+hexID(id)+path, nil, testToken); code != http.StatusNotImplemented {
+			t.Fatalf("%s answered %d, want 501", path, code)
+		}
+	}
+}
+
+func TestSettlementRoutesNeedTheToken(t *testing.T) {
+	c, base, r, stop := payoutAPI(t)
+	defer stop()
+	for _, path := range []string{"/payout", "/payout/policy", "/payout/close", "/payout/run"} {
+		if code, _ := do(t, c, http.MethodPost, base+"/v1/channels/"+hexID(r.id)+path, nil, ""); code != http.StatusUnauthorized {
+			t.Fatalf("%s answered %d without a token", path, code)
+		}
 	}
 }

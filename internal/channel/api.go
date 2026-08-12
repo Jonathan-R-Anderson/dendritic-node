@@ -62,8 +62,9 @@ type PeerResolver func(id [32]byte, counterparty Address) (Peer, error)
 
 // API is the HTTP surface.
 type API struct {
-	coord *Coordinator
-	peers PeerResolver
+	coord  *Coordinator
+	payout *PayoutWorker
+	peers  PeerResolver
 
 	// token is required. An unauthenticated payment API is not a smaller
 	// version of a secure one.
@@ -83,6 +84,11 @@ func NewAPI(coord *Coordinator, peers PeerResolver, token string) (*API, error) 
 	}
 	return &API{coord: coord, peers: peers, token: token}, nil
 }
+
+// WithPayout enables the settlement routes. Without a worker they answer 501:
+// a node that cannot pay gas should say so rather than accept a request it will
+// silently never act on.
+func (a *API) WithPayout(w *PayoutWorker) *API { a.payout = w; return a }
 
 // Handler returns the routes.
 func (a *API) Handler() http.Handler {
@@ -203,6 +209,14 @@ func (a *API) channelRoutes(w http.ResponseWriter, r *http.Request) {
 		a.pay(w, r, id)
 	case "recover":
 		a.recover(w, r, id)
+	case "payout":
+		a.payoutStatus(w, r, id)
+	case "payout/policy":
+		a.payoutPolicy(w, r, id)
+	case "payout/close":
+		a.payoutClose(w, r, id)
+	case "payout/run":
+		a.payoutRun(w, r, id)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such action"})
 	}
@@ -422,4 +436,132 @@ func (a *API) peerFor(r *http.Request, id [32]byte) (Peer, error) {
 		counterparty = ch.PartyB
 	}
 	return a.peers(id, counterparty)
+}
+
+// ---- settlement ----------------------------------------------------------------
+//
+// As thin as the payment routes, and for the same reason. A caller asks for
+// "checkpoint this channel" or "close this channel"; it does not supply
+// balances, a nonce, withdrawal amounts, signatures or calldata. Those are
+// consequences of the current signed state and the recipient's policy, and
+// letting a caller name them would put the state machine back on the far side
+// of an HTTP request.
+
+func (a *API) requirePayout(w http.ResponseWriter) bool {
+	if a.payout == nil {
+		writeJSON(w, http.StatusNotImplemented,
+			map[string]string{"error": "this node has no settlement worker configured"})
+		return false
+	}
+	return true
+}
+
+func (a *API) payoutStatus(w http.ResponseWriter, r *http.Request, id [32]byte) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only"})
+		return
+	}
+	if !a.requirePayout(w) {
+		return
+	}
+	status, err := a.payout.Status(id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+type payoutPolicyRequest struct {
+	Mode PayoutMode `json:"mode"`
+	// IntervalSeconds applies to interval mode.
+	IntervalSeconds int64 `json:"interval_seconds,omitempty"`
+}
+
+func (a *API) payoutPolicy(w http.ResponseWriter, r *http.Request, id [32]byte) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
+		return
+	}
+	if !a.requirePayout(w) {
+		return
+	}
+	var req payoutPolicyRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed body"})
+		return
+	}
+	switch req.Mode {
+	case PayoutOnClose:
+	case PayoutOnInterval:
+		if req.IntervalSeconds <= 0 {
+			writeJSON(w, http.StatusBadRequest,
+				map[string]string{"error": "interval mode needs a positive interval_seconds"})
+			return
+		}
+	default:
+		writeJSON(w, http.StatusBadRequest,
+			map[string]string{"error": "mode must be on_close or interval"})
+		return
+	}
+	if err := a.payout.SetPolicy(id, PayoutPolicy{
+		Mode: req.Mode, IntervalSeconds: req.IntervalSeconds,
+	}); err != nil {
+		writeErr(w, err)
+		return
+	}
+	status, err := a.payout.Status(id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// payoutClose asks for the money now, whatever the schedule says.
+func (a *API) payoutClose(w http.ResponseWriter, r *http.Request, id [32]byte) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
+		return
+	}
+	if !a.requirePayout(w) {
+		return
+	}
+	if err := a.payout.RequestClose(id); err != nil {
+		writeErr(w, err)
+		return
+	}
+	a.runPayout(w, r, id)
+}
+
+// payoutRun advances a channel's settlement one step. What the scheduled worker
+// does, exposed so an operator can push it.
+func (a *API) payoutRun(w http.ResponseWriter, r *http.Request, id [32]byte) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
+		return
+	}
+	if !a.requirePayout(w) {
+		return
+	}
+	a.runPayout(w, r, id)
+}
+
+func (a *API) runPayout(w http.ResponseWriter, r *http.Request, id [32]byte) {
+	outcome, err := a.payout.Settle(r.Context(), id)
+	status, statusErr := a.payout.Status(id)
+
+	body := map[string]any{"outcome": string(outcome)}
+	if statusErr == nil {
+		body["payout"] = status
+	}
+	if err != nil {
+		// A settlement that could not complete is reported WITH its outcome, so
+		// a caller can tell "not due" from "the RPC is down" from "there are
+		// locks outstanding" — three situations with three different answers.
+		body["error"] = err.Error()
+		writeJSON(w, http.StatusAccepted, body)
+		return
+	}
+	writeJSON(w, http.StatusOK, body)
 }
