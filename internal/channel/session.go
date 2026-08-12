@@ -50,9 +50,34 @@ var (
 // tests it is a key.
 type StateSigner func(raw [32]byte) ([]byte, error)
 
-// PeerSession drives the protocol for one node over one store.
+// Committer is the only way this layer reaches persisted state.
+//
+// Deliberately two methods and no more. PeerSession decodes, sequences and
+// signs; it does not decide what a channel is, does not read the chain, and
+// cannot reach past this interface to a map. In production the Coordinator
+// implements it and adds the checks that make a channel real — see roadmap
+// invariant P5-2, one component turns a message into money.
+//
+// *Store satisfies it too, which is what keeps the protocol tests able to run
+// without a coordinator or a chain.
+type Committer interface {
+	// Channel returns a snapshot. A copy, never the live record.
+	Channel(id [32]byte) (*Channel, bool)
+	// Commit applies a change atomically, or applies none of it.
+	Commit(id [32]byte, mutate func(*Channel) error) error
+}
+
+// Channel makes *Store a Committer.
+func (s *Store) Channel(id [32]byte) (*Channel, bool) { return s.Get(id) }
+
+// Commit makes *Store a Committer.
+func (s *Store) Commit(id [32]byte, mutate func(*Channel) error) error {
+	return s.Update(id, mutate)
+}
+
+// PeerSession drives the protocol for one node.
 type PeerSession struct {
-	store *Store
+	store Committer
 	self  Address
 	sign  StateSigner
 
@@ -69,7 +94,7 @@ type PeerSession struct {
 
 // NewPeerSession builds an engine. self must be a party to every channel it is used
 // with, and sign must produce that party's signatures.
-func NewPeerSession(store *Store, self Address, sign StateSigner) *PeerSession {
+func NewPeerSession(store Committer, self Address, sign StateSigner) *PeerSession {
 	return &PeerSession{
 		store: store, self: self, sign: sign,
 		now:           func() int64 { return time.Now().Unix() },
@@ -96,7 +121,7 @@ func (s *PeerSession) SetClock(now func() int64, skew, minLockWindow int64) {
 // returns byte-identical messages (§5), which is what makes a retry a retry
 // rather than a second payment.
 func (s *PeerSession) Propose(id [32]byte, intent [32]byte, tr StateTransition) (Envelope, error) {
-	ch, ok := s.store.Get(id)
+	ch, ok := s.store.Channel(id)
 	if !ok {
 		return Envelope{}, ErrNoSuchChannel
 	}
@@ -137,7 +162,7 @@ func (s *PeerSession) Propose(id [32]byte, intent [32]byte, tr StateTransition) 
 	pending := &PendingProposal{Intent: intent, Transition: tr, State: next, Sig: sig}
 
 	// Persisted BEFORE the caller can send it (I5).
-	if err := s.store.Update(id, func(c *Channel) error {
+	if err := s.store.Commit(id, func(c *Channel) error {
 		c.Pending = pending
 		c.NoteSigned(next.Nonce, raw)
 		return nil
@@ -166,7 +191,7 @@ func (s *PeerSession) HandleAccept(env Envelope) error {
 	if err := env.Body_(&body); err != nil {
 		return err
 	}
-	ch, ok := s.store.Get(id)
+	ch, ok := s.store.Channel(id)
 	if !ok {
 		return ErrNoSuchChannel
 	}
@@ -189,7 +214,7 @@ func (s *PeerSession) HandleAccept(env Envelope) error {
 	}
 	complete := assemble(ch, p.State, p.Sig, s.self, theirs)
 
-	return s.store.Update(id, func(c *Channel) error {
+	return s.store.Commit(id, func(c *Channel) error {
 		if err := c.Accept(complete); err != nil {
 			return err
 		}
@@ -213,7 +238,7 @@ func (s *PeerSession) HandleReject(env Envelope) (RejectCode, error) {
 	if err := env.Body_(&body); err != nil {
 		return "", err
 	}
-	err = s.store.Update(id, func(c *Channel) error {
+	err = s.store.Commit(id, func(c *Channel) error {
 		if c.Pending != nil && hex.EncodeToString(c.Pending.Intent[:]) == body.Intent {
 			// The signed-nonce record deliberately SURVIVES. This node signed
 			// that state; forgetting it would let it sign a different one at the
@@ -241,7 +266,7 @@ func (s *PeerSession) HandlePropose(env Envelope) (Envelope, error) {
 	}
 	intent := intentOf(body.Intent)
 
-	ch, ok := s.store.Get(id)
+	ch, ok := s.store.Channel(id)
 	if !ok {
 		return s.reject(id, body.Intent, RejectUnknownChannel, "no such channel")
 	}
@@ -310,7 +335,7 @@ func (s *PeerSession) HandlePropose(env Envelope) (Envelope, error) {
 
 	// Persist the COMPLETE state before the signature leaves (I5). Accept runs
 	// the §4.1 checks; a failure here is a refusal, mapped to its code.
-	if err := s.store.Update(id, func(c *Channel) error {
+	if err := s.store.Commit(id, func(c *Channel) error {
 		if err := c.Accept(complete); err != nil {
 			return err
 		}
@@ -321,7 +346,7 @@ func (s *PeerSession) HandlePropose(env Envelope) (Envelope, error) {
 		return s.reject(id, body.Intent, codeFor(err), err.Error())
 	}
 
-	fresh, _ := s.store.Get(id)
+	fresh, _ := s.store.Channel(id)
 	return s.acceptEnvelope(fresh, body.Intent, proposed.Nonce)
 }
 
@@ -397,7 +422,7 @@ func (s *PeerSession) HandleRequest(env Envelope) (Envelope, error) {
 	if err != nil {
 		return Envelope{}, err
 	}
-	ch, ok := s.store.Get(id)
+	ch, ok := s.store.Channel(id)
 	if !ok {
 		return Envelope{}, ErrNoSuchChannel
 	}
@@ -442,7 +467,7 @@ func (s *PeerSession) HandleResponse(env Envelope) (ResyncOutcome, error) {
 	if err := env.Body_(&body); err != nil {
 		return "", err
 	}
-	ch, ok := s.store.Get(id)
+	ch, ok := s.store.Channel(id)
 	if !ok {
 		return "", ErrNoSuchChannel
 	}
@@ -458,7 +483,7 @@ func (s *PeerSession) HandleResponse(env Envelope) (ResyncOutcome, error) {
 	switch {
 	case theirs.State.Nonce > ch.Latest.State.Nonce:
 		// The whole §4.1 validation, inside Accept. Not just the signatures.
-		if err := s.store.Update(id, func(c *Channel) error {
+		if err := s.store.Commit(id, func(c *Channel) error {
 			if err := c.Accept(theirs); err != nil {
 				return err
 			}
@@ -484,7 +509,7 @@ func (s *PeerSession) HandleResponse(env Envelope) (ResyncOutcome, error) {
 		return ResyncSame, nil
 	}
 	mine := ch.Latest
-	if err := s.store.Update(id, func(c *Channel) error {
+	if err := s.store.Commit(id, func(c *Channel) error {
 		c.Conflict = &ConflictRecord{Nonce: theirs.State.Nonce, Mine: mine, Theirs: theirs}
 		c.Pending = nil
 		return nil
@@ -498,7 +523,7 @@ func (s *PeerSession) HandleResponse(env Envelope) (ResyncOutcome, error) {
 // same-nonce conflict. Both states travel because together they are the proof;
 // either alone is just a state.
 func (s *PeerSession) ConflictMessage(id [32]byte) (Envelope, error) {
-	ch, ok := s.store.Get(id)
+	ch, ok := s.store.Channel(id)
 	if !ok {
 		return Envelope{}, ErrNoSuchChannel
 	}
@@ -551,7 +576,7 @@ func (s *PeerSession) HandleConflict(env Envelope) (bool, error) {
 		return false, errors.New("scpp: the two states are identical; not a conflict")
 	}
 
-	ch, ok := s.store.Get(id)
+	ch, ok := s.store.Channel(id)
 	if !ok {
 		return false, ErrNoSuchChannel
 	}
@@ -564,7 +589,7 @@ func (s *PeerSession) HandleConflict(env Envelope) (bool, error) {
 		}
 	}
 
-	if err := s.store.Update(id, func(c *Channel) error {
+	if err := s.store.Commit(id, func(c *Channel) error {
 		c.Conflict = &ConflictRecord{Nonce: theirs.State.Nonce, Mine: ours, Theirs: theirs}
 		c.Pending = nil
 		return nil
@@ -606,7 +631,7 @@ func (s *PeerSession) verifyBothParties(ch *Channel, ss SignedState) error {
 // abandon it: the peer may hold a fully signed state. So it asks — which is
 // safe, because adoption only ever moves forward.
 func (s *PeerSession) Resume(id [32]byte) (Envelope, bool, error) {
-	ch, ok := s.store.Get(id)
+	ch, ok := s.store.Channel(id)
 	if !ok {
 		return Envelope{}, false, ErrNoSuchChannel
 	}
