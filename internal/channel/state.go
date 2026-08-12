@@ -449,6 +449,11 @@ type Channel struct {
 	// states at one nonce cannot be reconciled by any rule, so the protocol does
 	// not have one — it stops and preserves the evidence.
 	Conflict *ConflictRecord `json:"conflict,omitempty"`
+
+	// Payout is this node's record of turning off-chain value into on-chain
+	// value. OBSERVABILITY, NOT AUTHORITY: the chain decides what settled, and
+	// the worker asks it rather than trusting this. See settlement.go.
+	Payout *PayoutRecord `json:"payout,omitempty"`
 }
 
 // PendingProposal is the payer's half-finished payment.
