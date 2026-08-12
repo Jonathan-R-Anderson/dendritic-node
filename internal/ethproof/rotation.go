@@ -201,6 +201,13 @@ func (s *LightClientState) ApplyRotatingUpdate(u *Update, v SyncCommitteeVerifie
 	// 5. Everything passed. Only now is anything written.
 	previousPeriod := s.Period()
 	s.FinalizedHeader = u.FinalizedHeader
+	// The attested header was signed by the committee, so it is Verified — a
+	// weaker claim than the finalised one above, recorded separately because
+	// the two levels must never be read off the same field.
+	if !s.optimistic.known || u.AttestedHeader.Slot > s.optimistic.header.Slot {
+		s.optimistic.header = u.AttestedHeader
+		s.optimistic.known = true
+	}
 
 	if newPeriod := s.Period(); newPeriod > previousPeriod {
 		// The head crossed a boundary: the committee that was "next" is now

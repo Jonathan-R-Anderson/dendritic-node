@@ -176,6 +176,10 @@ type LightClientState struct {
 	NextCommittee *SyncCommittee
 	// Checkpoint is the sealed anchor everything descends from.
 	Checkpoint Checkpoint
+	// optimistic is the newest committee-signed but NOT finalised header.
+	// Unexported so nothing outside this package can raise a header's trust
+	// level by assignment — see finality.go.
+	optimistic optimisticState
 	// Spec is the fork whose container layout is in force. Carried on the state
 	// rather than assumed, because the generalized indices are positions in
 	// containers that changed shape across forks — a branch verified at a stale
