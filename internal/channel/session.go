@@ -90,7 +90,18 @@ type PeerSession struct {
 	// will accept it. A lock expiring in four seconds is structurally valid and
 	// worthless — see §4.2 check 11 and §9.
 	minLockWindow int64
+
+	// vault remembers preimages this node learns. Optional for a leaf that
+	// never forwards; REQUIRED for a hub, because a forwarded payment's only
+	// route to being made whole upstream is the secret it learned downstream.
+	vault *PreimageVault
 }
+
+// SetPreimageVault gives this session somewhere durable to remember secrets.
+//
+// Without one a node still pays and gets paid; it just cannot safely FORWARD,
+// because forwarding means being owed upstream on a secret learned downstream.
+func (s *PeerSession) SetPreimageVault(v *PreimageVault) { s.vault = v }
 
 // NewPeerSession builds an engine. self must be a party to every channel it is used
 // with, and sign must produce that party's signatures.
@@ -318,6 +329,19 @@ func (s *PeerSession) HandlePropose(env Envelope) (Envelope, error) {
 	// deliberately does not have.
 	if code, detail := s.checkTiming(ch, tr, proposed); code != "" {
 		return s.reject(id, body.Intent, code, detail)
+	}
+
+	// THE SECRET GOES TO DISK BEFORE THIS NODE SIGNS ANYTHING AWAY.
+	//
+	// Signing a LOCK_SETTLE is paying out downstream. If the preimage were only
+	// remembered after — or in the same write that could fail halfway — a crash
+	// here would leave this node having paid and unable to claim upstream, which
+	// nothing later can repair. Preimage first, deliberately: a secret stored
+	// for a lock that never settles costs nothing.
+	if tr.Kind == KindLockSettle && s.vault != nil {
+		if err := s.vault.Learn(tr.Preimage); err != nil {
+			return Envelope{}, fmt.Errorf("scpp: refusing to settle a lock this node cannot remember the secret for: %w", err)
+		}
 	}
 
 	// I4 before signing.
