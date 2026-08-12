@@ -10,11 +10,16 @@ package channel
 //	reorg depth   measurable here, read-only, by watching the head
 //	rpc failure   measurable here, read-only, by watching the endpoints
 //
-//	inclusion     NOT measurable here. Needs transactions actually sent on the
-//	repricing     target chain from a funded account, because the thing being
-//	              measured is what the network does with a real transaction.
-//	              A read-only probe can observe fee markets and block times,
-//	              which is context, not evidence.
+//	inclusion     Not measurable READ-ONLY. Needs transactions actually sent on
+//	repricing     the target chain from a funded account, because the thing
+//	              being measured is what the network does with a real
+//	              transaction. A read-only probe can observe fee markets and
+//	              block times, which is context, not evidence.
+//
+//	              InclusionObservation below therefore only SCORES a run that
+//	              something else performed; it deliberately cannot broadcast.
+//	              Keeping the spending out of this file is what stops a probe
+//	              from quietly acquiring a funded key.
 //
 //	detection     measurable, but by running the watchtower at the channel
 //	              count this deployment will hold — not by asking the chain.
@@ -26,7 +31,9 @@ package channel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -252,6 +259,81 @@ func (o ReorgObservation) AsEvidence(chainID int64, takenAt int64) (Evidence, er
 		ChainID: chainID, TakenAt: takenAt,
 		Method: fmt.Sprintf("head-tracking over %d blocks; %d reorgs, deepest %d blocks at %s spacing",
 			o.Blocks, o.Reorgs, o.MaxDepth, o.BlockInterval),
+	}, nil
+}
+
+// InclusionSample is one broadcast-to-confirmation observation.
+//
+// BlocksWaited is carried alongside Delay because the two fail differently:
+// Delay is measured against the including block's timestamp and so depends on
+// the local clock being roughly right, while BlocksWaited is read entirely off
+// the chain. When they disagree, the block count is the one to believe.
+type InclusionSample struct {
+	TxHash       string
+	Delay        time.Duration
+	BlocksWaited uint64
+	// Confirmed is false for a transaction that was broadcast and then gave up
+	// waiting. See InclusionObservation.AsEvidence for why this matters.
+	Confirmed bool
+	// BaseFeeGwei is what the fee market looked like at broadcast, recorded so
+	// a later reader can see which regime the number came from.
+	BaseFeeGwei float64
+}
+
+// InclusionObservation is a run of inclusion samples against a real chain.
+type InclusionObservation struct {
+	Samples []InclusionSample
+	// Endpoint is the provider the transactions were broadcast through, for
+	// provenance. Not a security input — inclusion is a property of the chain,
+	// and a lying endpoint would show up as a transaction that never confirms.
+	Endpoint string
+	// Account is the PUBLIC address the measurements were sent from.
+	Account string
+}
+
+// AsEvidence turns an inclusion run into a validation record.
+//
+// Refuses when any sample was abandoned unconfirmed. This is the same mistake
+// ReorgObservation.AsEvidence guards against, wearing different clothes: taking
+// the maximum over the transactions that DID confirm silently discards the ones
+// that did not, and those are precisely the observations the worst case is made
+// of. A run with one abandoned transaction has an unknown worst case, not a
+// worst case equal to its slowest success.
+func (o InclusionObservation) AsEvidence(chainID int64, takenAt int64) (Evidence, error) {
+	if len(o.Samples) == 0 {
+		return Evidence{}, errors.New("chainprobe: no inclusion samples")
+	}
+	var worst time.Duration
+	var worstBlocks, abandoned uint64
+	minFee, maxFee := math.Inf(1), math.Inf(-1)
+	for _, s := range o.Samples {
+		if !s.Confirmed {
+			abandoned++
+			continue
+		}
+		if s.Delay > worst {
+			worst = s.Delay
+		}
+		if s.BlocksWaited > worstBlocks {
+			worstBlocks = s.BlocksWaited
+		}
+		minFee = math.Min(minFee, s.BaseFeeGwei)
+		maxFee = math.Max(maxFee, s.BaseFeeGwei)
+	}
+	if abandoned > 0 {
+		return Evidence{}, fmt.Errorf(
+			"chainprobe: %d of %d transactions were abandoned unconfirmed; "+
+				"the worst case of a run with an unconfirmed transaction is unknown, "+
+				"not the slowest one that happened to land", abandoned, len(o.Samples))
+	}
+	return Evidence{
+		Term: "inclusion", Measured: worst, Samples: len(o.Samples),
+		ChainID: chainID, TakenAt: takenAt,
+		Method: fmt.Sprintf(
+			"%d EIP-1559 self-transfers from %s, 21000 gas, value 0, sequential nonces; "+
+				"broadcast to first containing block; worst %s (%d blocks); "+
+				"base fee %.3f–%.3f gwei at broadcast, priority fee 0.1 gwei",
+			len(o.Samples), o.Account, worst, worstBlocks, minFee, maxFee),
 	}, nil
 }
 
