@@ -6,21 +6,21 @@ package channel
 // as the other P13 suites: the spec is data, each row registers itself, and an
 // unclaimed row fails the suite.
 //
-// TWELVE OF THESE ROWS ARE GAPS, AND THEIR TESTS SAY SO
-// -----------------------------------------------------
-// SplitPlan is referenced nowhere outside multipath.go and its own test.
-// Nothing executes a plan. So every property that needs fragments coordinated
-// AT SETTLEMENT TIME — partial settlement, partial refund, aggregate replay,
-// crash recovery — has no implementation and cannot honestly be tested as
-// though it did.
+// THE GAPS ARE CLOSED
+// -------------------
+// Ten of these rows were GAPs: SplitPlan had no executor, so everything needing
+// fragments coordinated AT SETTLEMENT TIME — partial settlement, partial refund,
+// aggregate replay, crash recovery — had no implementation and could not
+// honestly be tested. Their tests pinned the absence instead.
 //
-// A GAP row's test therefore does the only useful thing available: it pins the
-// absence mechanically, so that writing an executor FAILS this suite and forces
-// the table to be revisited. A gap that is documented and then silently closed
-// is how a security table becomes fiction.
+// multipath_exec.go is that executor, and those rows are now enforced. The
+// end-to-end scenarios live in multipath_exec_test.go, driven through the real
+// Coordinator and SCPP/1; the rows below re-assert the specific property each
+// one names, so the security table stays checkable from one place.
 
 import (
 	"math/big"
+	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -50,17 +50,18 @@ var p13MultipathSpec = []p13Row{
 	{"mp", "per leg recovery is idempotent", "re-apply is a no-op"},
 	{"mp", "no aggregate write path", "Accept is the only mutator"},
 
-	// Gaps. Each pins an absence.
-	{"mp", "GAP aggregate settlement accounting", "no executor exists"},
-	{"mp", "GAP cross-fragment expiry ordering", "LockChain carries no expiry"},
-	{"mp", "GAP partial path failure", "no executor exists"},
-	{"mp", "GAP plan level replay identity", "SplitPlan has no identity"},
-	{"mp", "GAP partial settlement", "no executor exists"},
-	{"mp", "GAP partial refund reconciliation", "no executor exists"},
-	{"mp", "GAP aggregate stall resolution", "no executor exists"},
-	{"mp", "GAP plan is not persisted", "no store integration"},
-	{"mp", "GAP no resumption after restart", "no executor exists"},
-	{"mp", "GAP no aggregate recovery", "no executor exists"},
+	// Formerly GAPs. Closed by the executor (multipath_exec.go); each is now
+	// exercised end to end in multipath_exec_test.go and re-asserted here.
+	{"mp", "aggregate settlement accounting", "delivered value summed from channels"},
+	{"mp", "cross-fragment expiry ordering", "every leg expires by the deadline"},
+	{"mp", "partial path failure", "siblings resolve independently"},
+	{"mp", "plan level replay identity", "payment id re-derives the same intents"},
+	{"mp", "partial settlement", "reported as delivered, not complete"},
+	{"mp", "partial refund reconciliation", "refund never touches a settled leg"},
+	{"mp", "aggregate stall resolution", "unwind returns locked value"},
+	{"mp", "plan is persisted", "attempt journal written before any leg commits"},
+	{"mp", "resumption after restart", "state re-derived from channels"},
+	{"mp", "aggregate recovery is idempotent", "resume converges"},
 }
 
 // methodNames returns the exported method set of a type, for pinning an
@@ -72,23 +73,6 @@ func methodNames(v any) map[string]bool {
 		out[t.Method(i).Name] = true
 	}
 	return out
-}
-
-// assertNoExecutorMethod fails if a method implying plan execution has appeared.
-//
-// This is the mechanism that makes a GAP row honest: the day somebody writes
-// SplitPlan.Execute, this suite breaks and the security table must be updated
-// before the build is green again.
-func assertNoExecutorMethod(t *testing.T, names ...string) {
-	t.Helper()
-	have := methodNames(&SplitPlan{})
-	for _, n := range names {
-		if have[n] {
-			t.Fatalf("SplitPlan.%s now exists. A multi-path executor has been written, "+
-				"so the GAP rows in doc/p13-multipath-security-table.md are no longer "+
-				"accurate. Update the table and replace this test with a real one.", n)
-		}
-	}
 }
 
 func TestP13MultipathSecuritySuite(t *testing.T) {
@@ -595,111 +579,274 @@ func TestP13MultipathSecuritySuite(t *testing.T) {
 		}
 	})
 
-	// ---- the gaps -------------------------------------------------------
+	// ---- formerly gaps, now enforced by the executor ---------------------
 
-	t.Run("mp/GAP aggregate settlement accounting", func(t *testing.T) {
-		cover("GAP aggregate settlement accounting")
-		assertNoExecutorMethod(t, "Settle", "Execute", "Send", "Dispatch")
-		// Concretely: a plan whose fragments have all "settled" and one that
-		// has settled none are indistinguishable to this package, because
-		// Verify inspects the PLAN and nothing inspects outcomes.
-		plan, _, _, _ := newPlan(t, Amount(100_000))
-		if err := plan.Verify(); err != nil {
-			t.Fatalf("plan: %v", err)
+	t.Run("mp/aggregate settlement accounting", func(t *testing.T) {
+		cover("aggregate settlement accounting")
+		f := newMPFixture(t, 3, anon(500))
+		ctx := t.Context()
+		pay := f.payment(t, [32]byte{31: 100}, 20, 30, 50)
+		if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+			t.Fatalf("Lock: %v", err)
 		}
-		t.Log("GAP: Verify checks the plan, not what happened to it. " +
-			"No code sums delivered fragments against Total.")
+		// Locked is NOT delivered. Counting a lock as settled is how a payer
+		// would be told a payment succeeded while the recipient holds nothing.
+		if got := f.exec.Summarise(pay).SettledAmount; got.Sign() != 0 {
+			t.Fatalf("locked-but-unsettled value counted as delivered: %s", got)
+		}
+		if _, err := f.exec.Settle(ctx, pay, f.secret, f.peers(t)); err != nil {
+			t.Fatalf("Settle: %v", err)
+		}
+		out := f.exec.Summarise(pay)
+		if out.SettledAmount.Cmp(pay.Total) != 0 {
+			t.Fatalf("delivered %s, total %s", out.SettledAmount, pay.Total)
+		}
+		f.conserves(t, pay)
 	})
 
-	t.Run("mp/GAP cross-fragment expiry ordering", func(t *testing.T) {
-		cover("GAP cross-fragment expiry ordering")
-		// Mechanical: a LockChain has no expiry field at all, so there is
-		// nothing to order across fragments.
-		lc := reflect.TypeOf(LockChain{})
-		for i := 0; i < lc.NumField(); i++ {
-			if lc.Field(i).Name == "Expiry" || lc.Field(i).Name == "Expiries" {
-				t.Fatalf("LockChain now carries %s — cross-fragment expiry ordering "+
-					"is implementable and the table row must be rewritten", lc.Field(i).Name)
+	t.Run("mp/cross-fragment expiry ordering", func(t *testing.T) {
+		cover("cross-fragment expiry ordering")
+		f := newMPFixture(t, 2, anon(500))
+		// A leg outliving the payment deadline is refused at construction, so
+		// the payer's exposure across fragments is bounded by one number.
+		_, err := BuildPayment([32]byte{31: 101}, f.secret, anon(100), mpDeadline,
+			f.channels, []*big.Int{anon(50), anon(50)},
+			[]int64{mpExpiry, mpDeadline + 1})
+		if !errors.Is(err, ErrFragmentExpiryUnsafe) {
+			t.Fatalf("a fragment outliving the deadline was accepted: %v", err)
+		}
+		// And every leg of a valid payment carries an expiry within it.
+		pay := f.payment(t, [32]byte{31: 102}, 50, 50)
+		for _, leg := range pay.Legs {
+			if leg.Expiry <= 0 || leg.Expiry > pay.Deadline {
+				t.Fatalf("leg %d expiry %d outside the deadline %d",
+					leg.Index, leg.Expiry, pay.Deadline)
 			}
 		}
-		frag := reflect.TypeOf(Fragment{})
-		for i := 0; i < frag.NumField(); i++ {
-			if frag.Field(i).Name == "Expiry" {
-				t.Fatal("Fragment now carries an Expiry — update the table row")
+	})
+
+	t.Run("mp/partial path failure", func(t *testing.T) {
+		cover("partial path failure")
+		f := newMPFixture(t, 3, anon(500))
+		ctx := t.Context()
+		pay := f.payment(t, [32]byte{31: 103}, 20, 30, 50)
+		peers := func(ch [32]byte) (Peer, error) {
+			if ch == pay.Legs[1].Channel {
+				return deadPeer{}, nil
+			}
+			return f.peers(t)(ch)
+		}
+		errs, err := f.exec.Lock(ctx, pay, peers)
+		if err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		if errs[1] == nil {
+			t.Fatal("a dead counterparty reported success")
+		}
+		if errs[0] != nil || errs[2] != nil {
+			t.Fatal("one failing path prevented its siblings")
+		}
+		f.conserves(t, pay)
+	})
+
+	t.Run("mp/plan level replay identity", func(t *testing.T) {
+		cover("plan level replay identity")
+		f := newMPFixture(t, 2, anon(500))
+		id := [32]byte{31: 104}
+		a := f.payment(t, id, 40, 60)
+		b := f.payment(t, id, 40, 60)
+		// The same payment id must re-derive identical intents — that is what
+		// makes a whole-payment replay recognisable rather than a second payment.
+		for i := range a.Legs {
+			if a.Legs[i].Intent != b.Legs[i].Intent {
+				t.Fatalf("leg %d intent is not stable across rebuilds", i)
 			}
 		}
-		t.Log("GAP: fragments carry points, not deadlines. The payer's exposure " +
-			"across fragments is unbounded by any check in this package.")
-	})
-
-	t.Run("mp/GAP partial path failure", func(t *testing.T) {
-		cover("GAP partial path failure")
-		assertNoExecutorMethod(t, "OnFragmentFailed", "Reconcile", "Resolve")
-		t.Log("GAP: nothing observes per-fragment outcomes, so 'two of three succeeded' " +
-			"has no representation and no resolution policy.")
-	})
-
-	t.Run("mp/GAP plan level replay identity", func(t *testing.T) {
-		cover("GAP plan level replay identity")
-		// A SplitPlan has no id, nonce or intent binding, so a replay of the
-		// whole plan is only blocked incidentally, by per-leg nonces.
-		sp := reflect.TypeOf(SplitPlan{})
-		for i := 0; i < sp.NumField(); i++ {
-			switch sp.Field(i).Name {
-			case "ID", "Nonce", "Intent", "PaymentID":
-				t.Fatalf("SplitPlan now has %s — plan-level replay protection is "+
-					"implementable and the table row must be rewritten", sp.Field(i).Name)
+		// A DIFFERENT payment id must not collide with it.
+		c := f.payment(t, [32]byte{31: 105}, 40, 60)
+		for i := range a.Legs {
+			if a.Legs[i].Intent == c.Legs[i].Intent {
+				t.Fatalf("leg %d intent collides across payments", i)
 			}
 		}
-		t.Log("GAP: whole-plan replay is blocked only as a side effect of per-leg nonces, " +
-			"not by any guard that knows a plan is a unit.")
 	})
 
-	t.Run("mp/GAP partial settlement", func(t *testing.T) {
-		cover("GAP partial settlement")
-		assertNoExecutorMethod(t, "Settled", "MarkSettled", "Outcome")
-		t.Log("GAP: a recipient claiming the two largest fragments and letting the " +
-			"rest expire is undetectable here.")
+	t.Run("mp/partial settlement", func(t *testing.T) {
+		cover("partial settlement")
+		f := newMPFixture(t, 2, anon(500))
+		ctx := t.Context()
+		pay := f.payment(t, [32]byte{31: 106}, 40, 60)
+		if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		// Settle one leg only.
+		leg := pay.Legs[0]
+		tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
+			Preimage: FragmentPreimage(f.secret, 0)}
+		if _, err := f.payer.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr,
+			directPeer{t, f.payees[0].coord}); err != nil {
+			t.Fatalf("settle one leg: %v", err)
+		}
+		out := f.exec.Summarise(pay)
+		// It must report what was DELIVERED, and must not call itself complete.
+		if out.Complete(pay) {
+			t.Fatal("a partially settled payment reported itself complete")
+		}
+		if out.SettledAmount.Cmp(anon(40)) != 0 {
+			t.Fatalf("delivered %s, want 40", out.SettledAmount)
+		}
+		f.conserves(t, pay)
 	})
 
-	t.Run("mp/GAP partial refund reconciliation", func(t *testing.T) {
-		cover("GAP partial refund reconciliation")
-		assertNoExecutorMethod(t, "Refunded", "Reconcile")
-		t.Log("GAP: per-leg refunds work; nothing sums them against Total.")
+	t.Run("mp/partial refund reconciliation", func(t *testing.T) {
+		cover("partial refund reconciliation")
+		f := newMPFixture(t, 2, anon(500))
+		ctx := t.Context()
+		pay := f.payment(t, [32]byte{31: 107}, 40, 60)
+		if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		leg := pay.Legs[0]
+		tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
+			Preimage: FragmentPreimage(f.secret, 0)}
+		if _, err := f.payer.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr,
+			directPeer{t, f.payees[0].coord}); err != nil {
+			t.Fatalf("settle leg 0: %v", err)
+		}
+		delivered := f.exec.Summarise(pay).SettledAmount
+
+		f.advanceTo(mpExpiry + 120)
+		if _, err := f.exec.Refund(ctx, pay, f.peers(t)); err != nil {
+			t.Fatalf("Refund: %v", err)
+		}
+		out := f.exec.Summarise(pay)
+		// Refunding must not touch the settled leg: that would pay it twice.
+		if out.Settled != 1 || out.Refunded != 1 {
+			t.Fatalf("expected 1 settled and 1 refunded: %+v", out)
+		}
+		if out.SettledAmount.Cmp(delivered) != 0 {
+			t.Fatalf("a refund changed delivered value: %s -> %s", delivered, out.SettledAmount)
+		}
+		f.conserves(t, pay)
 	})
 
-	t.Run("mp/GAP aggregate stall resolution", func(t *testing.T) {
-		cover("GAP aggregate stall resolution")
-		assertNoExecutorMethod(t, "ExpireStale", "Timeout")
-		t.Log("GAP: per-leg timeouts unwind each hop; whether the PAYMENT then " +
-			"resolves coherently has no owner.")
+	t.Run("mp/aggregate stall resolution", func(t *testing.T) {
+		cover("aggregate stall resolution")
+		f := newMPFixture(t, 2, anon(500))
+		ctx := t.Context()
+		pay := f.payment(t, [32]byte{31: 108}, 30, 70)
+		if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		// Nobody ever settles. The locked value must not sit forever: reaching
+		// the expiry lets it be unwound, and both sides get their value back.
+		f.advanceTo(mpExpiry + 120)
+		errs, err := f.exec.Refund(ctx, pay, f.peers(t))
+		if err != nil {
+			t.Fatalf("Refund: %v", err)
+		}
+		noErrs(t, "refund", errs)
+		out := f.exec.Summarise(pay)
+		if out.Refunded != 2 || out.SettledAmount.Sign() != 0 {
+			t.Fatalf("stalled payment did not unwind: %+v", out)
+		}
+		f.conserves(t, pay)
 	})
 
-	t.Run("mp/GAP plan is not persisted", func(t *testing.T) {
-		cover("GAP plan is not persisted")
-		st := methodNames(&Store{})
-		for _, n := range []string{"PutPlan", "SavePlan", "TrackPlan", "Plans"} {
-			if st[n] {
-				t.Fatalf("Store.%s exists — plans are now persisted and the crash/restart "+
-					"rows must be rewritten", n)
+	t.Run("mp/plan is persisted", func(t *testing.T) {
+		cover("plan is persisted")
+		f := newMPFixture(t, 3, anon(500))
+		id := [32]byte{31: 109}
+		pay := f.payment(t, id, 20, 30, 50)
+		// The journal must exist BEFORE any leg commits, or a crash mid-flight
+		// leaves committed money with nothing recording what it belonged to.
+		if _, err := f.exec.LoadJournal(id); err == nil {
+			t.Fatal("a journal existed before the payment was journalled")
+		}
+		if err := f.exec.Journal(pay); err != nil {
+			t.Fatalf("Journal: %v", err)
+		}
+		loaded, err := f.exec.LoadJournal(id)
+		if err != nil {
+			t.Fatalf("LoadJournal: %v", err)
+		}
+		if len(loaded.Legs) != 3 || loaded.Total.Cmp(pay.Total) != 0 {
+			t.Fatalf("journal round trip lost data: %+v", loaded)
+		}
+		for i := range pay.Legs {
+			if loaded.Legs[i].Intent != pay.Legs[i].Intent ||
+				loaded.Legs[i].Amount.Cmp(pay.Legs[i].Amount) != 0 {
+				t.Fatalf("leg %d did not round trip", i)
 			}
 		}
-		t.Log("GAP: SplitPlan is an in-memory value with no encoder and no store. " +
-			"A crash between committing a leg and finishing the plan loses the plan.")
 	})
 
-	t.Run("mp/GAP no resumption after restart", func(t *testing.T) {
-		cover("GAP no resumption after restart")
-		assertNoExecutorMethod(t, "Resume", "Recover")
-		t.Log("GAP: channels reload correctly, so no value is lost — what is lost " +
-			"is the knowledge that several legs were one payment.")
+	t.Run("mp/resumption after restart", func(t *testing.T) {
+		cover("resumption after restart")
+		f := newMPFixture(t, 3, anon(500))
+		ctx := t.Context()
+		id := [32]byte{31: 110}
+		pay := f.payment(t, id, 20, 30, 50)
+		// Commit one leg, then lose the process.
+		peers := func(ch [32]byte) (Peer, error) {
+			if ch == pay.Legs[0].Channel {
+				return f.peers(t)(ch)
+			}
+			return deadPeer{}, nil
+		}
+		if _, err := f.exec.Lock(ctx, pay, peers); err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		revived, err := NewMultipathExecutor(f.payer.coord, f.dir)
+		if err != nil {
+			t.Fatalf("revived: %v", err)
+		}
+		loaded, err := revived.LoadJournal(id)
+		if err != nil {
+			t.Fatalf("LoadJournal: %v", err)
+		}
+		// Recovery must read the CHANNELS: one leg really landed, two did not.
+		if got := revived.Summarise(loaded).Locked; got != 1 {
+			t.Fatalf("recovery trusted the previous process's intent: %d locked", got)
+		}
+		secret := f.secret
+		out, errs, err := revived.Resume(ctx, id, &secret, f.peers(t))
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		noErrs(t, "resume", errs)
+		if !out.Complete(loaded) {
+			t.Fatalf("resume did not complete: %+v", out)
+		}
+		f.conserves(t, loaded)
 	})
 
-	t.Run("mp/GAP no aggregate recovery", func(t *testing.T) {
-		cover("GAP no aggregate recovery")
-		assertNoExecutorMethod(t, "Recover", "Reconcile", "Resume")
-		t.Log("GAP: per-leg recovery is idempotent; there is no aggregate recovery " +
-			"to be idempotent about.")
+	t.Run("mp/aggregate recovery is idempotent", func(t *testing.T) {
+		cover("aggregate recovery is idempotent")
+		f := newMPFixture(t, 2, anon(500))
+		ctx := t.Context()
+		id := [32]byte{31: 111}
+		pay := f.payment(t, id, 45, 55)
+		if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		secret := f.secret
+		first, _, err := f.exec.Resume(ctx, id, &secret, f.peers(t))
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		// Resuming repeatedly must converge on the same result, not pay again.
+		for i := 0; i < 3; i++ {
+			again, _, err := f.exec.Resume(ctx, id, &secret, f.peers(t))
+			if err != nil {
+				t.Fatalf("Resume %d: %v", i, err)
+			}
+			if again.SettledAmount.Cmp(first.SettledAmount) != 0 {
+				t.Fatalf("resume %d moved more value: %s -> %s",
+					i, first.SettledAmount, again.SettledAmount)
+			}
+		}
+		f.conserves(t, pay)
 	})
 
 	// ---- the audit ------------------------------------------------------
@@ -720,7 +867,7 @@ func TestP13MultipathSecuritySuite(t *testing.T) {
 				gaps++
 			}
 		}
-		t.Logf("all %d multi-path rows exercised: %d enforced, %d gaps pinned",
+		t.Logf("all %d multi-path rows exercised: %d enforced, %d gaps remaining",
 			len(p13MultipathSpec), len(p13MultipathSpec)-gaps, gaps)
 	})
 }
