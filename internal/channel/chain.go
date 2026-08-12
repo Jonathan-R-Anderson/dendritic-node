@@ -59,6 +59,22 @@ type OnChainChannel struct {
 	DepositB *big.Int
 	Status   Status
 
+	// The dispute fields. Zero until somebody starts a unilateral close, and
+	// meaningless before then — but once Status is Closing they are the whole
+	// picture a watchtower reasons about:
+	//
+	//	Nonce         the state the contract currently believes is best
+	//	ChallengeEnds when it stops being possible to beat it
+	//
+	// Read from the chain rather than from an event, because an event is a
+	// notification and this is the fact. A watchtower that had missed the log
+	// would otherwise have no way to catch up.
+	Nonce         uint64
+	ChallengeEnds int64
+	BalanceA      *big.Int
+	BalanceB      *big.Int
+	LockedTotal   *big.Int
+
 	// fromChain is the guard. Unexported, so no package outside this one can
 	// set it, and a hand-built OnChainChannel is rejected by TrackFromChain.
 	fromChain bool
@@ -156,9 +172,11 @@ func decodeChannelsReturn(id [32]byte, result string) (OnChainChannel, error) {
 	if err != nil {
 		return OnChainChannel{}, fmt.Errorf("%w: result is not hex", ErrChainUnreachable)
 	}
-	// Five words is the minimum this function reads; a shorter return means the
-	// address is not the contract we think it is.
-	if len(raw) < 5*32 {
+	// Eleven words is the whole Channel struct. A shorter return means the
+	// address is not the contract we think it is — and reading only the first
+	// five, as this once did, would leave a watchtower silently blind to the
+	// dispute fields it exists to act on.
+	if len(raw) < 11*32 {
 		return OnChainChannel{}, fmt.Errorf("%w: short return (%d bytes)", ErrChainUnreachable, len(raw))
 	}
 
@@ -176,7 +194,15 @@ func decodeChannelsReturn(id [32]byte, result string) (OnChainChannel, error) {
 		DepositA:  new(big.Int).SetBytes(wordAt(2)),
 		DepositB:  new(big.Int).SetBytes(wordAt(3)),
 		Status:    Status(new(big.Int).SetBytes(wordAt(4)).Uint64()),
-		fromChain: true,
+		// Struct order, which is the ABI order for a public mapping getter:
+		// partyA, partyB, depositA, depositB, status, balanceA, balanceB,
+		// nonce, challengeEnds, htlcRoot, lockedTotal.
+		BalanceA:      new(big.Int).SetBytes(wordAt(5)),
+		BalanceB:      new(big.Int).SetBytes(wordAt(6)),
+		Nonce:         new(big.Int).SetBytes(wordAt(7)).Uint64(),
+		ChallengeEnds: new(big.Int).SetBytes(wordAt(8)).Int64(),
+		LockedTotal:   new(big.Int).SetBytes(wordAt(10)),
+		fromChain:     true,
 	}
 
 	// Status None with zero parties is how the mapping answers for a channel
@@ -233,6 +259,31 @@ func (f *FakeChain) Add(partyA, partyB Address, depositA, depositB *big.Int) [32
 		Status: StatusOpen, fromChain: true,
 	}
 	return id
+}
+
+// StartClose puts a channel into Closing at a given state, as closeUnilateral
+// would. The nonce is the one a watchtower has to beat.
+func (f *FakeChain) StartClose(id [32]byte, nonce uint64, challengeEnds int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ch, ok := f.Channels[id]
+	if !ok {
+		return
+	}
+	ch.Status = StatusClosing
+	ch.Nonce = nonce
+	ch.ChallengeEnds = challengeEnds
+	f.Channels[id] = ch
+}
+
+// Settled marks a channel finished, as settle would.
+func (f *FakeChain) Settled(id [32]byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ch, ok := f.Channels[id]; ok {
+		ch.Status = StatusSettled
+		f.Channels[id] = ch
+	}
 }
 
 func (f *FakeChain) ReadChannel(_ context.Context, _ Address, id [32]byte) (OnChainChannel, error) {

@@ -57,6 +57,12 @@ var (
 	selCheckpoint       = keccak([]byte("checkpoint((bytes32,uint64,uint256,uint256,uint256,uint256),(bytes32,bytes32,uint256,uint256,bool)[],bytes,bytes)"))[:4]
 	selCloseCooperative = keccak([]byte("closeCooperative(bytes32,uint64,uint256,uint256,bytes,bytes)"))[:4]
 	selClaimLock        = keccak([]byte("claimLock(bytes32,(bytes32,bytes32,uint256,uint256,bool)[],uint256,bytes32)"))[:4]
+	// The dispute path. challenge takes exactly the shape closeUnilateral does,
+	// because the argument IS the same thing: a fully signed state, offered as a
+	// better one.
+	selChallenge       = keccak([]byte("challenge(bytes32,uint64,uint256,uint256,(bytes32,bytes32,uint256,uint256,bool)[],bytes,bytes)"))[:4]
+	selCloseUnilateral = keccak([]byte("closeUnilateral(bytes32,uint64,uint256,uint256,(bytes32,bytes32,uint256,uint256,bool)[],bytes,bytes)"))[:4]
+	selSettle          = keccak([]byte("settle(bytes32)"))[:4]
 	selExpireLock       = keccak([]byte("expireLock(bytes32,(bytes32,bytes32,uint256,uint256,bool)[],uint256)"))[:4]
 	selOpenChannel      = keccak([]byte("openChannel(address,uint256)"))[:4]
 	selDeposit          = keccak([]byte("deposit(bytes32,uint256)"))[:4]
@@ -195,6 +201,69 @@ func CloseCooperativeCalldata(ch *Channel) ([]byte, error) {
 	e.patch(sigBSlot, sigBPos)
 
 	return append(append([]byte{}, selCloseCooperative...), e.bytes()...), nil
+}
+
+// disputeCalldata encodes a signed state for closeUnilateral or challenge.
+//
+// One encoder for both because the contract takes one argument list for both,
+// and the difference is entirely in what the call MEANS: closeUnilateral starts
+// the clock, challenge beats a state already on it. Two near-identical encoders
+// would eventually differ in some detail neither reviewer noticed.
+//
+// Note the withdrawals are absent. The contract hashes these states with
+// withdrawA and withdrawB at zero — a dispute is about the balances, and a
+// checkpoint's withdrawal has already left the channel — so a state carrying
+// one cannot be used here and is refused rather than silently mis-hashed.
+func disputeCalldata(selector []byte, signed SignedState) ([]byte, error) {
+	if !signed.Complete() {
+		return nil, ErrNothingToSubmit
+	}
+	st := signed.State
+	if orZero(st.WithdrawA).Sign() != 0 || orZero(st.WithdrawB).Sign() != 0 {
+		return nil, fmt.Errorf(
+			"channel: a state with a withdrawal cannot be submitted to the dispute path")
+	}
+
+	e := &abiEncoder{}
+	e.fixed(st.Channel)
+	e.u64(st.Nonce)
+	e.u256(st.BalanceA)
+	e.u256(st.BalanceB)
+	locksSlot := e.offset()
+	sigASlot := e.offset()
+	sigBSlot := e.offset()
+	locksPos := e.encodeLocks(st.Pending)
+	sigAPos := e.encodeBytes(signed.SigA)
+	sigBPos := e.encodeBytes(signed.SigB)
+	e.patch(locksSlot, locksPos)
+	e.patch(sigASlot, sigAPos)
+	e.patch(sigBSlot, sigBPos)
+
+	return append(append([]byte{}, selector...), e.bytes()...), nil
+}
+
+// ChallengeCalldata builds a call to ChannelManagerV2.challenge.
+//
+// Callable by ANYONE — the contract checks the signatures, not the sender —
+// which is what makes a third-party watchtower possible at all. A tipper who
+// closed their browser six months ago cannot defend their own channel; somebody
+// else has to be able to do it for them, without holding their key.
+func ChallengeCalldata(signed SignedState) ([]byte, error) {
+	return disputeCalldata(selChallenge, signed)
+}
+
+// CloseUnilateralCalldata builds a call to ChannelManagerV2.closeUnilateral.
+//
+// Unlike challenge, this one IS restricted to the two parties.
+func CloseUnilateralCalldata(signed SignedState) ([]byte, error) {
+	return disputeCalldata(selCloseUnilateral, signed)
+}
+
+// SettleCalldata builds a call to ChannelManagerV2.settle.
+func SettleCalldata(id [32]byte) []byte {
+	e := &abiEncoder{}
+	e.fixed(id)
+	return append(append([]byte{}, selSettle...), e.bytes()...)
 }
 
 // OpenChannelCalldata builds a call to ChannelManagerV2.openChannel.
