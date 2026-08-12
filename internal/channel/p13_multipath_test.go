@@ -62,6 +62,10 @@ var p13MultipathSpec = []p13Row{
 	{"mp", "plan is persisted", "attempt journal written before any leg commits"},
 	{"mp", "resumption after restart", "state re-derived from channels"},
 	{"mp", "aggregate recovery is idempotent", "resume converges"},
+
+	// The seam that made "SplitPlan is executable" true rather than asserted.
+	{"mp", "real split plan is executable", "Split output drives the engine"},
+	{"mp", "expiry from the actual route", "per-fragment, scaled by hop count"},
 }
 
 // methodNames returns the exported method set of a type, for pinning an
@@ -682,7 +686,7 @@ func TestP13MultipathSecuritySuite(t *testing.T) {
 		// Settle one leg only.
 		leg := pay.Legs[0]
 		tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
-			Preimage: FragmentPreimage(f.secret, 0)}
+			Preimage: FragmentPreimage(f.secret, pay.Legs[0].Intent)}
 		if _, err := f.payer.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr,
 			directPeer{t, f.payees[0].coord}); err != nil {
 			t.Fatalf("settle one leg: %v", err)
@@ -708,7 +712,7 @@ func TestP13MultipathSecuritySuite(t *testing.T) {
 		}
 		leg := pay.Legs[0]
 		tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
-			Preimage: FragmentPreimage(f.secret, 0)}
+			Preimage: FragmentPreimage(f.secret, pay.Legs[0].Intent)}
 		if _, err := f.payer.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr,
 			directPeer{t, f.payees[0].coord}); err != nil {
 			t.Fatalf("settle leg 0: %v", err)
@@ -847,6 +851,63 @@ func TestP13MultipathSecuritySuite(t *testing.T) {
 			}
 		}
 		f.conserves(t, pay)
+	})
+
+	t.Run("mp/real split plan is executable", func(t *testing.T) {
+		cover("real split plan is executable")
+		f := newMPFixture(t, 3, anon(500))
+		ctx := t.Context()
+		c := DefaultCurve()
+		_, Z, err := NewSecret(c)
+		if err != nil {
+			t.Fatalf("NewSecret: %v", err)
+		}
+		plan, err := Split(c, Z, Amount(120_000), threeIndependentRoutes())
+		if err != nil {
+			t.Fatalf("Split: %v", err)
+		}
+		pay, err := PaymentFromSplitPlan(plan, [32]byte{31: 130}, f.secret,
+			f.channels[:len(plan.Fragments)], mpClock, 900, mpClock+86_400)
+		if err != nil {
+			t.Fatalf("PaymentFromSplitPlan: %v", err)
+		}
+		if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		if _, err := f.exec.Settle(ctx, pay, f.secret, f.peers(t)); err != nil {
+			t.Fatalf("Settle: %v", err)
+		}
+		if !f.exec.Summarise(pay).Complete(pay) {
+			t.Fatal("a real Split plan did not settle through the executor")
+		}
+		f.conserves(t, pay)
+	})
+
+	t.Run("mp/expiry from the actual route", func(t *testing.T) {
+		cover("expiry from the actual route")
+		f := newMPFixture(t, 3, anon(500))
+		c := DefaultCurve()
+		_, Z, _ := NewSecret(c)
+		plan, err := Split(c, Z, Amount(120_000), [][]Candidate{
+			routeOf("x1", "x2"), routeOf("y1", "y2", "y3"),
+		})
+		if err != nil {
+			t.Fatalf("Split: %v", err)
+		}
+		pay, err := PaymentFromSplitPlan(plan, [32]byte{31: 131}, f.secret,
+			f.channels[:len(plan.Fragments)], mpClock, 900, mpClock+86_400)
+		if err != nil {
+			t.Fatalf("PaymentFromSplitPlan: %v", err)
+		}
+		// Each window must come from that fragment's own hop count, not a
+		// constant and not recomputed here from the same expression: the hop
+		// count is read back off the PLAN.
+		for i, leg := range pay.Legs {
+			hops := len(plan.Fragments[i].Route)
+			if leg.Expiry != mpClock+900*int64(hops+1) {
+				t.Fatalf("fragment %d (%d hops) got expiry %d", i, hops, leg.Expiry)
+			}
+		}
 	})
 
 	// ---- the audit ------------------------------------------------------

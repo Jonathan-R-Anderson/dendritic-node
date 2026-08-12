@@ -31,17 +31,34 @@ package channel
 // this inherits it rather than reimplementing it. Two different fragments
 // derive different intents, so no leg's authorisation can move another.
 //
-// PER-FRAGMENT PREIMAGES
-// ----------------------
+// PER-FRAGMENT PREIMAGES, BOUND TO THE FRAGMENT
+// ---------------------------------------------
 // One payment secret, but each fragment locks a DIFFERENT hash:
 //
-//	preimage_i = H(domain || secret || i)
+//	preimage_i = H(domain || secret || intent_i)
 //	hash_i     = keccak(preimage_i)
 //
 // The recipient holds the secret, so it can open every fragment — which is what
 // makes the payment atomic from their side. But preimage_i opens only fragment
-// i, so revealing one does not drain the rest. Both properties are required and
-// a single shared hash would satisfy only the first.
+// i, so revealing one does not drain the rest.
+//
+// THE INTENT, NOT JUST THE INDEX. An earlier version derived this from
+// (secret, index) alone, and adversarial review broke it twice:
+//
+//   - ACROSS PAYMENTS. Two payments sharing a secret produced the SAME hash for
+//     fragment i, because the payment id lived in the intent but not in the
+//     hash. A counterparty that legitimately learned preimage_0 from one payment
+//     could settle fragment 0 of another. Verified as working theft.
+//   - ACROSS RE-SPLITS. unevenSplit draws fresh random weights every call, so
+//     retrying a payment after a refused leg yields different amounts. The amount
+//     is in the intent, so intents and lock ids changed — but the hash did not,
+//     leaving two same-hash locks the payee could settle twice. Nothing dedupes
+//     HTLC.Hash: state.go permits two locks sharing one deliberately, for
+//     exactly the multipath case.
+//
+// intent_i already commits to payment id, index, channel and amount, so binding
+// the preimage to it closes both. The recipient can still derive every preimage:
+// it knows the channel and amount of any leg it is party to.
 //
 // WHAT THIS DELIBERATELY DOES NOT DO
 // -----------------------------------
@@ -113,15 +130,18 @@ func FragmentIntent(paymentID [32]byte, index int, channel [32]byte, amount *big
 		paymentID[:], u64(uint64(index)), channel[:], orZero(amount).Bytes())
 }
 
-// FragmentPreimage derives the secret that opens fragment i and no other.
-func FragmentPreimage(secret [32]byte, index int) [32]byte {
-	return derive("syndichan/multipath/preimage/v1", secret[:], u64(uint64(index)))
+// FragmentPreimage derives the secret that opens ONE fragment of ONE payment.
+//
+// Keyed by the leg's intent rather than its index — see the file header for the
+// two attacks that (secret, index) allowed.
+func FragmentPreimage(secret [32]byte, intent [32]byte) [32]byte {
+	return derive("syndichan/multipath/preimage/v2", secret[:], intent[:])
 }
 
 // FragmentHash is what the lock commits to, hashed exactly as the contract
 // hashes it — see HTLC.Matches.
-func FragmentHash(secret [32]byte, index int) [32]byte {
-	p := FragmentPreimage(secret, index)
+func FragmentHash(secret [32]byte, intent [32]byte) [32]byte {
+	p := FragmentPreimage(secret, intent)
 	var h [32]byte
 	copy(h[:], keccak(p[:]))
 	return h
@@ -163,7 +183,7 @@ func BuildPayment(id [32]byte, secret [32]byte, total *big.Int, deadline int64,
 		pay.Legs = append(pay.Legs, MultipathLeg{
 			Index: i, Channel: channels[i], Amount: new(big.Int).Set(amt),
 			Expiry: expiries[i], Intent: intent,
-			Hash:   FragmentHash(secret, i),
+			Hash:   FragmentHash(secret, intent),
 			LockID: derive("syndichan/multipath/lock/v1", intent[:]),
 		})
 		sum.Add(sum, amt)
@@ -423,7 +443,7 @@ func (e *MultipathExecutor) Settle(ctx context.Context, pay *MultipathPayment,
 		}
 		tr := StateTransition{
 			Kind: KindLockSettle, LockID: leg.LockID,
-			Preimage: FragmentPreimage(secret, leg.Index),
+			Preimage: FragmentPreimage(secret, leg.Intent),
 		}
 		errs[i] = asLegError(e.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr, peer))
 	}
@@ -492,4 +512,90 @@ func (e *MultipathExecutor) Resume(ctx context.Context, id [32]byte,
 		errs = append(errs, refundErrs...)
 	}
 	return e.Summarise(pay), errs, nil
+}
+
+// ---- making the existing SplitPlan executable -------------------------------
+
+// ErrPlanChannelMismatch means the channel assignment does not match the plan.
+var ErrPlanChannelMismatch = errors.New(
+	"multipath: one channel must be assigned per fragment, in fragment order")
+
+// PaymentFromSplitPlan turns a real SplitPlan into an executable payment.
+//
+// WHY THIS IS A CONVERSION AND NOT A MERGE
+// ----------------------------------------
+// A SplitPlan and a MultipathPayment describe different halves of the same
+// payment, in different vocabularies, and collapsing them would lose something:
+//
+//	SplitPlan       amounts, routes, and a per-fragment point-based LockChain.
+//	                The LockChain is ROUTING machinery — adaptor points unwound
+//	                hop by hop so an intermediary learns its scalar only once it
+//	                has been paid downstream.
+//	MultipathLeg    a channel, an amount, an expiry, and a hash-based HTLC.
+//	                That is what ChannelManagerV2 settles.
+//
+// Both are real and neither replaces the other. The plan says how value travels;
+// the leg says what the contract will enforce. So the LockChain rides alongside
+// as routing metadata and the HTLC is the settlement lock — rather than one
+// being rewritten into the other, which would either put adaptor points somewhere
+// the contract cannot check them, or throw away the per-hop unwinding that makes
+// routed payments safe for intermediaries.
+//
+// EXPIRIES COME FROM THE ROUTE, NOT FROM A CONSTANT
+// -------------------------------------------------
+// Each fragment's window is sized by ITS OWN hop count, because a longer route
+// genuinely needs longer: every hop must be able to claim upstream after paying
+// downstream, and a uniform expiry would starve the longest route while
+// over-exposing the shortest. `deadline` then bounds the whole payment, so the
+// payer's exposure is one number they chose rather than the maximum of whatever
+// the router happened to pick.
+func PaymentFromSplitPlan(plan *SplitPlan, id, secret [32]byte,
+	channels [][32]byte, now, perHopSeconds, deadline int64) (*MultipathPayment, error) {
+
+	// The plan must be internally consistent BEFORE it is turned into money
+	// movements. Verify checks the fragment sum and cross-route operator
+	// disjointness; skipping it here would mean a tampered plan becomes a set of
+	// signed channel states.
+	if err := plan.Verify(); err != nil {
+		return nil, fmt.Errorf("multipath: plan does not verify: %w", err)
+	}
+	if len(channels) != len(plan.Fragments) {
+		return nil, fmt.Errorf("%w: %d channels for %d fragments",
+			ErrPlanChannelMismatch, len(channels), len(plan.Fragments))
+	}
+	if perHopSeconds <= 0 {
+		return nil, fmt.Errorf("%w: per-hop window must be positive", ErrFragmentExpiryUnsafe)
+	}
+
+	amounts := make([]*big.Int, len(plan.Fragments))
+	expiries := make([]int64, len(plan.Fragments))
+	total := new(big.Int)
+	for i, frag := range plan.Fragments {
+		amounts[i] = new(big.Int).SetInt64(int64(frag.Amount))
+		total.Add(total, amounts[i])
+
+		// One window per hop, plus one for the recipient's own claim.
+		hops := len(frag.Route)
+		if hops == 0 {
+			return nil, fmt.Errorf("%w: fragment %d has no route", ErrPlanChannelMismatch, i)
+		}
+		expiries[i] = now + perHopSeconds*int64(hops+1)
+	}
+
+	// BuildPayment re-checks conservation against this total, rejects duplicate
+	// channels, and rejects any expiry beyond the deadline. Deliberately not
+	// bypassed: it is the one place those three rules live.
+	return BuildPayment(id, secret, total, deadline, channels, amounts, expiries)
+}
+
+// RoutingLocksFor returns the plan's point-based LockChain for a fragment.
+//
+// Exposed so a router can drive the onion unwinding alongside the channel
+// settlement, and separate from the leg so nothing can mistake an adaptor point
+// for something the contract will check.
+func RoutingLocksFor(plan *SplitPlan, index int) (*LockChain, error) {
+	if plan == nil || index < 0 || index >= len(plan.Fragments) {
+		return nil, fmt.Errorf("multipath: no fragment %d", index)
+	}
+	return plan.Fragments[index].Locks, nil
 }

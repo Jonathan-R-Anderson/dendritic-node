@@ -270,7 +270,7 @@ func TestOneFragmentsPreimageCannotSettleAnother(t *testing.T) {
 	// Fragment 0's preimage offered against fragment 1's lock: the channel must
 	// refuse it. This goes through the real transition, so the refusal is
 	// Channel.Accept's, not the executor's.
-	wrong := FragmentPreimage(f.secret, 0)
+	wrong := FragmentPreimage(f.secret, pay.Legs[0].Intent)
 	tr := StateTransition{Kind: KindLockSettle, LockID: pay.Legs[1].LockID, Preimage: wrong}
 	_, err := f.payer.coord.Pay(ctx, pay.Legs[1].Channel,
 		derive("test/cross-fragment", pay.Legs[1].Intent[:]), tr, directPeer{t, f.payees[1].coord})
@@ -481,7 +481,7 @@ func TestRefundingDoesNotTouchASettledLeg(t *testing.T) {
 	// Settle only leg 0, by hand through the real engine.
 	leg := pay.Legs[0]
 	tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
-		Preimage: FragmentPreimage(f.secret, 0)}
+		Preimage: FragmentPreimage(f.secret, pay.Legs[0].Intent)}
 	if _, err := f.payer.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr,
 		directPeer{t, f.payees[0].coord}); err != nil {
 		t.Fatalf("settle leg 0: %v", err)
@@ -780,5 +780,564 @@ func TestFragmentIntentDependsOnEveryInput(t *testing.T) {
 	// And it is deterministic, which is what makes a retry a retry.
 	if FragmentIntent(id, 0, ch, anon(10)) != base {
 		t.Fatal("the intent derivation is not deterministic")
+	}
+}
+
+// ---- the remaining required scenarios --------------------------------------
+
+// MULTIPLE paths fail while one survives.
+//
+// One failure is the easy case. Several at once is where a naive executor either
+// gives up before resolving the survivors, or unwinds the wrong set.
+func TestMultiplePathsFailAndTheSurvivorStillResolves(t *testing.T) {
+	f := newMPFixture(t, 4, anon(500))
+	ctx := context.Background()
+	pay := f.payment(t, [32]byte{31: 210}, 10, 20, 30, 40)
+
+	// Three of four counterparties are gone.
+	peers := func(ch [32]byte) (Peer, error) {
+		if ch == pay.Legs[2].Channel {
+			return f.peers(t)(ch)
+		}
+		return deadPeer{}, nil
+	}
+	errs, err := f.exec.Lock(ctx, pay, peers)
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	for _, i := range []int{0, 1, 3} {
+		if errs[i] == nil {
+			t.Fatalf("leg %d reported success against a dead counterparty", i)
+		}
+	}
+	if errs[2] != nil {
+		t.Fatalf("the reachable leg failed because its siblings did: %v", errs[2])
+	}
+	out := f.exec.Summarise(pay)
+	if out.Locked != 1 || out.Pending != 3 {
+		t.Fatalf("expected 1 locked and 3 pending: %+v", out)
+	}
+	f.conserves(t, pay)
+
+	// The payment cannot complete, so the one committed leg must come back.
+	f.advanceTo(mpExpiry + 120)
+	if _, err := f.exec.Refund(ctx, pay, f.peers(t)); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	final := f.exec.Summarise(pay)
+	if final.Refunded != 1 || final.SettledAmount.Sign() != 0 {
+		t.Fatalf("survivor was not unwound: %+v", final)
+	}
+	f.conserves(t, pay)
+}
+
+// One leg EXPIRES while another settles — mixed terminal outcomes.
+//
+// The hazard is an executor that treats a payment as one thing: it either
+// settles the expired leg it should not, or refunds the settled leg it must not.
+func TestOneLegExpiresWhileAnotherSettles(t *testing.T) {
+	f := newMPFixture(t, 2, anon(500))
+	ctx := context.Background()
+	pay := f.payment(t, [32]byte{31: 211}, 35, 65)
+	if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	// Leg 0 settles while both locks are live.
+	leg := pay.Legs[0]
+	tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
+		Preimage: FragmentPreimage(f.secret, pay.Legs[0].Intent)}
+	if _, err := f.payer.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr,
+		directPeer{t, f.payees[0].coord}); err != nil {
+		t.Fatalf("settle leg 0: %v", err)
+	}
+
+	// Time passes; leg 1 is now expired and gets reclaimed.
+	f.advanceTo(mpExpiry + 120)
+	if _, err := f.exec.Refund(ctx, pay, f.peers(t)); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	out := f.exec.Summarise(pay)
+	if out.Settled != 1 || out.Refunded != 1 {
+		t.Fatalf("mixed outcome wrong: %+v", out)
+	}
+	// Delivered is the settled leg only — not the total, and not zero.
+	if out.SettledAmount.Cmp(anon(35)) != 0 {
+		t.Fatalf("delivered %s, want 35", out.SettledAmount)
+	}
+	if out.Complete(pay) {
+		t.Fatal("a payment with an expired leg reported itself complete")
+	}
+	f.conserves(t, pay)
+}
+
+// Crash AFTER one leg settled but BEFORE the rest were claimed.
+//
+// The dangerous recovery: a process that resumes by refunding would claw back a
+// leg the recipient has already been paid for, and one that resumes by settling
+// blindly would try to settle a leg that is already gone.
+func TestCrashAfterOneSettlementBeforeTheOthers(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	ctx := context.Background()
+	id := [32]byte{31: 212}
+	pay := f.payment(t, id, 20, 30, 50)
+	if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	// Settle leg 1 only, then lose the process.
+	leg := pay.Legs[1]
+	tr := StateTransition{Kind: KindLockSettle, LockID: leg.LockID,
+		Preimage: FragmentPreimage(f.secret, pay.Legs[1].Intent)}
+	if _, err := f.payer.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr,
+		directPeer{t, f.payees[1].coord}); err != nil {
+		t.Fatalf("settle leg 1: %v", err)
+	}
+
+	revived, err := NewMultipathExecutor(f.payer.coord, f.dir)
+	if err != nil {
+		t.Fatalf("revived: %v", err)
+	}
+	loaded, err := revived.LoadJournal(id)
+	if err != nil {
+		t.Fatalf("LoadJournal: %v", err)
+	}
+	// Recovery must SEE the settled leg rather than assume nothing settled.
+	mid := revived.Summarise(loaded)
+	if mid.Settled != 1 || mid.Locked != 2 {
+		t.Fatalf("recovery misread the real state: %+v", mid)
+	}
+	secret := f.secret
+	out, errs, err := revived.Resume(ctx, id, &secret, f.peers(t))
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	noErrs(t, "resume", errs)
+	if !out.Complete(loaded) {
+		t.Fatalf("resume did not finish the payment: %+v", out)
+	}
+	// The already-settled leg must not have been paid twice.
+	if out.SettledAmount.Cmp(loaded.Total) != 0 {
+		t.Fatalf("delivered %s, total %s", out.SettledAmount, loaded.Total)
+	}
+	f.conserves(t, loaded)
+}
+
+// Crash DURING a refund: some legs unwound, others not.
+func TestCrashDuringRefundResumesTheUnwind(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	ctx := context.Background()
+	id := [32]byte{31: 213}
+	pay := f.payment(t, id, 20, 30, 50)
+	if _, err := f.exec.Lock(ctx, pay, f.peers(t)); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	f.advanceTo(mpExpiry + 120)
+
+	// Refund leg 0 only, then die.
+	leg := pay.Legs[0]
+	tr := StateTransition{Kind: KindLockRefund, LockID: leg.LockID}
+	if _, err := f.payer.coord.Pay(ctx, leg.Channel, refundIntent(leg.Intent), tr,
+		directPeer{t, f.payees[0].coord}); err != nil {
+		t.Fatalf("refund leg 0: %v", err)
+	}
+
+	revived, err := NewMultipathExecutor(f.payer.coord, f.dir)
+	if err != nil {
+		t.Fatalf("revived: %v", err)
+	}
+	loaded, err := revived.LoadJournal(id)
+	if err != nil {
+		t.Fatalf("LoadJournal: %v", err)
+	}
+	if got := revived.Summarise(loaded).Refunded; got != 1 {
+		t.Fatalf("recovery misread the partial refund: %d refunded", got)
+	}
+	// Resuming without the secret finishes the unwind and must not
+	// double-refund the leg already returned.
+	out, errs, err := revived.Resume(ctx, id, nil, f.peers(t))
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	noErrs(t, "resume", errs)
+	if out.Refunded != 3 || out.SettledAmount.Sign() != 0 {
+		t.Fatalf("unwind incomplete: %+v", out)
+	}
+	f.conserves(t, loaded)
+}
+
+// Hub liquidity exhaustion in a multi-path context.
+//
+// Each fragment travels its own hub, so exhausting one must fail exactly one
+// fragment and must not consume any other hub's outbound capacity.
+func TestHubLiquidityExhaustionAffectsOnlyItsOwnFragment(t *testing.T) {
+	// Three hubs, one per fragment. The middle one is short.
+	hubs := []*Hub{NewHub(), NewHub(), NewHub()}
+	outbound := []Amount{1000, 5, 1000}
+	for i, h := range hubs {
+		if err := h.OpenReader(p13Tipper, 1000); err != nil {
+			t.Fatalf("hub %d: %v", i, err)
+		}
+		h.FundRecipient(p13Recipient, outbound[i])
+	}
+	before := make([]p13Conservation, len(hubs))
+	for i, h := range hubs {
+		before[i] = snapshot(h, p13Tipper, p13Recipient)
+	}
+
+	var reserved []int
+	for i, h := range hubs {
+		var secret Preimage
+		secret[31] = byte(i + 1)
+		_, err := h.Reserve(p13Tipper, p13Recipient, 100, HashOf(secret))
+		if err == nil {
+			reserved = append(reserved, i)
+			continue
+		}
+		if i != 1 {
+			t.Fatalf("hub %d refused a payment it had capacity for: %v", i, err)
+		}
+	}
+	if len(reserved) != 2 {
+		t.Fatalf("expected 2 fragments to reserve, got %d", len(reserved))
+	}
+	// The exhausted hub must be untouched — it must not have been debited for a
+	// payment it could not deliver.
+	if snapshot(hubs[1], p13Tipper, p13Recipient) != before[1] {
+		t.Fatal("the exhausted hub moved value for a payment it refused")
+	}
+	if hubs[1].Failed == 0 {
+		t.Fatal("an undeliverable fragment was not counted as failed")
+	}
+	// And the healthy hubs' capacity is exactly what their own fragment took.
+	for _, i := range reserved {
+		got := snapshot(hubs[i], p13Tipper, p13Recipient)
+		if got.outbound != before[i].outbound-100 {
+			t.Fatalf("hub %d outbound %d, want %d", i, got.outbound, before[i].outbound-100)
+		}
+		// Reserve commits TWO pots for one payment: the reader's inbound and the
+		// hub's own outbound. So the invariant is per-side, not a single sum —
+		// reader+inflight and outbound+inflight each stay whole. Checking one
+		// combined total would look like a 100-unit leak on every reservation,
+		// which is how a correct hub gets mistaken for a leaking one.
+		if got.reader+got.inFlight != before[i].reader {
+			t.Fatalf("hub %d inbound side leaked: %d+%d != %d",
+				i, got.reader, got.inFlight, before[i].reader)
+		}
+		if got.outbound+got.inFlight != before[i].outbound {
+			t.Fatalf("hub %d outbound side leaked: %d+%d != %d",
+				i, got.outbound, got.inFlight, before[i].outbound)
+		}
+	}
+}
+
+// ---- the real SplitPlan, executed ------------------------------------------
+
+// A genuine Split() plan, converted and driven to completion through the engine.
+//
+// This is the requirement the executor existed to satisfy and did not: until
+// now nothing consumed a SplitPlan, so "the executor makes SplitPlan
+// executable" was a claim about two types that had never met.
+func TestARealSplitPlanIsExecutable(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	ctx := context.Background()
+
+	c := DefaultCurve()
+	_, Z, err := NewSecret(c)
+	if err != nil {
+		t.Fatalf("NewSecret: %v", err)
+	}
+	plan, err := Split(c, Z, Amount(120_000), threeIndependentRoutes())
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	if len(plan.Fragments) < 2 {
+		t.Fatalf("split produced %d fragments", len(plan.Fragments))
+	}
+
+	pay, err := PaymentFromSplitPlan(plan, [32]byte{31: 220}, f.secret,
+		f.channels[:len(plan.Fragments)], mpClock, 900, mpClock+86_400)
+	if err != nil {
+		t.Fatalf("PaymentFromSplitPlan: %v", err)
+	}
+
+	// The converted payment must account for exactly the plan's total.
+	planTotal := new(big.Int).SetInt64(int64(plan.Total))
+	if pay.Total.Cmp(planTotal) != 0 {
+		t.Fatalf("converted total %s, plan total %s", pay.Total, planTotal)
+	}
+	sum := new(big.Int)
+	for _, leg := range pay.Legs {
+		sum.Add(sum, leg.Amount)
+	}
+	if sum.Cmp(planTotal) != 0 {
+		t.Fatalf("legs sum to %s, plan total %s", sum, planTotal)
+	}
+
+	// Drive it through the real engine, end to end.
+	errs, err := f.exec.Lock(ctx, pay, f.peers(t))
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	noErrs(t, "lock", errs)
+	errs, err = f.exec.Settle(ctx, pay, f.secret, f.peers(t))
+	if err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	noErrs(t, "settle", errs)
+
+	out := f.exec.Summarise(pay)
+	if !out.Complete(pay) {
+		t.Fatalf("a real split plan did not settle completely: %+v", out)
+	}
+	f.conserves(t, pay)
+
+	// The routing locks are still reachable and still per-fragment distinct —
+	// the conversion carries them rather than discarding them.
+	seen := map[string]bool{}
+	for i := range plan.Fragments {
+		lc, err := RoutingLocksFor(plan, i)
+		if err != nil || lc == nil || len(lc.Locks) == 0 {
+			t.Fatalf("fragment %d lost its routing locks: %v", i, err)
+		}
+		for _, l := range lc.Locks {
+			k := l.X.String() + ":" + l.Y.String()
+			if seen[k] {
+				t.Fatalf("fragment %d shares a routing lock point with another", i)
+			}
+			seen[k] = true
+		}
+	}
+}
+
+// Expiries must come from each fragment's OWN route length.
+//
+// A uniform window would starve the longest route — every hop needs time to
+// claim upstream after paying downstream — while over-exposing the shortest.
+func TestConvertedExpiriesScaleWithRouteLength(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	c := DefaultCurve()
+	_, Z, _ := NewSecret(c)
+
+	// Routes of deliberately different lengths.
+	routes := [][]Candidate{
+		routeOf("a1", "a2"),
+		routeOf("b1", "b2", "b3"),
+	}
+	plan, err := Split(c, Z, Amount(120_000), routes)
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	pay, err := PaymentFromSplitPlan(plan, [32]byte{31: 221}, f.secret,
+		f.channels[:len(plan.Fragments)], mpClock, 900, mpClock+86_400)
+	if err != nil {
+		t.Fatalf("PaymentFromSplitPlan: %v", err)
+	}
+
+	for i, leg := range pay.Legs {
+		hops := len(plan.Fragments[i].Route)
+		want := mpClock + 900*int64(hops+1)
+		if leg.Expiry != want {
+			t.Fatalf("fragment %d has %d hops, expiry %d, want %d",
+				i, hops, leg.Expiry, want)
+		}
+	}
+	// The longer route really does get the longer window.
+	if len(pay.Legs) >= 2 {
+		shortIdx, longIdx := 0, 1
+		if len(plan.Fragments[0].Route) > len(plan.Fragments[1].Route) {
+			shortIdx, longIdx = 1, 0
+		}
+		if pay.Legs[longIdx].Expiry <= pay.Legs[shortIdx].Expiry {
+			t.Fatal("the longer route did not receive a longer window")
+		}
+	}
+}
+
+// A tampered plan must not become signed channel states.
+func TestConversionRefusesATamperedPlan(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	c := DefaultCurve()
+	_, Z, _ := NewSecret(c)
+	plan, err := Split(c, Z, Amount(120_000), threeIndependentRoutes())
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	// Shave a fragment: the plan no longer sums to its own total.
+	plan.Fragments[0].Amount -= 1
+	if _, err := PaymentFromSplitPlan(plan, [32]byte{31: 222}, f.secret,
+		f.channels[:len(plan.Fragments)], mpClock, 900, mpClock+86_400); err == nil {
+		t.Fatal("a plan that fails its own Verify was converted into a payment")
+	}
+}
+
+// The channel assignment must match the plan exactly.
+func TestConversionRefusesAChannelMismatch(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	c := DefaultCurve()
+	_, Z, _ := NewSecret(c)
+	plan, err := Split(c, Z, Amount(120_000), threeIndependentRoutes())
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	// One channel short.
+	if _, err := PaymentFromSplitPlan(plan, [32]byte{31: 223}, f.secret,
+		f.channels[:len(plan.Fragments)-1], mpClock, 900, mpClock+86_400); !errors.Is(err, ErrPlanChannelMismatch) {
+		t.Fatalf("a short channel list was accepted: %v", err)
+	}
+	// And a per-hop window of zero would produce an unset expiry.
+	if _, err := PaymentFromSplitPlan(plan, [32]byte{31: 224}, f.secret,
+		f.channels[:len(plan.Fragments)], mpClock, 0, mpClock+86_400); err == nil {
+		t.Fatal("a zero per-hop window was accepted")
+	}
+}
+
+// A converted payment whose windows exceed the deadline must be refused, so the
+// route length cannot silently extend the payer's exposure.
+func TestConversionRespectsThePaymentDeadline(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	c := DefaultCurve()
+	_, Z, _ := NewSecret(c)
+	plan, err := Split(c, Z, Amount(120_000), threeIndependentRoutes())
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	// A deadline shorter than even one hop's window.
+	if _, err := PaymentFromSplitPlan(plan, [32]byte{31: 225}, f.secret,
+		f.channels[:len(plan.Fragments)], mpClock, 900, mpClock+100); !errors.Is(err, ErrFragmentExpiryUnsafe) {
+		t.Fatalf("route-derived expiries overran the deadline unchecked: %v", err)
+	}
+}
+
+// A fragment with no route cannot be delivered, and must be refused.
+//
+// Split() itself cannot produce one — BuildLocks rejects a zero-hop route — but
+// PaymentFromSplitPlan is exported and takes a *SplitPlan, so a hand-assembled
+// or mutated plan can carry one. SplitPlan.Verify does NOT catch it: it checks
+// the fragment sum and operator disjointness, and a route with no hops has no
+// operators to clash with, so it passes cleanly.
+//
+// Left unchecked the fragment gets a valid-looking expiry and joins the payment
+// as a leg that nothing can carry.
+func TestConversionRefusesARoutelessFragment(t *testing.T) {
+	f := newMPFixture(t, 3, anon(500))
+	c := DefaultCurve()
+	_, Z, _ := NewSecret(c)
+	plan, err := Split(c, Z, Amount(120_000), threeIndependentRoutes())
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	// Strip one fragment's route, leaving amounts untouched so the plan still
+	// sums correctly and still verifies.
+	plan.Fragments[1].Route = nil
+	if err := plan.Verify(); err != nil {
+		t.Fatalf("precondition: the stripped plan should still verify, got %v", err)
+	}
+	if _, err := PaymentFromSplitPlan(plan, [32]byte{31: 226}, f.secret,
+		f.channels[:len(plan.Fragments)], mpClock, 900, mpClock+86_400); err == nil {
+		t.Fatal("a fragment with no route was converted into an executable leg")
+	}
+}
+
+// A preimage from ONE payment must not settle a fragment of ANOTHER.
+//
+// This is the attack adversarial review found and proved: the preimage was
+// derived from (secret, index), so two payments sharing a secret produced the
+// SAME hash for fragment i. A counterparty that legitimately learned preimage_0
+// by settling payment A could then settle fragment 0 of payment B and be paid
+// twice for one secret.
+//
+// Nothing downstream stops it: HTLC.Matches is a bare keccak with no binding to
+// lock id, channel, amount or payment, and Channel.Accept dedupes on lock ID
+// only — state.go permits two locks sharing a hash on purpose, for exactly the
+// multipath case.
+//
+// The fix keys the preimage on the leg's INTENT, which commits to payment id,
+// index, channel and amount.
+func TestAPreimageFromOnePaymentCannotSettleAnother(t *testing.T) {
+	f := newMPFixture(t, 2, anon(500))
+	ctx := context.Background()
+
+	// Payment A, settled legitimately, so its counterparty knows preimage_0.
+	payA := f.payment(t, [32]byte{31: 0xE1}, 40, 60)
+	if _, err := f.exec.Lock(ctx, payA, f.peers(t)); err != nil {
+		t.Fatalf("lock A: %v", err)
+	}
+	if _, err := f.exec.Settle(ctx, payA, f.secret, f.peers(t)); err != nil {
+		t.Fatalf("settle A: %v", err)
+	}
+	leakedA := FragmentPreimage(f.secret, payA.Legs[0].Intent)
+
+	// Payment B: different id, SAME secret, same channels.
+	payB := f.payment(t, [32]byte{31: 0xE2}, 40, 60)
+
+	// The hashes must differ, or the leak transfers.
+	if payA.Legs[0].Hash == payB.Legs[0].Hash {
+		t.Fatal("two payments sharing a secret produced the same fragment hash; " +
+			"a preimage learned from one settles the other")
+	}
+	if _, err := f.exec.Lock(ctx, payB, f.peers(t)); err != nil {
+		t.Fatalf("lock B: %v", err)
+	}
+
+	// The counterparty tries payment A's preimage against payment B's lock.
+	tr := StateTransition{Kind: KindLockSettle,
+		LockID: payB.Legs[0].LockID, Preimage: leakedA}
+	if _, err := f.payer.coord.Pay(ctx, payB.Legs[0].Channel,
+		derive("test/cross-payment", payB.Legs[0].Intent[:]), tr,
+		directPeer{t, f.payees[0].coord}); err == nil {
+		t.Fatal("a preimage from a previous payment settled this one")
+	}
+
+	// And payment B still settles with its own preimages.
+	errs, err := f.exec.Settle(ctx, payB, f.secret, f.peers(t))
+	if err != nil {
+		t.Fatalf("settle B: %v", err)
+	}
+	noErrs(t, "settle B", errs)
+	if !f.exec.Summarise(payB).Complete(payB) {
+		t.Fatal("payment B did not settle after a rejected cross-payment claim")
+	}
+	// conserves() assumes the channels carried ONE payment; here they carried
+	// two, so check the combined figure directly. Exactly two payments' worth
+	// must have been delivered — not three, which is what the theft would have
+	// produced.
+	delivered := new(big.Int)
+	for i, leg := range payB.Legs {
+		bal, err := f.payees[i].coord.Balances(leg.Channel)
+		if err != nil {
+			t.Fatalf("balances: %v", err)
+		}
+		delivered.Add(delivered, bal.Mine)
+	}
+	want := new(big.Int).Add(payA.Total, payB.Total)
+	if delivered.Cmp(want) != 0 {
+		t.Fatalf("channels delivered %s across two payments, want %s", delivered, want)
+	}
+}
+
+// Re-splitting the same payment id must not reuse a fragment hash.
+//
+// unevenSplit draws fresh random weights per call, so a retry after a refused
+// leg produces different amounts. The amount is in the intent, so intents and
+// lock ids change — and the hash must change with them, or the channel ends up
+// holding two locks the payee can settle with one preimage.
+func TestReSplittingDoesNotReuseAFragmentHash(t *testing.T) {
+	f := newMPFixture(t, 2, anon(500))
+	id := [32]byte{31: 0xE3}
+	first := f.payment(t, id, 40, 60)
+	// Same id, same secret, DIFFERENT split of the same total.
+	second := f.payment(t, id, 25, 75)
+
+	if first.Total.Cmp(second.Total) != 0 {
+		t.Fatal("precondition: both splits must carry the same total")
+	}
+	for i := range first.Legs {
+		if first.Legs[i].Hash == second.Legs[i].Hash {
+			t.Fatalf("leg %d reused its hash across a re-split (%s -> %s); "+
+				"one preimage would settle both locks",
+				i, first.Legs[i].Amount, second.Legs[i].Amount)
+		}
+		if first.Legs[i].LockID == second.Legs[i].LockID {
+			t.Fatalf("leg %d reused its lock id across a re-split", i)
+		}
 	}
 }
