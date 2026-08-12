@@ -337,6 +337,98 @@ func (o InclusionObservation) AsEvidence(chainID int64, takenAt int64) (Evidence
 	}, nil
 }
 
+// RepricingSample is one full recovery cycle: a transaction that could not be
+// mined, replaced at the same nonce by one that could.
+type RepricingSample struct {
+	OriginalHash, ReplacementHash string
+	// Recovery is original submission to replacement inclusion, from BLOCK
+	// timestamps. The local clock is not in this number.
+	Recovery time.Duration
+	// OriginalUnmined records that the original never obtained a receipt. A
+	// sample where it did is not a repricing sample at all — nothing was
+	// repriced — which is what the guard below turns on.
+	OriginalUnmined bool
+	// ReplacementSucceeded is the replacement's receipt status, not merely its
+	// presence. A reverted replacement is a failed recovery.
+	ReplacementSucceeded bool
+	BaseFeeGwei          float64
+}
+
+// RepricingObservation is a campaign of recovery cycles against a real chain.
+type RepricingObservation struct {
+	Samples []RepricingSample
+	// Discarded counts samples that did not satisfy the validity rules, by
+	// reason. RECORDED, not dropped: a campaign that retries until it has
+	// enough survivors is selecting for a favourable answer, and the only
+	// defence is that the selection is visible.
+	Discarded map[string]int
+	Account   string
+	// Conditions describes the fee regime this was measured in. Required —
+	// see AsEvidence.
+	Conditions string
+}
+
+// AsEvidence turns a repricing campaign into a validation record.
+//
+// Two refusals, for two different ways this term gets validated by accident.
+//
+// FIRST, a sample in which nothing was repriced. If the original was mined, the
+// replacement path never ran, and the cycle "completed" quickly for the one
+// reason that makes it meaningless. Recording that as a fast sample pulls the
+// distribution toward zero using observations where the mechanism under test
+// did not execute. Same shape as the abandoned-transaction guard on inclusion.
+//
+// SECOND, a campaign with no stated conditions. This measurement is only
+// meaningful relative to the fee market it ran in, and a number carried without
+// that context WILL eventually be read as a general claim about Ethereum. The
+// conditions travel inside Method so they cannot be separated from the figure.
+func (o RepricingObservation) AsEvidence(chainID int64, takenAt int64) (Evidence, error) {
+	if len(o.Samples) == 0 {
+		return Evidence{}, errors.New("chainprobe: no repricing samples")
+	}
+	if strings.TrimSpace(o.Conditions) == "" {
+		return Evidence{}, errors.New(
+			"chainprobe: a repricing campaign must state the fee conditions it ran in; " +
+				"a recovery time without them reads as a claim about all conditions")
+	}
+	var worst time.Duration
+	minFee, maxFee := math.Inf(1), math.Inf(-1)
+	for i, s := range o.Samples {
+		if !s.OriginalUnmined {
+			return Evidence{}, fmt.Errorf(
+				"chainprobe: sample %d had its original mined, so nothing was repriced; "+
+					"a cycle that skipped the replacement path is not a fast sample", i+1)
+		}
+		if !s.ReplacementSucceeded {
+			return Evidence{}, fmt.Errorf(
+				"chainprobe: sample %d's replacement did not succeed; "+
+					"a failed recovery is not a recovery", i+1)
+		}
+		if s.Recovery > worst {
+			worst = s.Recovery
+		}
+		minFee = math.Min(minFee, s.BaseFeeGwei)
+		maxFee = math.Max(maxFee, s.BaseFeeGwei)
+	}
+	var discards int
+	for _, n := range o.Discarded {
+		discards += n
+	}
+	return Evidence{
+		Term: "repricing", Measured: worst, Samples: len(o.Samples),
+		ChainID: chainID, TakenAt: takenAt,
+		Method: fmt.Sprintf(
+			"%d full recovery cycles from %s: an EIP-1559 transaction with maxFeePerGas "+
+				"below the base fee (arithmetically unmineable), replaced at the same nonce "+
+				"one block later at a fee priced to confirm; recovery measured from block "+
+				"timestamps, original submission to replacement inclusion; worst %s; "+
+				"%d discarded; base fee %.3f–%.3f gwei. "+
+				"LIMITATION: %s. This does NOT establish replacement behaviour during "+
+				"sustained fee-market congestion.",
+			len(o.Samples), o.Account, worst, discards, minFee, maxFee, o.Conditions),
+	}, nil
+}
+
 // providerOf reduces an endpoint URL to the operator it most likely belongs to.
 //
 // The last two labels of the host: eth-mainnet.g.alchemy.com and
