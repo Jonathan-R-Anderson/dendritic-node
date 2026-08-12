@@ -284,29 +284,94 @@ func TestAFailedSignatureLeavesRotationUntouched(t *testing.T) {
 
 // ---- fork discipline ---------------------------------------------------------
 
-// The layout must travel with the state. A state that names no fork cannot
-// verify anything, rather than silently using Altair's indices.
-func TestAStateWithNoSpecVersionRefuses(t *testing.T) {
+// Branch indices no longer depend on the state's Spec field — they are chosen
+// by slot. Spec still governs the EXECUTION PAYLOAD layout, where the field
+// count differs by fork, and an unnamed fork must still refuse there.
+func TestAnUnnamedForkStillRefusesToRootAPayload(t *testing.T) {
 	s := rotatingState(t)
 	s.Spec = ""
 
+	// Branch validation proceeds: the slot decides the layout, not s.Spec.
 	if err := s.ApplyRotatingUpdate(updateAt(t, 2*periodSlots+10, 2*periodSlots+50, nil),
-		&countingVerifier{}); !errors.Is(err, ErrSpecUnsupported) {
-		t.Fatalf("got %v, want ErrSpecUnsupported", err)
+		&countingVerifier{}); err != nil {
+		t.Fatalf("branch validation should not depend on s.Spec: %v", err)
+	}
+	// The payload path still refuses, which is where the field count matters.
+	if _, err := samplePayload().HashTreeRoot(""); !errors.Is(err, ErrSpecUnsupported) {
+		t.Fatalf("an unnamed fork rooted a payload: %v", err)
 	}
 }
 
-// Electra moved the indices and we have not recorded them. Refusing to start is
-// recoverable; verifying a branch against the wrong field is not.
-func TestElectraRefusesRatherThanGuessing(t *testing.T) {
-	if _, err := IndicesFor(SpecElectra); !errors.Is(err, ErrSpecUnsupported) {
-		t.Fatalf("got %v, want ErrSpecUnsupported — Electra's indices must not be guessed", err)
+// Electra's indices are now RECORDED, from consensus-specs v1.6.1
+// specs/electra/light-client/sync-protocol.md. They were taken from the spec,
+// not inferred from observed branch depths — this pins the exact values so a
+// later edit cannot quietly substitute a guess.
+func TestElectraIndicesAreTheSpecValues(t *testing.T) {
+	got, err := IndicesFor(SpecElectra)
+	if err != nil {
+		t.Fatalf("IndicesFor(electra): %v", err)
 	}
-	s := rotatingState(t)
-	s.Spec = SpecElectra
-	if err := s.ApplyRotatingUpdate(updateAt(t, 2*periodSlots+10, 2*periodSlots+50, nil),
-		&countingVerifier{}); !errors.Is(err, ErrSpecUnsupported) {
-		t.Fatalf("an Electra state verified against Altair's layout: %v", err)
+	if got.FinalizedRoot != 169 {
+		t.Errorf("FINALIZED_ROOT_GINDEX_ELECTRA = %d, spec says 169", got.FinalizedRoot)
+	}
+	if got.CurrentSyncCommittee != 86 {
+		t.Errorf("CURRENT_SYNC_COMMITTEE_GINDEX_ELECTRA = %d, spec says 86", got.CurrentSyncCommittee)
+	}
+	if got.NextSyncCommittee != 87 {
+		t.Errorf("NEXT_SYNC_COMMITTEE_GINDEX_ELECTRA = %d, spec says 87", got.NextSyncCommittee)
+	}
+
+	// Fulu inherits Electra's light client protocol — consensus-specs v1.6.1
+	// has no specs/fulu/light-client directory.
+	fulu, err := IndicesFor(SpecFulu)
+	if err != nil {
+		t.Fatalf("IndicesFor(fulu): %v", err)
+	}
+	if fulu != got {
+		t.Error("Fulu should inherit Electra's indices unchanged")
+	}
+
+	// The depths these imply must match what mainnet actually serves: 7/6/6.
+	// A CONFIRMATION of the spec values, not their source.
+	for name, tc := range map[string]struct{ index, depth uint64 }{
+		"finality":          {got.FinalizedRoot, 7},
+		"current committee": {got.CurrentSyncCommittee, 6},
+		"next committee":    {got.NextSyncCommittee, 6},
+	} {
+		if d := uint64(GeneralizedIndexDepth(tc.index)); d != tc.depth {
+			t.Errorf("%s branch depth %d, mainnet serves %d", name, d, tc.depth)
+		}
+	}
+}
+
+// An unrecorded fork still refuses. The rule did not go away; Electra simply
+// stopped being one of them.
+func TestAnUnknownForkStillRefuses(t *testing.T) {
+	if _, err := IndicesFor("bellatrix-ish"); !errors.Is(err, ErrSpecUnsupported) {
+		t.Fatalf("got %v, want ErrSpecUnsupported", err)
+	}
+	if _, err := IndicesFor(""); !errors.Is(err, ErrSpecUnsupported) {
+		t.Fatalf("an unnamed fork returned indices: %v", err)
+	}
+}
+
+// The layout is chosen BY SLOT, as the spec's *_gindex_at_slot functions do.
+// At a fork boundary one configured version would get one side wrong.
+func TestIndicesAreChosenBySlotAcrossTheForkBoundary(t *testing.T) {
+	beforeFork := uint64(MainnetElectraForkEpoch-1) * SlotsPerEpoch
+	atFork := uint64(MainnetElectraForkEpoch) * SlotsPerEpoch
+
+	if got := IndicesAtSlot(beforeFork); got.FinalizedRoot != FinalizedRootIndex {
+		t.Errorf("pre-Electra slot got index %d, want Altair's %d",
+			got.FinalizedRoot, FinalizedRootIndex)
+	}
+	if got := IndicesAtSlot(atFork); got.FinalizedRoot != FinalizedRootIndexElectra {
+		t.Errorf("Electra-epoch slot got index %d, want %d",
+			got.FinalizedRoot, FinalizedRootIndexElectra)
+	}
+	// And mainnet's current head is well past it.
+	if got := IndicesAtSlot(uint64(MainnetFuluForkEpoch) * SlotsPerEpoch); got.FinalizedRoot != FinalizedRootIndexElectra {
+		t.Error("a Fulu-era slot did not get the Electra layout")
 	}
 }
 

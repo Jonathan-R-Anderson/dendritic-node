@@ -92,13 +92,36 @@ func TestAFinalityUpdateWithoutAProofIsRefused(t *testing.T) {
 
 // ---- 5. wrong fork ----------------------------------------------------------
 
-func TestFinalityUnderTheWrongForkIsRefused(t *testing.T) {
+// A branch built for the WRONG fork's layout must be refused.
+//
+// Now that indices are chosen by slot, this is the real fork-mismatch: a branch
+// of Altair depth offered for an Electra-era slot. It is what a client using a
+// stale layout would produce, and it must fail rather than verify against a
+// different field.
+func TestABranchFromTheWrongForkLayoutIsRefused(t *testing.T) {
+	// An Electra-era slot: the layout there wants a depth-7 finality branch.
+	electraSlot := uint64(MainnetElectraForkEpoch)*SlotsPerEpoch + 100
 	s := finalityState(t)
-	s.Spec = SpecElectra // indices not recorded; must refuse rather than guess
+	s.FinalizedHeader = BeaconBlockHeader{Slot: electraSlot}
+	s.CurrentCommittee = committee(0xAA)
 
-	u := updateAt(t, 2*periodSlots+10, 2*periodSlots+50, nil)
-	if err := s.ApplyFinalityUpdate(u, &countingVerifier{}); !errors.Is(err, ErrSpecUnsupported) {
-		t.Fatalf("got %v, want ErrSpecUnsupported", err)
+	u := &Update{
+		FinalizedHeader: BeaconBlockHeader{Slot: electraSlot + 10},
+		AttestedHeader:  BeaconBlockHeader{Slot: electraSlot + 20},
+		SignatureSlot:   electraSlot + 21,
+		Participation:   fullParticipation(),
+		Signature:       make([]byte, 96),
+	}
+	// A branch built at ALTAIR's index — the wrong depth for this slot.
+	root, err := u.FinalizedHeader.HashTreeRoot()
+	if err != nil {
+		t.Fatalf("HashTreeRoot: %v", err)
+	}
+	branch, stateRoot := branchFor(t, root, FinalizedRootIndex)
+	u.FinalityBranch, u.AttestedHeader.StateRoot = branch, stateRoot
+
+	if err := s.ApplyFinalityUpdate(u, &countingVerifier{}); !errors.Is(err, ErrBranchWrongField) {
+		t.Fatalf("an Altair-layout branch verified at an Electra-era slot: %v", err)
 	}
 }
 

@@ -31,6 +31,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
@@ -57,6 +58,11 @@ func (c *BeaconClient) get(ctx context.Context, path string, out any) error {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	// Some providers sit behind a WAF that rejects requests without one. A
+	// transport detail, not a trust one — but a 403 here would otherwise read
+	// as "this source cannot be asked", which the checkpoint acquirer treats
+	// as a hard failure.
+	req.Header.Set("User-Agent", "syndichan-lightclient/1.0")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
@@ -141,6 +147,77 @@ func (j jsonCommittee) decode() (*SyncCommittee, error) {
 	return out, nil
 }
 
+// decode turns the beacon API's execution payload header into ours.
+//
+// Note the two encodings the API mixes: base_fee_per_gas is a DECIMAL string
+// and must become a little-endian uint256, while the roots are hex. Getting the
+// base fee's endianness wrong produces a payload root that is wrong by a byte
+// reversal, which looks exactly like a bad branch.
+func (j jsonExecution) decode() (ExecutionPayloadHeader, error) {
+	var p ExecutionPayloadHeader
+
+	for _, f := range []struct {
+		src string
+		dst *Root
+	}{
+		{j.ParentHash, &p.ParentHash}, {j.StateRoot, &p.StateRoot},
+		{j.ReceiptsRoot, &p.ReceiptsRoot}, {j.PrevRandao, &p.PrevRandao},
+		{j.BlockHash, &p.BlockHash}, {j.TxRoot, &p.TxRoot},
+		{j.Withdrawals, &p.WithdrawalsRoot},
+	} {
+		r, err := decodeHex32(f.src)
+		if err != nil {
+			return p, err
+		}
+		*f.dst = r
+	}
+
+	fee, err := decodeHexBytes(j.FeeRecipient)
+	if err != nil || len(fee) != 20 {
+		return p, fmt.Errorf("beacon: fee_recipient %q", j.FeeRecipient)
+	}
+	copy(p.FeeRecipient[:], fee)
+
+	bloom, err := decodeHexBytes(j.LogsBloom)
+	if err != nil || len(bloom) != 256 {
+		return p, fmt.Errorf("beacon: logs_bloom is %d bytes, want 256", len(bloom))
+	}
+	copy(p.LogsBloom[:], bloom)
+
+	if p.ExtraData, err = decodeHexBytes(j.ExtraData); err != nil {
+		return p, fmt.Errorf("beacon: extra_data: %w", err)
+	}
+
+	for _, f := range []struct {
+		src string
+		dst *uint64
+	}{
+		{j.BlockNumber, &p.BlockNumber}, {j.GasLimit, &p.GasLimit},
+		{j.GasUsed, &p.GasUsed}, {j.Timestamp, &p.Timestamp},
+		{j.BlobGasUsed, &p.BlobGasUsed}, {j.ExcessBlobGas, &p.ExcessBlobGas},
+	} {
+		v, err := strconv.ParseUint(f.src, 10, 64)
+		if err != nil {
+			return p, fmt.Errorf("beacon: %q is not a uint64: %w", f.src, err)
+		}
+		*f.dst = v
+	}
+
+	// uint256, decimal in, little-endian out.
+	base, ok := new(big.Int).SetString(j.BaseFeePerGas, 10)
+	if !ok {
+		return p, fmt.Errorf("beacon: base_fee_per_gas %q is not a decimal", j.BaseFeePerGas)
+	}
+	be := base.Bytes()
+	if len(be) > 32 {
+		return p, fmt.Errorf("beacon: base_fee_per_gas exceeds a uint256")
+	}
+	for i, b := range be {
+		p.BaseFeePerGas[len(be)-1-i] = b // reverse into little-endian
+	}
+	return p, nil
+}
+
 func decodeBranch(hexes []string) ([]Root, error) {
 	out := make([]Root, 0, len(hexes))
 	for i, h := range hexes {
@@ -194,40 +271,49 @@ func (c *BeaconClient) Bootstrap(ctx context.Context, blockRoot string) (Bootstr
 		CurrentSyncCommitteeBranch: branch}, nil
 }
 
+// jsonExecution is the LightClientHeader's execution payload header.
+//
+// PART OF THE AUTHENTICATED RELATIONSHIP, not incidental JSON. Since Capella the
+// LightClientHeader carries beacon + execution + execution_branch, and the
+// branch proves the payload sits in THAT beacon block's body. Discarding it —
+// as an earlier version of this decoder did — throws away the only link from
+// consensus to the execution state root, which is the entire point of P12-5.7.
+type jsonExecution struct {
+	ParentHash    string `json:"parent_hash"`
+	FeeRecipient  string `json:"fee_recipient"`
+	StateRoot     string `json:"state_root"`
+	ReceiptsRoot  string `json:"receipts_root"`
+	LogsBloom     string `json:"logs_bloom"`
+	PrevRandao    string `json:"prev_randao"`
+	BlockNumber   string `json:"block_number"`
+	GasLimit      string `json:"gas_limit"`
+	GasUsed       string `json:"gas_used"`
+	Timestamp     string `json:"timestamp"`
+	ExtraData     string `json:"extra_data"`
+	BaseFeePerGas string `json:"base_fee_per_gas"`
+	BlockHash     string `json:"block_hash"`
+	TxRoot        string `json:"transactions_root"`
+	Withdrawals   string `json:"withdrawals_root"`
+	BlobGasUsed   string `json:"blob_gas_used"`
+	ExcessBlobGas string `json:"excess_blob_gas"`
+}
+
+// jsonLightClientHeader is beacon + execution + branch, the Capella-and-later
+// shape confirmed against live Fulu data.
+type jsonLightClientHeader struct {
+	Beacon          jsonHeader     `json:"beacon"`
+	Execution       *jsonExecution `json:"execution"`
+	ExecutionBranch []string       `json:"execution_branch"`
+}
+
 // jsonUpdate is the shared shape of light client updates.
 type jsonUpdate struct {
-	AttestedHeader struct {
-		Beacon    jsonHeader `json:"beacon"`
-		Execution *struct {
-			ParentHash    string `json:"parent_hash"`
-			FeeRecipient  string `json:"fee_recipient"`
-			StateRoot     string `json:"state_root"`
-			ReceiptsRoot  string `json:"receipts_root"`
-			LogsBloom     string `json:"logs_bloom"`
-			PrevRandao    string `json:"prev_randao"`
-			BlockNumber   string `json:"block_number"`
-			GasLimit      string `json:"gas_limit"`
-			GasUsed       string `json:"gas_used"`
-			Timestamp     string `json:"timestamp"`
-			ExtraData     string `json:"extra_data"`
-			BaseFeePerGas string `json:"base_fee_per_gas"`
-			BlockHash     string `json:"block_hash"`
-			TxRoot        string `json:"transactions_root"`
-			Withdrawals   string `json:"withdrawals_root"`
-			BlobGasUsed   string `json:"blob_gas_used"`
-			ExcessBlobGas string `json:"excess_blob_gas"`
-		} `json:"execution"`
-		ExecutionBranch []string `json:"execution_branch"`
-	} `json:"attested_header"`
-	NextSyncCommittee       *jsonCommittee `json:"next_sync_committee"`
-	NextSyncCommitteeBranch []string       `json:"next_sync_committee_branch"`
-	FinalizedHeader         *struct {
-		Beacon          jsonHeader `json:"beacon"`
-		Execution       *json.RawMessage `json:"execution"`
-		ExecutionBranch []string         `json:"execution_branch"`
-	} `json:"finalized_header"`
-	FinalityBranch []string `json:"finality_branch"`
-	SyncAggregate  struct {
+	AttestedHeader          jsonLightClientHeader  `json:"attested_header"`
+	NextSyncCommittee       *jsonCommittee         `json:"next_sync_committee"`
+	NextSyncCommitteeBranch []string               `json:"next_sync_committee_branch"`
+	FinalizedHeader         *jsonLightClientHeader `json:"finalized_header"`
+	FinalityBranch          []string               `json:"finality_branch"`
+	SyncAggregate           struct {
 		SyncCommitteeBits      string `json:"sync_committee_bits"`
 		SyncCommitteeSignature string `json:"sync_committee_signature"`
 	} `json:"sync_aggregate"`
@@ -247,6 +333,19 @@ func (j jsonUpdate) decode() (*Update, error) {
 			return nil, err
 		}
 		u.FinalizedHeader = finalized
+		// The execution payload and its branch belong to THIS header. Preserved
+		// so the bridge in P12-5.7 can authenticate the execution state root
+		// from the finalised block, which is the whole chain's last link.
+		if j.FinalizedHeader.Execution != nil {
+			payload, err := j.FinalizedHeader.Execution.decode()
+			if err != nil {
+				return nil, fmt.Errorf("beacon: finalized execution: %w", err)
+			}
+			u.FinalizedExecution = &payload
+			if u.FinalizedExecutionBranch, err = decodeBranch(j.FinalizedHeader.ExecutionBranch); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if u.FinalityBranch, err = decodeBranch(j.FinalityBranch); err != nil {
 		return nil, err

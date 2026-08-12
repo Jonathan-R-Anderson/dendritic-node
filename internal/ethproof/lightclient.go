@@ -203,6 +203,12 @@ type Update struct {
 	// NextSyncCommitteeIndex.
 	NextCommittee       *SyncCommittee
 	NextCommitteeBranch []Root
+	// FinalizedExecution is the execution payload header carried by the
+	// finalised LightClientHeader, with the branch proving it sits in that
+	// beacon block. Present from Capella onward. This is the link from
+	// consensus to the execution state root — see P12-5.7.
+	FinalizedExecution       *ExecutionPayloadHeader
+	FinalizedExecutionBranch []Root
 	// Participation and Signature are the sync aggregate.
 	Participation Participation
 	Signature     []byte
@@ -268,12 +274,21 @@ func (s *LightClientState) ValidateStructure(u *Update) error {
 }
 
 // SigningRootFor is what the committee's signature is over.
+//
+// The domain uses the fork version IN FORCE AT THE SIGNATURE SLOT, not the
+// checkpoint's. A signature made under Fulu does not verify under Electra's
+// domain, so anchoring in one era and verifying signatures from another with
+// the anchor's version rejects every real update. The genesis validators root
+// stays fixed — it identifies the CHAIN, while the fork version identifies the
+// ERA, and the domain needs both.
 func (s *LightClientState) SigningRootFor(u *Update) (Root, error) {
 	attestedRoot, err := u.AttestedHeader.HashTreeRoot()
 	if err != nil {
 		return Root{}, err
 	}
-	domain, err := s.Checkpoint.ComputeDomain()
+	era := s.Checkpoint
+	era.ForkVersion = ForkVersionAtSlot(u.SignatureSlot)
+	domain, err := era.ComputeDomain()
 	if err != nil {
 		return Root{}, err
 	}

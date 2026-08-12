@@ -113,10 +113,15 @@ func (p ExecutionPayloadHeader) HashTreeRoot(spec SpecVersion) (Root, error) {
 	}
 
 	switch spec {
-	case SpecAltair:
-		// Altair predates the merge and has no execution payload at all; the
-		// name is this package's shorthand for "the light client layout through
-		// Deneb", so the Deneb field set applies.
+	case SpecAltair, SpecElectra, SpecFulu:
+		// The Deneb field set: Capella added withdrawals_root and Deneb added
+		// the blob gas fields. Neither Electra nor Fulu redefines
+		// ExecutionPayloadHeader — consensus-specs v1.6.1 has no class
+		// definition for it under specs/electra or specs/fulu, only usages —
+		// so all three share this layout.
+		//
+		// Confirmed against live mainnet Fulu data, which serialises exactly
+		// these seventeen fields in this order.
 		fields = append(fields, p.WithdrawalsRoot,
 			Uint64Root(p.BlobGasUsed), Uint64Root(p.ExcessBlobGas))
 	default:

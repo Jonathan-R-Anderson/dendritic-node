@@ -231,11 +231,26 @@ func TestAnOverlongExtraDataIsRefused(t *testing.T) {
 // self-consistent and wrong. An unrecorded fork must refuse.
 func TestAnUnrecordedForkRefusesToRootAPayload(t *testing.T) {
 	p := samplePayload()
-	if _, err := p.HashTreeRoot(SpecElectra); !errors.Is(err, ErrSpecUnsupported) {
-		t.Fatalf("got %v, want ErrSpecUnsupported", err)
+	// Electra and Fulu are now RECORDED: neither redefines
+	// ExecutionPayloadHeader, so both share Deneb's seventeen fields. Confirmed
+	// against live mainnet Fulu data, which serialises exactly that set.
+	for _, spec := range []SpecVersion{SpecAltair, SpecElectra, SpecFulu} {
+		if _, err := p.HashTreeRoot(spec); err != nil {
+			t.Errorf("%s should be recorded: %v", spec, err)
+		}
 	}
+	// All three must agree, since the layout is the same.
+	a, _ := p.HashTreeRoot(SpecAltair)
+	b, _ := p.HashTreeRoot(SpecFulu)
+	if a != b {
+		t.Error("Fulu and the Deneb field set produced different payload roots")
+	}
+	// An unnamed or unknown fork still refuses.
 	if _, err := p.HashTreeRoot(""); !errors.Is(err, ErrSpecUnsupported) {
 		t.Fatalf("an unnamed fork rooted a payload: %v", err)
+	}
+	if _, err := p.HashTreeRoot("gloas"); !errors.Is(err, ErrSpecUnsupported) {
+		t.Fatalf("an unrecorded future fork rooted a payload: %v", err)
 	}
 }
 
