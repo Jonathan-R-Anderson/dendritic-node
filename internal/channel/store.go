@@ -1,0 +1,464 @@
+package channel
+
+// The durable home for money-bearing channel state.
+//
+// ONE INTERPRETATION OF STATE, NOT TWO
+// ------------------------------------
+// This package contains an older local ledger — native.go's channelState, signed
+// with the node's own key over proofDigest, in int64 Amounts. That is NOT this.
+// It is a domain-separated digest of its own invention, it has no relationship
+// to anything the chain will accept, and int64 cannot even hold one gold award
+// in wei.
+//
+// Everything here goes through Channel.Accept, which digests exactly what
+// ChannelManagerV2.stateDigest digests. If a state is good enough to store, it
+// is good enough to settle, and there is no second opinion about what a channel
+// currently holds.
+//
+// WHAT PERSISTENCE HAS TO BE SUFFICIENT FOR
+// -----------------------------------------
+// Not "the balances". The complete signed state, including every pending lock.
+// Consider what a lossy record does:
+//
+//	on chain, in the state both parties signed:   100 ANON locked
+//	this node, after a restart:                   100 ANON unlocked
+//
+// The node now believes it can spend value that is committed to somebody else's
+// preimage, will happily sign a state doing so, and the counterparty holds the
+// signature proving it. That is not a display bug, it is money.
+//
+// So the check at load is deliberately harsh: every stored state has its digest
+// RECOMPUTED and both signatures RE-RECOVERED. The digest covers the lock root,
+// so if persistence dropped a lock, changed an amount, lost an expiry or muddled
+// which party is the payer, the signatures stop verifying and the node refuses
+// to start. A record that cannot reproduce the signed digest is not a record of
+// that state.
+//
+// WHY AMOUNTS ARE STORED AS STRINGS
+// ---------------------------------
+// encoding/json renders *big.Int as a bare JSON number. Go reads that back
+// exactly; JavaScript does not — 100 ANON is 1e20, well past
+// Number.MAX_SAFE_INTEGER, and this file is the same state the payment node's
+// HTTP surface will eventually hand a browser. A balance that silently rounds
+// on its way through a JSON parser is the same class of bug as computing wei in
+// floating point, which the site already avoids elsewhere.
+//
+// WHY A FAILED WRITE IS A FAILED PAYMENT
+// --------------------------------------
+// Accept advances in-memory state only after the write is on disk and fsynced.
+// The reverse order works perfectly until the machine loses power between the
+// write and the flush, which is exactly the moment it matters: the counterparty
+// holds a signed state this node cannot prove, and there is no recovery from
+// that except their goodwill.
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/big"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+)
+
+var (
+	ErrNoSuchChannel   = errors.New("channel: no such channel in the store")
+	ErrChannelExists   = errors.New("channel: already in the store")
+	ErrStateUnreadable = errors.New("channel: stored state does not reproduce its signatures")
+)
+
+// Store holds V2 channel state durably.
+type Store struct {
+	dir      string
+	mu       sync.Mutex
+	channels map[[32]byte]*Channel
+}
+
+// OpenStore loads every channel under dir, or creates it.
+//
+// An unreadable or unverifiable channel file STOPS the node. It is tempting to
+// skip the bad file and carry on — that is right for a cache and wrong for
+// money, because carrying on means operating with a balance that is missing or
+// stale, and the first thing the node does with it is sign something.
+func OpenStore(dir string) (*Store, error) {
+	s := &Store{dir: dir, channels: map[[32]byte]*Channel{}}
+	if err := os.MkdirAll(filepath.Join(dir, "channels"), 0o700); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "channels"))
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, "channels", e.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("channel: %s unreadable, refusing to start: %w", path, err)
+		}
+		ch, err := decodeChannel(raw)
+		if err != nil {
+			return nil, fmt.Errorf("channel: %s malformed, refusing to start: %w", path, err)
+		}
+		if err := verifyLoaded(ch); err != nil {
+			return nil, fmt.Errorf("channel: %s: %w", path, err)
+		}
+		s.channels[ch.ID] = ch
+	}
+	return s, nil
+}
+
+// verifyLoaded re-derives the digest of the stored state and recovers both
+// signatures from it.
+//
+// This is the whole persistence guarantee in one function. Anything the digest
+// covers — nonce, both balances, and through the root every lock's id, hash,
+// amount, expiry and payer — must have survived the round trip exactly, or the
+// recovered addresses will not be the channel's parties.
+func verifyLoaded(ch *Channel) error {
+	if !ch.Latest.Complete() {
+		// A channel opened but never used has no state to check. Its deposits
+		// come from the chain, not from here.
+		return nil
+	}
+	raw := ch.Latest.State.Digest(ch.ChainID, ch.Contract)
+	a, err := RecoverSigner(raw, ch.Latest.SigA)
+	if err != nil {
+		return fmt.Errorf("%w: sigA: %v", ErrStateUnreadable, err)
+	}
+	b, err := RecoverSigner(raw, ch.Latest.SigB)
+	if err != nil {
+		return fmt.Errorf("%w: sigB: %v", ErrStateUnreadable, err)
+	}
+	if a != ch.PartyA || b != ch.PartyB {
+		return fmt.Errorf("%w: recovered %s/%s, parties are %s/%s",
+			ErrStateUnreadable, a.Hex(), b.Hex(), ch.PartyA.Hex(), ch.PartyB.Hex())
+	}
+	return nil
+}
+
+// Track registers a channel observed on chain.
+//
+// Deposits and parties come from the chain; this only records them. It does not
+// open anything — no transaction is sent from here.
+func (s *Store) Track(ch *Channel) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.channels[ch.ID]; exists {
+		return ErrChannelExists
+	}
+	if err := s.persist(ch); err != nil {
+		return err
+	}
+	s.channels[ch.ID] = ch
+	return nil
+}
+
+// Get returns a COPY of a channel's record.
+//
+// A copy because a caller holding a pointer into the store could mutate a
+// balance without going through Accept, which is the one door every state is
+// supposed to come through.
+func (s *Store) Get(id [32]byte) (*Channel, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, ok := s.channels[id]
+	if !ok {
+		return nil, false
+	}
+	clone := *ch
+	clone.Latest = cloneSigned(ch.Latest)
+	return &clone, true
+}
+
+// IDs lists tracked channels, in a stable order.
+func (s *Store) IDs() [][32]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([][32]byte, 0, len(s.channels))
+	for id := range s.channels {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return hex.EncodeToString(out[i][:]) < hex.EncodeToString(out[j][:])
+	})
+	return out
+}
+
+// Accept validates a state and, if it is good, makes it this channel's latest —
+// on disk first, then in memory.
+//
+// The validation is Channel.Accept's, unchanged and unduplicated: right channel,
+// strictly increasing nonce, no negatives, well-formed locks, conservation, and
+// both signatures over the V2 digest. Because that digest covers the lock root,
+// a state cannot be accepted with somebody else's locks attached to it, nor with
+// its own removed.
+//
+// The nonce rule is what makes stored state monotonic across restarts as well as
+// within a run: the stored nonce is loaded back, and 99 or 100 against a stored
+// 100 are both refused. Only 101 is even considered, and only then is the
+// expensive signature work done.
+func (s *Store) Accept(id [32]byte, candidate SignedState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ch, ok := s.channels[id]
+	if !ok {
+		return ErrNoSuchChannel
+	}
+
+	// Applied to a copy: Channel.Accept mutates on success, and a state that
+	// validates but cannot be written must leave nothing behind.
+	trial := *ch
+	trial.Latest = cloneSigned(ch.Latest)
+	if err := trial.Accept(candidate); err != nil {
+		return err
+	}
+	if err := s.persist(&trial); err != nil {
+		// NOT advanced. Reporting success for a payment that is not on disk is
+		// the bug the whole write ordering exists to prevent.
+		return err
+	}
+	*ch = trial
+	return nil
+}
+
+// persist writes one channel durably.
+//
+// Temp file, fsync, rename, then fsync the DIRECTORY. The last step is the one
+// usually omitted: without it the rename itself can be lost and the file
+// reappears with its old contents after a crash — an older state, which is
+// precisely what everything else here works to prevent.
+func (s *Store) persist(ch *Channel) error {
+	raw, err := encodeChannel(ch)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(s.dir, "channels")
+	name := hex.EncodeToString(ch.ID[:])
+	tmp := filepath.Join(dir, "."+name+".tmp")
+	final := filepath.Join(dir, name+".json")
+
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+func cloneSigned(ss SignedState) SignedState {
+	out := ss
+	out.SigA = append([]byte(nil), ss.SigA...)
+	out.SigB = append([]byte(nil), ss.SigB...)
+	out.State.Pending = append([]HTLC(nil), ss.State.Pending...)
+	return out
+}
+
+// ---- the on-disk form ------------------------------------------------------
+
+// Amounts are decimal strings. See the file header: a JSON number cannot carry
+// 1e20 through every parser that will read this.
+
+type storedHTLC struct {
+	ID       string `json:"id"`
+	Hash     string `json:"hash"`
+	Amount   string `json:"amount"`
+	Expiry   int64  `json:"expiry"`
+	PayerIsA bool   `json:"payer_is_a"`
+}
+
+type storedState struct {
+	Channel  string       `json:"channel"`
+	Nonce    uint64       `json:"nonce"`
+	BalanceA string       `json:"balance_a"`
+	BalanceB string       `json:"balance_b"`
+	Pending  []storedHTLC `json:"pending,omitempty"`
+}
+
+type storedChannel struct {
+	Version  int         `json:"version"`
+	ID       string      `json:"id"`
+	PartyA   string      `json:"party_a"`
+	PartyB   string      `json:"party_b"`
+	DepositA string      `json:"deposit_a"`
+	DepositB string      `json:"deposit_b"`
+	Status   uint8       `json:"status"`
+	ChainID  string      `json:"chain_id"`
+	Contract string      `json:"contract"`
+	State    storedState `json:"state"`
+	SigA     string      `json:"sig_a,omitempty"`
+	SigB     string      `json:"sig_b,omitempty"`
+}
+
+func decString(n *big.Int) string {
+	if n == nil {
+		return "0"
+	}
+	return n.String()
+}
+
+func parseDec(s string) (*big.Int, error) {
+	if s == "" {
+		return new(big.Int), nil
+	}
+	n, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return nil, fmt.Errorf("channel: %q is not a decimal amount", s)
+	}
+	return n, nil
+}
+
+func parseBytes32(s string) ([32]byte, error) {
+	var out [32]byte
+	raw, err := hex.DecodeString(s)
+	if err != nil || len(raw) != 32 {
+		return out, fmt.Errorf("channel: %q is not 32 hex bytes", s)
+	}
+	copy(out[:], raw)
+	return out, nil
+}
+
+func encodeChannel(ch *Channel) ([]byte, error) {
+	rec := storedChannel{
+		Version:  2,
+		ID:       hex.EncodeToString(ch.ID[:]),
+		PartyA:   ch.PartyA.Hex(),
+		PartyB:   ch.PartyB.Hex(),
+		DepositA: decString(ch.DepositA),
+		DepositB: decString(ch.DepositB),
+		Status:   uint8(ch.Status),
+		ChainID:  decString(ch.ChainID),
+		Contract: ch.Contract.Hex(),
+		SigA:     hex.EncodeToString(ch.Latest.SigA),
+		SigB:     hex.EncodeToString(ch.Latest.SigB),
+		State: storedState{
+			Channel:  hex.EncodeToString(ch.Latest.State.Channel[:]),
+			Nonce:    ch.Latest.State.Nonce,
+			BalanceA: decString(ch.Latest.State.BalanceA),
+			BalanceB: decString(ch.Latest.State.BalanceB),
+		},
+	}
+	for _, h := range ch.Latest.State.Pending {
+		rec.State.Pending = append(rec.State.Pending, storedHTLC{
+			ID:       hex.EncodeToString(h.ID[:]),
+			Hash:     hex.EncodeToString(h.Hash[:]),
+			Amount:   decString(h.Amount),
+			Expiry:   h.Expiry,
+			PayerIsA: h.PayerIsA,
+		})
+	}
+	return json.MarshalIndent(rec, "", "  ")
+}
+
+func decodeChannel(raw []byte) (*Channel, error) {
+	var rec storedChannel
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return nil, err
+	}
+	if rec.Version != 2 {
+		return nil, fmt.Errorf("channel: unknown record version %d", rec.Version)
+	}
+	id, err := parseBytes32(rec.ID)
+	if err != nil {
+		return nil, err
+	}
+	partyA, err := ParseAddress(rec.PartyA)
+	if err != nil {
+		return nil, err
+	}
+	partyB, err := ParseAddress(rec.PartyB)
+	if err != nil {
+		return nil, err
+	}
+	contract, err := ParseAddress(rec.Contract)
+	if err != nil {
+		return nil, err
+	}
+	depositA, err := parseDec(rec.DepositA)
+	if err != nil {
+		return nil, err
+	}
+	depositB, err := parseDec(rec.DepositB)
+	if err != nil {
+		return nil, err
+	}
+	chainID, err := parseDec(rec.ChainID)
+	if err != nil {
+		return nil, err
+	}
+	stateChannel, err := parseBytes32(rec.State.Channel)
+	if err != nil {
+		return nil, err
+	}
+	balanceA, err := parseDec(rec.State.BalanceA)
+	if err != nil {
+		return nil, err
+	}
+	balanceB, err := parseDec(rec.State.BalanceB)
+	if err != nil {
+		return nil, err
+	}
+	sigA, err := hex.DecodeString(rec.SigA)
+	if err != nil {
+		return nil, err
+	}
+	sigB, err := hex.DecodeString(rec.SigB)
+	if err != nil {
+		return nil, err
+	}
+
+	ch := &Channel{
+		ID: id, PartyA: partyA, PartyB: partyB,
+		DepositA: depositA, DepositB: depositB,
+		Status: Status(rec.Status), ChainID: chainID, Contract: contract,
+		Latest: SignedState{
+			State: State{
+				Channel: stateChannel, Nonce: rec.State.Nonce,
+				BalanceA: balanceA, BalanceB: balanceB,
+			},
+			SigA: sigA, SigB: sigB,
+		},
+	}
+	for _, h := range rec.State.Pending {
+		lockID, err := parseBytes32(h.ID)
+		if err != nil {
+			return nil, err
+		}
+		hash, err := parseBytes32(h.Hash)
+		if err != nil {
+			return nil, err
+		}
+		amount, err := parseDec(h.Amount)
+		if err != nil {
+			return nil, err
+		}
+		ch.Latest.State.Pending = append(ch.Latest.State.Pending, HTLC{
+			ID: lockID, Hash: hash, Amount: amount,
+			Expiry: h.Expiry, PayerIsA: h.PayerIsA,
+		})
+	}
+	return ch, nil
+}
