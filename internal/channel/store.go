@@ -74,6 +74,10 @@ type Store struct {
 	dir      string
 	mu       sync.Mutex
 	channels map[[32]byte]*Channel
+	// unreconciled holds channels loaded from a RESTORED backup. They may be
+	// stale in a way nothing local can detect, so they are unsignable until
+	// reconciled against an outside source — see reconcile.go.
+	unreconciled map[[32]byte]struct{}
 }
 
 // OpenStore loads every channel under dir, or creates it.
@@ -83,7 +87,14 @@ type Store struct {
 // money, because carrying on means operating with a balance that is missing or
 // stale, and the first thing the node does with it is sign something.
 func OpenStore(dir string) (*Store, error) {
-	s := &Store{dir: dir, channels: map[[32]byte]*Channel{}}
+	s := &Store{
+		dir: dir, channels: map[[32]byte]*Channel{},
+		unreconciled: map[[32]byte]struct{}{},
+	}
+	// A restore rolls back every local signal, including any this store might
+	// have written to detect one. The marker is left by whoever performed the
+	// restore, because they are the only party who knows.
+	restored := wasRestored(dir)
 	if err := os.MkdirAll(filepath.Join(dir, "channels"), 0o700); err != nil {
 		return nil, err
 	}
@@ -108,6 +119,14 @@ func OpenStore(dir string) (*Store, error) {
 			return nil, fmt.Errorf("channel: %s: %w", path, err)
 		}
 		s.channels[ch.ID] = ch
+		if restored {
+			s.unreconciled[ch.ID] = struct{}{}
+		}
+	}
+	if restored && len(s.unreconciled) == 0 {
+		// Restored with nothing in it. Nothing can be stale, so the marker has
+		// no work to do and leaving it would quarantine channels opened later.
+		_ = os.Remove(filepath.Join(dir, RestoreMarker))
 	}
 	return s, nil
 }
@@ -224,7 +243,11 @@ func (s *Store) Get(id [32]byte) (*Channel, bool) {
 	if !ok {
 		return nil, false
 	}
-	return ch.Clone(), true
+	out := ch.Clone()
+	// Stamped on every snapshot rather than stored on the record, so there is
+	// no way to read a channel without also learning whether it may be stale.
+	_, out.NeedsReconcile = s.unreconciled[id]
+	return out, true
 }
 
 // IDs lists tracked channels, in a stable order.

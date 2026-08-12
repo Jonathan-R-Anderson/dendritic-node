@@ -45,6 +45,23 @@ var (
 	ErrAlreadySigned  = errors.New("scpp: already signed a different state at that nonce")
 )
 
+// signFor is the ONE place this node's key is applied to a digest.
+//
+// Both signing paths go through it — proposing and accepting — because the
+// quarantine it enforces has to cover both. A restored node that refused to
+// propose but happily countersigned would double-sign just as thoroughly, and
+// from the side where the counterparty chose the nonce.
+//
+// See reconcile.go: after a backup restore a channel may be stale in a way
+// nothing local can detect, and signing against a rolled-back nonce produces
+// two different states at one nonce with the counterparty holding both.
+func (s *PeerSession) signFor(ch *Channel, raw [32]byte) ([]byte, error) {
+	if ch.NeedsReconcile {
+		return nil, fmt.Errorf("%w (channel %x)", ErrNeedsReconcile, ch.ID[:4])
+	}
+	return s.sign(raw)
+}
+
 // StateSigner produces this party's 65-byte signature over a raw digest, applying
 // EIP-191 exactly as RecoverSigner expects. In production this is a wallet; in
 // tests it is a key.
@@ -165,7 +182,7 @@ func (s *PeerSession) Propose(id [32]byte, intent [32]byte, tr StateTransition) 
 	}
 
 	raw := next.Digest(ch.ChainID, ch.Contract)
-	sig, err := s.sign(raw)
+	sig, err := s.signFor(ch, raw)
 	if err != nil {
 		return Envelope{}, err
 	}
@@ -359,7 +376,7 @@ func (s *PeerSession) HandlePropose(env Envelope) (Envelope, error) {
 			"already signed a different state at that nonce")
 	}
 
-	mySig, err := s.sign(raw)
+	mySig, err := s.signFor(ch, raw)
 	if err != nil {
 		return Envelope{}, err
 	}

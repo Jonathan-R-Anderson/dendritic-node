@@ -480,6 +480,17 @@ type Channel struct {
 	// value. OBSERVABILITY, NOT AUTHORITY: the chain decides what settled, and
 	// the worker asks it rather than trusting this. See settlement.go.
 	Payout *PayoutRecord `json:"payout,omitempty"`
+
+	// NeedsReconcile marks a channel restored from a backup and not yet checked
+	// against an outside source. While it is true this node MUST NOT sign for
+	// the channel — see reconcile.go.
+	//
+	// NOT PERSISTED, and the json tag says so. Writing it down would be
+	// pointless in the exact case it exists for: a restore rolls back whatever
+	// was written, including this. It is set on each snapshot from the store's
+	// quarantine set, which is built at load time from a marker the restore
+	// procedure leaves behind.
+	NeedsReconcile bool `json:"-"`
 }
 
 // PendingProposal is the payer's half-finished payment.
