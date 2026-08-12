@@ -5,6 +5,7 @@ package channel
 // older state come back.
 
 import (
+	"context"
 	"encoding/json"
 	"math/big"
 	"os"
@@ -34,9 +35,7 @@ func storeWithChannel(t *testing.T) (*Store, *Channel, *signer, *signer, string)
 	}
 	tipper, recipient := newSigner(t), newSigner(t)
 	ch := newFundedChannel(t, tipper, recipient, anon(500))
-	if err := s.Track(ch); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
+	trackViaChain(t, s, ch)
 	return s, ch, tipper, recipient, dir
 }
 
@@ -345,8 +344,84 @@ func TestGetReturnsACopy(t *testing.T) {
 
 func TestTrackRefusesADuplicate(t *testing.T) {
 	s, ch, _, _, _ := storeWithChannel(t)
-	if err := s.Track(ch); err != ErrChannelExists {
+	chain := NewFakeChain()
+	chain.Add(ch.PartyA, ch.PartyB, ch.DepositA, ch.DepositB)
+	occ, err := chain.ReadChannel(context.Background(), ch.Contract, ch.ID)
+	if err != nil {
+		t.Fatalf("chain read: %v", err)
+	}
+	if err := s.TrackFromChain(ch.ChainID, ch.Contract, occ); err != ErrChannelExists {
 		t.Fatalf("got %v, want ErrChannelExists", err)
+	}
+}
+
+// Invariant P5-1, as a test rather than a comment: a channel whose deposits did
+// not come from a chain read cannot be registered.
+//
+// The struct literal below is what an attacker's code path looks like — and
+// outside this package it does not even compile, because the guard field is
+// unexported. This test can only be written from inside.
+func TestAHandBuiltChannelIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	tipper, recipient := newSigner(t), newSigner(t)
+	a, b := SortParties(tipper.address(), recipient.address())
+
+	forged := OnChainChannel{
+		ID: DeriveChannelID(a, b), PartyA: a, PartyB: b,
+		DepositA: anon(1000), DepositB: new(big.Int),
+		Status: StatusOpen,
+		// fromChain deliberately absent — this is peer-supplied collateral.
+	}
+	if err := s.TrackFromChain(big.NewInt(1), Address{}, forged); err != ErrNotFromChain {
+		t.Fatalf("got %v, want ErrNotFromChain", err)
+	}
+	if len(s.IDs()) != 0 {
+		t.Fatal("a channel with fabricated collateral was registered")
+	}
+}
+
+// The deposit the store uses is the chain's, not the one anybody hoped for.
+func TestTheChainsDepositIsTheOneThatCounts(t *testing.T) {
+	s, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	tipper, recipient := newSigner(t), newSigner(t)
+
+	// The chain says 10.
+	chain := NewFakeChain()
+	id := chain.Add(tipper.address(), recipient.address(), anon(10), new(big.Int))
+	occ, err := chain.ReadChannel(context.Background(), Address{}, id)
+	if err != nil {
+		t.Fatalf("chain read: %v", err)
+	}
+	if err := s.TrackFromChain(big.NewInt(1), Address{}, occ); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+
+	ch, _ := s.Get(id)
+	total := new(big.Int).Add(ch.DepositA, ch.DepositB)
+	if total.Cmp(anon(10)) != 0 {
+		t.Fatalf("the store holds a deposit of %s, want the chain's 10", total)
+	}
+
+	// A state conserving a 1,000 deposit — signed by both, and worthless.
+	fabricated := State{Channel: id, Nonce: 1, BalanceA: anon(900), BalanceB: anon(100)}
+	if err := ch.Accept(signState(t, ch, fabricated, tipper, recipient)); err != ErrNotConserved {
+		t.Fatalf("got %v, want ErrNotConserved — a fabricated deposit was believed", err)
+	}
+}
+
+// A channel the chain has never heard of is not a channel, however plausible
+// the id looks.
+func TestAnUnknownChannelCannotBeTracked(t *testing.T) {
+	chain := NewFakeChain()
+	if _, err := chain.ReadChannel(context.Background(), Address{}, [32]byte{0xde, 0xad}); err != ErrChannelNotOnChain {
+		t.Fatalf("got %v, want ErrChannelNotOnChain", err)
 	}
 }
 
@@ -426,5 +501,20 @@ func TestPreimageMatchesTheContractsHashing(t *testing.T) {
 	wrong[0] = 0xff
 	if lock.Matches(wrong) {
 		t.Fatal("a wrong preimage opened the lock")
+	}
+}
+
+// trackViaChain registers a channel the only way the store allows: from facts a
+// chain read established.
+func trackViaChain(t *testing.T, s *Store, ch *Channel) {
+	t.Helper()
+	chain := NewFakeChain()
+	chain.Add(ch.PartyA, ch.PartyB, ch.DepositA, ch.DepositB)
+	occ, err := chain.ReadChannel(context.Background(), ch.Contract, ch.ID)
+	if err != nil {
+		t.Fatalf("chain read: %v", err)
+	}
+	if err := s.TrackFromChain(ch.ChainID, ch.Contract, occ); err != nil {
+		t.Fatalf("TrackFromChain: %v", err)
 	}
 }

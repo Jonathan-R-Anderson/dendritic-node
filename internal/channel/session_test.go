@@ -9,6 +9,7 @@ package channel
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"math/big"
 	"testing"
@@ -53,9 +54,15 @@ func (n *node) restart() {
 	n.sess.SetClock(func() int64 { return n.clock }, 30, 600)
 }
 
-func (n *node) track(ch *Channel) {
+// track registers a channel the way the node must: by reading the chain, never
+// by believing a peer. The FakeChain stands in for ChannelManagerV2.
+func (n *node) track(chain *FakeChain, ch *Channel) {
 	n.t.Helper()
-	if err := n.store.Track(ch.Clone()); err != nil {
+	occ, err := chain.ReadChannel(context.Background(), ch.Contract, ch.ID)
+	if err != nil {
+		n.t.Fatalf("chain read: %v", err)
+	}
+	if err := n.store.TrackFromChain(ch.ChainID, ch.Contract, occ); err != nil {
 		n.t.Fatalf("track: %v", err)
 	}
 }
@@ -97,8 +104,10 @@ func pair(t *testing.T) (payer, payee *node, id [32]byte) {
 	payee = newNode(t, qk, t.TempDir())
 
 	ch := newFundedChannel(t, pk, qk, anon(500))
-	payer.track(ch)
-	payee.track(ch)
+	chain := NewFakeChain()
+	chain.Add(ch.PartyA, ch.PartyB, ch.DepositA, ch.DepositB)
+	payer.track(chain, ch)
+	payee.track(chain, ch)
 	return payer, payee, ch.ID
 }
 

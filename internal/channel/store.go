@@ -141,20 +141,45 @@ func verifyLoaded(ch *Channel) error {
 	return nil
 }
 
-// Track registers a channel observed on chain.
+// TrackFromChain registers a channel using facts the blockchain established.
 //
-// Deposits and parties come from the chain; this only records them. It does not
-// open anything — no transaction is sent from here.
-func (s *Store) Track(ch *Channel) error {
+// The ONLY way to create a channel record. Invariant P5-1: a peer may name a
+// channel, it may not declare its own collateral — so the deposits here arrive
+// in an OnChainChannel, which nothing outside this package can forge, rather
+// than as two *big.Ints a caller pulled from a message.
+//
+// It does not open anything. No transaction is sent from here; this records
+// what a chain read found.
+func (s *Store) TrackFromChain(chainID *big.Int, contract Address, occ OnChainChannel) error {
+	if !occ.fromChain {
+		return ErrNotFromChain
+	}
+	if occ.Status != StatusOpen {
+		return fmt.Errorf("channel: on-chain status is %d, not open", occ.Status)
+	}
+	// Belt and braces: the id must derive from the parties the chain reported.
+	if DeriveChannelID(occ.PartyA, occ.PartyB) != occ.ID {
+		return errors.New("channel: on-chain parties do not derive the channel id")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.channels[ch.ID]; exists {
+	if _, exists := s.channels[occ.ID]; exists {
 		return ErrChannelExists
+	}
+
+	ch := &Channel{
+		ID: occ.ID, PartyA: occ.PartyA, PartyB: occ.PartyB,
+		DepositA: new(big.Int).Set(orZero(occ.DepositA)),
+		DepositB: new(big.Int).Set(orZero(occ.DepositB)),
+		Status:   StatusOpen,
+		ChainID:  new(big.Int).Set(orZero(chainID)),
+		Contract: contract,
 	}
 	if err := s.persist(ch); err != nil {
 		return err
 	}
-	s.channels[ch.ID] = ch
+	s.channels[occ.ID] = ch
 	return nil
 }
 
