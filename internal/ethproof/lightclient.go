@@ -176,6 +176,10 @@ type LightClientState struct {
 	NextCommittee *SyncCommittee
 	// Checkpoint is the sealed anchor everything descends from.
 	Checkpoint Checkpoint
+	// Anchor is that checkpoint, sealed against replacement. Held alongside
+	// Checkpoint so the signing domain stays cheap to compute while the
+	// immutability guarantee lives in one place.
+	Anchor SealedAnchor
 	// optimistic is the newest committee-signed but NOT finalised header.
 	// Unexported so nothing outside this package can raise a header's trust
 	// level by assignment — see finality.go.

@@ -117,6 +117,10 @@ type HeaderVerifier struct {
 	ChainID  uint64
 	Endpoint string
 	anchor   Anchor
+	// client is the native light client, once attached. Nil until P12-5.8 wires
+	// one in, and VerifyHeader refuses while it is nil — there is no degraded
+	// mode that accepts a provider's word instead.
+	client *LightClient
 }
 
 // SetAnchor records what this deployment is relying on.
@@ -157,11 +161,13 @@ func (v *HeaderVerifier) VerifyHeader(h BlockHeader) error {
 		return fmt.Errorf("%w (anchor is %q; see doc/trust-anchor.md)",
 			ErrNoTrustAnchor, v.anchor.Kind)
 	}
-	// Unreachable until an anchor kind exists that can satisfy Trustworthy.
-	// Left as an explicit panic rather than a silent success so that whoever
-	// implements the light client cannot accidentally ship this stub as the
-	// verification step.
-	panic("ethproof: sync-committee verification is not implemented; see doc/trust-anchor.md")
+	if v.client == nil {
+		// A trustworthy anchor with nothing to verify against. Refused rather
+		// than treated as permission: the anchor says what we would trust, the
+		// client is what does the trusting.
+		return fmt.Errorf("%w: anchor is set but no light client is attached", ErrNoTrustAnchor)
+	}
+	return v.client.VerifyExecutionHeader(h)
 }
 
 // ChainAt reports whether two headers are linked parent-to-child.
