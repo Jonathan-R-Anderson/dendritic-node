@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	_ "embed"
 
 	"crypto/rand"
@@ -73,6 +74,10 @@ type Server struct {
 	// is the empty string", which must never be accepted.
 	authUser, authPass [sha256.Size]byte
 	authSet            bool
+
+	// receiving is the payment node, when this one accepts tips. Nil on a
+	// storage-only node, and the receiving routes answer 501 then.
+	receiving Receiving
 }
 
 // SetAccessControl tells the dashboard where it is bound and what credential to
@@ -242,6 +247,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.setDCS(w, r)
 	case r.URL.Path == "/config/payout" && r.Method == http.MethodPost:
 		s.setPayout(w, r)
+	case r.URL.Path == "/api/receiving" && r.Method == http.MethodGet:
+		s.serveReceiving(w, r)
+	case r.URL.Path == "/receiving/policy" && r.Method == http.MethodPost:
+		s.setReceivingPolicy(w, r)
+	case r.URL.Path == "/receiving/settle" && r.Method == http.MethodPost:
+		s.settleReceiving(w, r)
+	case r.URL.Path == "/receiving/close" && r.Method == http.MethodPost:
+		s.closeReceiving(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -266,6 +279,14 @@ func validDashboardHost(value string) bool {
 func (s *Server) dashboard(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data := map[string]any{"CSRF": s.csrf, "HasConfig": s.hasConfig()}
+	// Absent rather than empty when this node does not receive: a panel showing
+	// no channels reads as "nobody has tipped you", which is a different and
+	// discouraging claim from "this node is not set up to receive".
+	if s.receiving != nil {
+		if channels, err := s.receiving.Channels(context.Background()); err == nil {
+			data["Receiving"] = channels
+		}
+	}
 	if s.hasConfig() {
 		c := s.cfgSnapshot()
 		data["Cfg"] = c
@@ -561,6 +582,61 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
     <button type="submit">Save allocation</button>
   </form>
 </section>
+
+{{if .Receiving}}
+<section class="panel cfg">
+  <h2>Receiving tips</h2>
+  <p class="muted">Channels people are tipping you over. Value accumulates off chain and
+    reaches your wallet when it is settled &mdash; on a schedule you choose, or when you
+    close a channel.</p>
+  {{range .Receiving}}
+  <div class="chan">
+    <h3>{{if .Peer}}{{.Peer}}{{else}}{{.ID}}{{end}}</h3>
+    <table>
+      <tr><td>Yours</td><td class="num">{{.Mine}}</td></tr>
+      <tr><td>Theirs</td><td class="num">{{.Theirs}}</td></tr>
+      <tr><td>In flight</td><td class="num">{{.Locked}}</td></tr>
+      <tr><td>Updates</td><td class="num">{{.Nonce}}</td></tr>
+      <tr><td>Settlement</td><td>{{.Mode}} &mdash; {{.Phase}}</td></tr>
+      {{if .TxHash}}<tr><td>Transaction</td><td class="mono">{{.TxHash}}</td></tr>{{end}}
+      {{if .LastError}}<tr><td>Last problem</td><td class="warn">{{.LastError}}</td></tr>{{end}}
+    </table>
+    {{if .Conflicted}}
+    <p class="warn">This channel is stopped: two different states were signed at one
+      update number. It needs closing on chain with the best state held. No further
+      tips will be accepted on it.</p>
+    {{else}}
+    <form method="post" action="/receiving/policy">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <input type="hidden" name="channel" value="{{.ID}}">
+      <label>Settle
+        <select name="mode">
+          <option value="on_close"{{if eq .Mode "on_close"}} selected{{end}}>only when I close</option>
+          <option value="interval"{{if eq .Mode "interval"}} selected{{end}}>on a schedule</option>
+        </select>
+      </label>
+      <label>every <input name="interval_seconds" type="number" min="60" step="60"
+        value="3600" style="width:7em"></label> seconds
+      <button type="submit">Save</button>
+    </form>
+    <form method="post" action="/receiving/settle" class="inline">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <input type="hidden" name="channel" value="{{.ID}}">
+      <button type="submit">Settle now</button>
+    </form>
+    <form method="post" action="/receiving/close" class="inline">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <input type="hidden" name="channel" value="{{.ID}}">
+      <button type="submit">Close channel</button>
+    </form>
+    {{end}}
+  </div>
+  {{else}}
+  <p class="muted">No channels yet. One appears here when somebody opens a tipping
+    channel with this node.</p>
+  {{end}}
+</section>
+{{end}}
 
 {{if .HasConfig}}
 <section class="panel cfg">

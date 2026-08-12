@@ -26,10 +26,24 @@ func (s *Server) SetConfigAccess(snapshot func() config.Config, apply func(func(
 
 func (s *Server) hasConfig() bool { return s.cfgSnapshot != nil && s.cfgApply != nil }
 
-// checkCSRF guards every mutating handler; a mismatch is a hard 403.
-func (s *Server) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+// checkToken is the CSRF comparison on its own; a mismatch is a hard 403.
+//
+// Split from checkCSRF because those were two guards in one: "this request came
+// from our own page" and "this node has an editable config file". They are
+// unrelated, and a handler that is not editing configuration — settling a
+// channel, say — should not be refused because no config file is loaded.
+func (s *Server) checkToken(w http.ResponseWriter, r *http.Request) bool {
 	if subtle.ConstantTimeCompare([]byte(r.FormValue("csrf")), []byte(s.csrf)) != 1 {
 		http.Error(w, "invalid request token", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+// checkCSRF guards every mutating CONFIG handler: the token, and that there is
+// a config to edit.
+func (s *Server) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+	if !s.checkToken(w, r) {
 		return false
 	}
 	if !s.hasConfig() {
