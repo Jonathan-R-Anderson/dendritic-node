@@ -73,8 +73,12 @@ func (c *Client) call(ctx context.Context, method string, params []any, out any)
 
 // BlockHeader is the part of a block this needs.
 type BlockHeader struct {
-	Number      string `json:"number"`
-	Hash        string `json:"hash"`
+	Number string `json:"number"`
+	Hash   string `json:"hash"`
+	// ParentHash links a header to the one before it. A CONSISTENCY signal
+	// only: post-merge there is no proof-of-work, so linkage is free to
+	// fabricate — see anchor.go.
+	ParentHash  string `json:"parentHash"`
 	StateRoot   string `json:"stateRoot"`
 	ReceiptRoot string `json:"receiptsRoot"`
 	LogsBloom   string `json:"logsBloom"`
