@@ -46,6 +46,7 @@ package channel
 
 import (
 	"context"
+	"crypto/cipher"
 	"errors"
 	"fmt"
 	"math/big"
@@ -97,6 +98,10 @@ type Vault struct {
 
 	mu      sync.RWMutex
 	entries map[[32]byte]*VaultEntry
+	// backend is durable custody, optional. Without it the vault is in-memory
+	// and a restart loses everything it was defending with — see vaultstore.go.
+	backend VaultBackend
+	aead    cipher.AEAD
 }
 
 // NewVault builds one.
@@ -113,6 +118,20 @@ func NewVault(chain ChainReader, chainID *big.Int, contract Address) *Vault {
 // not need to be: a valid state is valid whoever carried it, and an invalid one
 // is refused whoever carried it. That is what lets this endpoint be open.
 func (v *Vault) Submit(ctx context.Context, signed SignedState) (VaultEntry, error) {
+	entry, err := v.submitVerified(ctx, signed)
+	if err != nil {
+		return entry, err
+	}
+	return entry, nil
+}
+
+// submitVerified is Submit's body, shared with Load.
+//
+// Load goes through exactly this path rather than a shortcut for records the
+// vault wrote itself: same verification, same chain read, same monotonic rule.
+// A "trusted" path for one's own storage is how a store quietly becomes an
+// authority.
+func (v *Vault) submitVerified(ctx context.Context, signed SignedState) (VaultEntry, error) {
 	if v.Chain == nil {
 		return VaultEntry{}, fmt.Errorf("%w: no chain reader", ErrNotVerifiable)
 	}
@@ -169,6 +188,18 @@ func (v *Vault) Submit(ctx context.Context, signed SignedState) (VaultEntry, err
 	//    named.
 	digest := signed.State.Digest(v.ChainID, v.Contract)
 	if err := requireBothParties(digest, signed, onChain.PartyA, onChain.PartyB); err != nil {
+		return VaultEntry{}, err
+	}
+
+	// Persist BEFORE activating. Crashing between them leaves a state in the
+	// store that memory has not adopted, and Load finds it; the reverse order
+	// leaves a vault claiming a state it cannot produce, which nobody discovers
+	// until a channel needed defending and was not.
+	//
+	// So a storage failure is a submission failure. Telling the submitter their
+	// state was accepted when this vault cannot keep it is the one outcome that
+	// must not happen.
+	if err := v.persist(ctx, signed); err != nil {
 		return VaultEntry{}, err
 	}
 
