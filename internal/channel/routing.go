@@ -189,6 +189,18 @@ func (f *Forwarder) ClaimUpstream(ctx context.Context, in Incoming,
 	}, peer)
 }
 
+// claimUpstreamIntent identifies ONE LOCK INSTANCE for idempotency purposes.
+//
+// Named and separate so the property can be tested directly: two locks that
+// merely share an id must derive different intents, while the same lock derives
+// the same intent across a restart. See the comment at its call site in
+// SweepClaimable for the theft that a lock-id-only key allowed.
+func claimUpstreamIntent(in Incoming) [32]byte {
+	return derive("syndichan/routing/claim-upstream/v2",
+		in.Channel[:], in.Lock.ID[:], in.Lock.Hash[:],
+		orZero(in.Lock.Amount).Bytes(), u64(uint64(in.Lock.Expiry)))
+}
+
 // SweepClaimable settles every incoming lock this node can now open.
 //
 // What a hub runs after a downstream settlement, and again on startup: a node
@@ -206,10 +218,31 @@ func (f *Forwarder) SweepClaimable(ctx context.Context, peer func([32]byte) (Pee
 			problems = append(problems, err)
 			continue
 		}
-		// The intent is derived from the lock, so a retry after a crash is the
-		// same intent and cannot claim twice.
-		var intent [32]byte
-		copy(intent[:], keccak([]byte("claim-upstream"), in.Lock.ID[:]))
+		// The intent identifies THIS LOCK INSTANCE, not merely its id.
+		//
+		// It was keccak("claim-upstream", Lock.ID) — and the goal was right: a
+		// retry after a crash must produce the same intent so it cannot claim
+		// twice. But a lock ID is only unique among PENDING locks. Channel.Accept
+		// builds its duplicate check over st.Pending (state.go:691), so once a
+		// lock settles or refunds its id leaves the state and is free again.
+		//
+		// That turned the crash-idempotency key into a theft:
+		//
+		//	1. payment 1 uses lock id L, resolves. AppliedAt(intent_L) is recorded.
+		//	2. payment 2 reuses L upstream. Accept permits it — L is not pending.
+		//	3. the hub forwards, pays downstream, learns the preimage.
+		//	4. the sweep recomputes intent_L. Coordinator.Pay finds it already
+		//	   applied and returns Done WITHOUT claiming anything.
+		//	5. res.Done is true, so the sweep reports no problem.
+		//
+		// The hub paid downstream, never claimed upstream, and believed it had.
+		// Verified as a working exploit before this change.
+		//
+		// Binding the channel, hash, amount and expiry keeps the crash property —
+		// every input is read back off the pending lock, so a restart derives the
+		// same bytes — while making two instances that merely share an id derive
+		// different ones.
+		intent := claimUpstreamIntent(in)
 		res, err := f.ClaimUpstream(ctx, in, intent, p)
 		if err != nil {
 			problems = append(problems, fmt.Errorf("claiming %x: %w", in.Lock.ID[:4], err))

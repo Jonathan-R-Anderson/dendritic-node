@@ -127,13 +127,20 @@ func (c *Coordinator) Locks(id [32]byte) ([]LockView, error) {
 func lockStatus(incoming, secretKnown, expired bool) LockStatus {
 	if incoming {
 		switch {
-		case secretKnown:
-			// Claimable even past the expiry: the peer may still co-sign, and
-			// saying "lapsed" would tell an operator to give up on value they
-			// might still take.
-			return LockClaimable
 		case expired:
+			// LAPSED EVEN WITH THE SECRET. This used to return LockClaimable on
+			// `secretKnown` alone, reasoning that "the peer may still co-sign".
+			// It no longer will: a settlement at or after expiry is refused off
+			// chain (session.go checkTiming) because claimLock reverts on chain
+			// (ChannelManagerV2.sol:439).
+			//
+			// Order matters here. Reporting an expired lock as claimable tells an
+			// operator to wait for value that cannot arrive, which is worse than
+			// telling them it is gone — the honest answer is that the window
+			// closed, whatever they hold.
 			return LockLapsed
+		case secretKnown:
+			return LockClaimable
 		default:
 			return LockWaiting
 		}

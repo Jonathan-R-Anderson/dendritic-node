@@ -419,7 +419,20 @@ func (w *PayoutWorker) ResolveLocks(ctx context.Context, id [32]byte,
 	now := w.now()
 
 	for i, lock := range locks {
-		if secret, known := preimages[lock.Hash]; known && lock.Matches(secret) {
+		// KNOWING THE SECRET IS NOT ENOUGH — THE LOCK MUST STILL BE LIVE.
+		//
+		//	ChannelManagerV2.claimLock: if (block.timestamp >= lock.expiry) revert LockHasExpired();
+		//
+		// This branch used to fire on `known` alone and then `continue`, so an
+		// expired lock whose secret was known went to claimLock, REVERTED on
+		// chain, and never reached the expireLock branch below. The value was
+		// then neither claimed nor reclaimed — and because the error returns
+		// immediately, every REMAINING lock in the channel went unresolved too.
+		//
+		// The expiry test is the same one the off-chain settle rule now applies
+		// (session.go checkTiming): past expiry a lock is refund-only, because
+		// that is all the chain will honour.
+		if secret, known := preimages[lock.Hash]; known && lock.Matches(secret) && lock.Expiry > now {
 			if _, err := w.writer.ClaimLock(ctx, w.contract, id, locks, i, secret); err != nil {
 				return claimed, refunded, err
 			}

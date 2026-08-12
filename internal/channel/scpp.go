@@ -85,6 +85,12 @@ const (
 	RejectTransitionMismatch RejectCode = "TRANSITION_MISMATCH"
 	RejectPreimageBad        RejectCode = "PREIMAGE_BAD"
 	RejectLockNotExpired     RejectCode = "LOCK_NOT_EXPIRED"
+	// RejectLockExpired is a settlement offered at or after the lock's expiry.
+	// Deliberately NOT retryable: an expired lock never becomes settleable again,
+	// so a retry can only waste both nodes' time. An older peer that does not know
+	// this code falls through Retryable()'s default of false, which is the same
+	// answer.
+	RejectLockExpired        RejectCode = "LOCK_EXPIRED"
 	RejectInsufficient       RejectCode = "INSUFFICIENT_CAPACITY"
 	RejectConflicted         RejectCode = "CHANNEL_CONFLICTED"
 	RejectClosing            RejectCode = "CHANNEL_CLOSING"

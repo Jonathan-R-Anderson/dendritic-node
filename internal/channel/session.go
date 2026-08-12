@@ -174,6 +174,41 @@ func (s *PeerSession) Propose(id [32]byte, intent [32]byte, tr StateTransition) 
 		return Envelope{}, err
 	}
 
+	// The timing rules apply to what this node SIGNS, not only to what it
+	// accepts. checkTiming used to run on the inbound path alone, so a node
+	// would sign and send a transition its own rules forbid — and signing is
+	// where the damage is done, because I4 then records that signature at that
+	// nonce forever.
+	//
+	// The cost is not the wasted round trip. A doomed proposal POISONS THE
+	// NONCE: the peer's later, legitimate transition at the same nonce is
+	// refused with ALREADY_SIGNED_NONCE, and the channel can make no further
+	// cooperative progress. An expired lock whose payee first tried a late
+	// settlement became unrefundable off-chain — recoverable only by closing on
+	// chain, which is safe but is not the cooperative path anyone wanted.
+	//
+	// Checking here costs one comparison and keeps a node from signing its own
+	// channel into a corner.
+	// SETTLEMENT ONLY, and deliberately so.
+	//
+	// A lock's expiry is a FACT both parties read from the same state, so a node
+	// can apply the settle rule to itself and get the same answer the peer will.
+	// The other two timing rules are not like that:
+	//
+	//	minLockWindow (LOCK_ADD)  the ACCEPTOR's policy — "I will not hold a lock
+	//	                          shorter than X". A proposer cannot know it, and
+	//	                          applying it locally would refuse proposals the
+	//	                          peer would have taken.
+	//	LOCK_REFUND               objective too, but its wire-level rejection is
+	//	                          existing documented behaviour with a test that
+	//	                          pins it. Changing that belongs to whoever
+	//	                          revisits it, not to this fix.
+	if tr.Kind == KindLockSettle {
+		if code, detail := s.checkTiming(ch, tr, next); code != "" {
+			return Envelope{}, fmt.Errorf("scpp: refusing to sign: %s: %s", code, detail)
+		}
+	}
+
 	// I4, before signing anything.
 	if digest, signed := ch.HasSigned(next.Nonce); signed {
 		if digest != next.Digest(ch.ChainID, ch.Contract) {
@@ -411,6 +446,39 @@ func (s *PeerSession) checkTiming(ch *Channel, tr StateTransition, proposed Stat
 			return RejectLocksMalformed, fmt.Sprintf(
 				"lock expires in %ds; this node requires at least %ds",
 				tr.Expiry-s.now(), s.minLockWindow)
+		}
+	case KindLockSettle:
+		i := findLock(ch.Latest.State.Pending, tr.LockID)
+		if i < 0 {
+			return RejectTransitionMismatch, "no such lock"
+		}
+		// A PREIMAGE IS WORTHLESS AT OR AFTER EXPIRY, BECAUSE THE CONTRACT SAYS SO.
+		//
+		//	ChannelManagerV2.claimLock  : if (block.timestamp >= lock.expiry) revert LockHasExpired();
+		//	ChannelManagerV2.expireLock : if (block.timestamp <  lock.expiry) revert LockNotExpired();
+		//
+		// So on chain the boundary is exact and the two paths never overlap. This
+		// case was ABSENT, and its absence let the off-chain machine co-sign a
+		// settlement the chain would have reverted — a signed state strictly more
+		// generous to the payee than the contract's own rule.
+		//
+		// The loss it enables is the intermediary's, and it is the one routing.go
+		// declares impossible. A hop holds an incoming lock expiring at E_in and
+		// wrote an outgoing one at E_out = E_in - margin. Let the downstream settle
+		// LATE, after E_out: the hop's node signs, pays downstream, learns the
+		// preimage — and then cannot claim upstream, because on chain claimLock
+		// reverts once E_in has passed and the upstream party may expireLock. The
+		// margin was enforced at lock CREATION and nothing enforced it at
+		// RESOLUTION, which is where the money actually moves.
+		//
+		// Skew works AGAINST the settler, mirroring the refund rule below: their
+		// clock being slow must not let them claim a lock the payer is already
+		// entitled to reclaim. The two rules together leave a 2*skew band in which
+		// NEITHER side may act, which is deliberate — a window where both are valid
+		// is a race over the same value.
+		if ch.Latest.State.Pending[i].Expiry <= s.now()+s.skew {
+			return RejectLockExpired, fmt.Sprintf(
+				"lock expired %ds ago; it is refund-only", s.now()-ch.Latest.State.Pending[i].Expiry)
 		}
 	case KindLockRefund:
 		i := findLock(ch.Latest.State.Pending, tr.LockID)
