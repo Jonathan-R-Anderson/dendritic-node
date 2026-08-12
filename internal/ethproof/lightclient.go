@@ -176,6 +176,11 @@ type LightClientState struct {
 	NextCommittee *SyncCommittee
 	// Checkpoint is the sealed anchor everything descends from.
 	Checkpoint Checkpoint
+	// Spec is the fork whose container layout is in force. Carried on the state
+	// rather than assumed, because the generalized indices are positions in
+	// containers that changed shape across forks — a branch verified at a stale
+	// index proves a TRUE statement about the WRONG FIELD. See rotation.go.
+	Spec SpecVersion
 }
 
 // Update is one light client update, entirely untrusted.
