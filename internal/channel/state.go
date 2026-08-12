@@ -423,6 +423,135 @@ type Channel struct {
 	// Latest is the newest fully signed state. This is the money. Everything
 	// else in this struct can be re-read from the chain; this cannot.
 	Latest SignedState `json:"latest"`
+
+	// ---- SCPP/1 protocol state. Persisted with the channel because it must
+	// land in the SAME atomic write as the state it describes.
+
+	// Signed records the digest this node has signed at each nonce ABOVE
+	// Latest. Invariant I4: never sign two different states at one nonce, not
+	// even after a crash. Entries at or below Latest.Nonce are dropped, because
+	// Accept's monotonicity already refuses those nonces — so this stays small
+	// rather than growing for the life of the channel.
+	Signed map[uint64][32]byte `json:"signed,omitempty"`
+
+	// Applied maps a payment intent to the nonce that carried it (§5). It is
+	// what makes a retry idempotent instead of a second payment, and it cannot
+	// be pruned by nonce the way Signed can: a stale intent retried after the
+	// channel moved on would otherwise be applied again at a fresh nonce.
+	Applied map[[32]byte]uint64 `json:"applied,omitempty"`
+
+	// Pending is a proposal this node has signed and not yet seen completed.
+	// Persisted BEFORE the proposal goes out, so a crash in between leaves
+	// evidence rather than a signature only the peer can prove.
+	Pending *PendingProposal `json:"pending,omitempty"`
+
+	// Conflict, once set, stops this channel permanently (§7). Two fully signed
+	// states at one nonce cannot be reconciled by any rule, so the protocol does
+	// not have one — it stops and preserves the evidence.
+	Conflict *ConflictRecord `json:"conflict,omitempty"`
+}
+
+// PendingProposal is the payer's half-finished payment.
+type PendingProposal struct {
+	Intent     [32]byte        `json:"intent"`
+	Transition StateTransition `json:"transition"`
+	State      State           `json:"state"`
+	Sig        []byte          `json:"sig"`
+}
+
+// ConflictRecord is the evidence that a party signed twice at one nonce.
+//
+// Both states are kept because together they are the proof; either alone is
+// just a state. Nothing in this package resolves a conflict — the resolution is
+// on chain, by force-closing with the best state held, promptly.
+type ConflictRecord struct {
+	Nonce  uint64      `json:"nonce"`
+	Mine   SignedState `json:"mine"`
+	Theirs SignedState `json:"theirs"`
+}
+
+// Clone is a deep copy.
+//
+// Shallow copying a Channel shares its maps, so a caller could add a signed
+// nonce or an applied intent to the store's own record without going through
+// Accept — which is the one door every state is meant to come through.
+func (c *Channel) Clone() *Channel {
+	out := *c
+	out.Latest = cloneSigned(c.Latest)
+	out.DepositA = new(big.Int).Set(orZero(c.DepositA))
+	out.DepositB = new(big.Int).Set(orZero(c.DepositB))
+	out.ChainID = new(big.Int).Set(orZero(c.ChainID))
+
+	if c.Signed != nil {
+		out.Signed = make(map[uint64][32]byte, len(c.Signed))
+		for k, v := range c.Signed {
+			out.Signed[k] = v
+		}
+	}
+	if c.Applied != nil {
+		out.Applied = make(map[[32]byte]uint64, len(c.Applied))
+		for k, v := range c.Applied {
+			out.Applied[k] = v
+		}
+	}
+	if c.Pending != nil {
+		p := *c.Pending
+		p.State = cloneState(c.Pending.State)
+		p.Sig = append([]byte(nil), c.Pending.Sig...)
+		if c.Pending.Transition.Amount != nil {
+			p.Transition.Amount = new(big.Int).Set(c.Pending.Transition.Amount)
+		}
+		out.Pending = &p
+	}
+	if c.Conflict != nil {
+		k := *c.Conflict
+		k.Mine = cloneSigned(c.Conflict.Mine)
+		k.Theirs = cloneSigned(c.Conflict.Theirs)
+		out.Conflict = &k
+	}
+	return &out
+}
+
+func cloneState(s State) State {
+	out := s
+	out.BalanceA = new(big.Int).Set(orZero(s.BalanceA))
+	out.BalanceB = new(big.Int).Set(orZero(s.BalanceB))
+	out.Pending = clonePending(s.Pending)
+	return out
+}
+
+// HasSigned reports the digest this node signed at a nonce, if any.
+func (c *Channel) HasSigned(nonce uint64) ([32]byte, bool) {
+	d, ok := c.Signed[nonce]
+	return d, ok
+}
+
+// NoteSigned records a signature at a nonce, and drops entries the nonce rule
+// now covers.
+func (c *Channel) NoteSigned(nonce uint64, digest [32]byte) {
+	if c.Signed == nil {
+		c.Signed = map[uint64][32]byte{}
+	}
+	c.Signed[nonce] = digest
+	for n := range c.Signed {
+		if n <= c.Latest.State.Nonce {
+			delete(c.Signed, n)
+		}
+	}
+}
+
+// NoteApplied records that an intent produced the state at a nonce.
+func (c *Channel) NoteApplied(intent [32]byte, nonce uint64) {
+	if c.Applied == nil {
+		c.Applied = map[[32]byte]uint64{}
+	}
+	c.Applied[intent] = nonce
+}
+
+// AppliedAt reports the nonce an intent produced, if it has been applied.
+func (c *Channel) AppliedAt(intent [32]byte) (uint64, bool) {
+	n, ok := c.Applied[intent]
+	return n, ok
 }
 
 // NewChannel builds the record for a pair, putting the parties in the
@@ -495,9 +624,15 @@ func (c *Channel) Accept(candidate SignedState) error {
 		}
 	}
 
-	// 4. Locks are well formed: unique ids, and none already expired. An
-	//    already-expired lock is not a payment, it is a refund the payer has
-	//    not collected, and accepting one as pending misstates both balances.
+	// 4. Locks are well formed: unique ids, and an expiry actually set.
+	//
+	//    NOT "an expiry in the future" — deliberately. This function is pure and
+	//    must stay pure: consulting a clock would let two nodes with a little
+	//    skew disagree about whether the same signed state is valid, and would
+	//    make a state that validated when signed stop validating while sitting
+	//    on disk, which turns the load-time check in store.go into a time bomb.
+	//    Freshness is policy and belongs to the protocol layer, which has a
+	//    clock and a skew tolerance. See doc/channel-payment-protocol.md §4.
 	seen := make(map[[32]byte]bool, len(st.Pending))
 	for _, h := range st.Pending {
 		if seen[h.ID] {
@@ -537,6 +672,15 @@ func (c *Channel) Accept(candidate SignedState) error {
 	}
 
 	c.Latest = candidate
+
+	// Nonces at or below the new latest can never be signed again — Accept
+	// refuses them on the nonce rule alone — so the I4 ledger drops them rather
+	// than growing for the life of the channel.
+	for n := range c.Signed {
+		if n <= c.Latest.State.Nonce {
+			delete(c.Signed, n)
+		}
+	}
 	return nil
 }
 

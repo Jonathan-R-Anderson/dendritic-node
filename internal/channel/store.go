@@ -170,9 +170,7 @@ func (s *Store) Get(id [32]byte) (*Channel, bool) {
 	if !ok {
 		return nil, false
 	}
-	clone := *ch
-	clone.Latest = cloneSigned(ch.Latest)
-	return &clone, true
+	return ch.Clone(), true
 }
 
 // IDs lists tracked channels, in a stable order.
@@ -213,17 +211,48 @@ func (s *Store) Accept(id [32]byte, candidate SignedState) error {
 
 	// Applied to a copy: Channel.Accept mutates on success, and a state that
 	// validates but cannot be written must leave nothing behind.
-	trial := *ch
-	trial.Latest = cloneSigned(ch.Latest)
+	// A deep copy, not a shallow one: Accept prunes the signed-nonce ledger on
+	// success, and a shallow copy shares that map — so a state that validated
+	// but failed to persist would still have mutated the live record.
+	trial := ch.Clone()
 	if err := trial.Accept(candidate); err != nil {
 		return err
 	}
-	if err := s.persist(&trial); err != nil {
+	if err := s.persist(trial); err != nil {
 		// NOT advanced. Reporting success for a payment that is not on disk is
 		// the bug the whole write ordering exists to prevent.
 		return err
 	}
-	*ch = trial
+	*ch = *trial
+	return nil
+}
+
+// Update applies a change to a channel's record atomically: on a deep copy, then
+// to disk, then in memory.
+//
+// Protocol bookkeeping — the signed-nonce ledger, applied intents, a pending
+// proposal, a conflict — is money-adjacent and gets the same discipline as the
+// state itself. A signature recorded in memory but not on disk is exactly the
+// crash that invariant I4 exists to survive.
+//
+// The mutation runs against a copy, so a function that fails halfway leaves the
+// live record untouched.
+func (s *Store) Update(id [32]byte, mutate func(*Channel) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ch, ok := s.channels[id]
+	if !ok {
+		return ErrNoSuchChannel
+	}
+	trial := ch.Clone()
+	if err := mutate(trial); err != nil {
+		return err
+	}
+	if err := s.persist(trial); err != nil {
+		return err
+	}
+	*ch = *trial
 	return nil
 }
 
@@ -298,6 +327,23 @@ type storedState struct {
 	Pending  []storedHTLC `json:"pending,omitempty"`
 }
 
+type storedPending struct {
+	Intent     string         `json:"intent"`
+	Transition wireTransition `json:"transition"`
+	State      storedState    `json:"state"`
+	Sig        string         `json:"sig"`
+}
+
+type storedConflict struct {
+	Nonce   uint64      `json:"nonce"`
+	Mine    storedState `json:"mine"`
+	MineA   string      `json:"mine_sig_a,omitempty"`
+	MineB   string      `json:"mine_sig_b,omitempty"`
+	Theirs  storedState `json:"theirs"`
+	TheirsA string      `json:"theirs_sig_a,omitempty"`
+	TheirsB string      `json:"theirs_sig_b,omitempty"`
+}
+
 type storedChannel struct {
 	Version  int         `json:"version"`
 	ID       string      `json:"id"`
@@ -311,6 +357,12 @@ type storedChannel struct {
 	State    storedState `json:"state"`
 	SigA     string      `json:"sig_a,omitempty"`
 	SigB     string      `json:"sig_b,omitempty"`
+
+	// SCPP/1 protocol state, in the same record so it lands in the same write.
+	Signed   map[string]string `json:"signed,omitempty"`
+	Applied  map[string]uint64 `json:"applied,omitempty"`
+	Pending  *storedPending    `json:"pending,omitempty"`
+	Conflict *storedConflict   `json:"conflict,omitempty"`
 }
 
 func decString(n *big.Int) string {
@@ -354,21 +406,39 @@ func encodeChannel(ch *Channel) ([]byte, error) {
 		Contract: ch.Contract.Hex(),
 		SigA:     hex.EncodeToString(ch.Latest.SigA),
 		SigB:     hex.EncodeToString(ch.Latest.SigB),
-		State: storedState{
-			Channel:  hex.EncodeToString(ch.Latest.State.Channel[:]),
-			Nonce:    ch.Latest.State.Nonce,
-			BalanceA: decString(ch.Latest.State.BalanceA),
-			BalanceB: decString(ch.Latest.State.BalanceB),
-		},
+		State:    encodeStateWire(ch.Latest.State),
 	}
-	for _, h := range ch.Latest.State.Pending {
-		rec.State.Pending = append(rec.State.Pending, storedHTLC{
-			ID:       hex.EncodeToString(h.ID[:]),
-			Hash:     hex.EncodeToString(h.Hash[:]),
-			Amount:   decString(h.Amount),
-			Expiry:   h.Expiry,
-			PayerIsA: h.PayerIsA,
-		})
+
+	for nonce, digest := range ch.Signed {
+		if rec.Signed == nil {
+			rec.Signed = map[string]string{}
+		}
+		rec.Signed[fmt.Sprintf("%d", nonce)] = hex.EncodeToString(digest[:])
+	}
+	for intent, nonce := range ch.Applied {
+		if rec.Applied == nil {
+			rec.Applied = map[string]uint64{}
+		}
+		rec.Applied[hex.EncodeToString(intent[:])] = nonce
+	}
+	if p := ch.Pending; p != nil {
+		rec.Pending = &storedPending{
+			Intent:     hex.EncodeToString(p.Intent[:]),
+			Transition: encodeTransitionWire(p.Transition),
+			State:      encodeStateWire(p.State),
+			Sig:        hex.EncodeToString(p.Sig),
+		}
+	}
+	if c := ch.Conflict; c != nil {
+		rec.Conflict = &storedConflict{
+			Nonce:   c.Nonce,
+			Mine:    encodeStateWire(c.Mine.State),
+			MineA:   hex.EncodeToString(c.Mine.SigA),
+			MineB:   hex.EncodeToString(c.Mine.SigB),
+			Theirs:  encodeStateWire(c.Theirs.State),
+			TheirsA: hex.EncodeToString(c.Theirs.SigA),
+			TheirsB: hex.EncodeToString(c.Theirs.SigB),
+		}
 	}
 	return json.MarshalIndent(rec, "", "  ")
 }
@@ -409,18 +479,6 @@ func decodeChannel(raw []byte) (*Channel, error) {
 	if err != nil {
 		return nil, err
 	}
-	stateChannel, err := parseBytes32(rec.State.Channel)
-	if err != nil {
-		return nil, err
-	}
-	balanceA, err := parseDec(rec.State.BalanceA)
-	if err != nil {
-		return nil, err
-	}
-	balanceB, err := parseDec(rec.State.BalanceB)
-	if err != nil {
-		return nil, err
-	}
 	sigA, err := hex.DecodeString(rec.SigA)
 	if err != nil {
 		return nil, err
@@ -434,31 +492,86 @@ func decodeChannel(raw []byte) (*Channel, error) {
 		ID: id, PartyA: partyA, PartyB: partyB,
 		DepositA: depositA, DepositB: depositB,
 		Status: Status(rec.Status), ChainID: chainID, Contract: contract,
-		Latest: SignedState{
-			State: State{
-				Channel: stateChannel, Nonce: rec.State.Nonce,
-				BalanceA: balanceA, BalanceB: balanceB,
-			},
-			SigA: sigA, SigB: sigB,
-		},
+		Latest: SignedState{SigA: sigA, SigB: sigB},
 	}
-	for _, h := range rec.State.Pending {
-		lockID, err := parseBytes32(h.ID)
+	// decodeStateWire, not a second loop: the lock-order check lives there, and
+	// a record whose locks are out of order would hash to a root the signatures
+	// were never made over.
+	latest, err := decodeStateWire(rec.State)
+	if err != nil {
+		return nil, err
+	}
+	ch.Latest.State = latest
+
+	for k, v := range rec.Signed {
+		var nonce uint64
+		if _, err := fmt.Sscanf(k, "%d", &nonce); err != nil {
+			return nil, fmt.Errorf("channel: bad signed-nonce key %q", k)
+		}
+		digest, err := parseBytes32(v)
 		if err != nil {
 			return nil, err
 		}
-		hash, err := parseBytes32(h.Hash)
+		if ch.Signed == nil {
+			ch.Signed = map[uint64][32]byte{}
+		}
+		ch.Signed[nonce] = digest
+	}
+	for k, v := range rec.Applied {
+		intent, err := parseBytes32(k)
 		if err != nil {
 			return nil, err
 		}
-		amount, err := parseDec(h.Amount)
+		if ch.Applied == nil {
+			ch.Applied = map[[32]byte]uint64{}
+		}
+		ch.Applied[intent] = v
+	}
+	if p := rec.Pending; p != nil {
+		intent, err := parseBytes32(p.Intent)
 		if err != nil {
 			return nil, err
 		}
-		ch.Latest.State.Pending = append(ch.Latest.State.Pending, HTLC{
-			ID: lockID, Hash: hash, Amount: amount,
-			Expiry: h.Expiry, PayerIsA: h.PayerIsA,
-		})
+		tr, err := decodeTransitionWire(p.Transition)
+		if err != nil {
+			return nil, err
+		}
+		state, err := decodeStateWire(p.State)
+		if err != nil {
+			return nil, err
+		}
+		sig, err := hex.DecodeString(p.Sig)
+		if err != nil {
+			return nil, err
+		}
+		ch.Pending = &PendingProposal{Intent: intent, Transition: tr, State: state, Sig: sig}
+	}
+	if c := rec.Conflict; c != nil {
+		mine, err := decodeSignedWire(c.Mine, c.MineA, c.MineB)
+		if err != nil {
+			return nil, err
+		}
+		theirs, err := decodeSignedWire(c.Theirs, c.TheirsA, c.TheirsB)
+		if err != nil {
+			return nil, err
+		}
+		ch.Conflict = &ConflictRecord{Nonce: c.Nonce, Mine: mine, Theirs: theirs}
 	}
 	return ch, nil
+}
+
+func decodeSignedWire(w storedState, sigA, sigB string) (SignedState, error) {
+	state, err := decodeStateWire(w)
+	if err != nil {
+		return SignedState{}, err
+	}
+	a, err := hex.DecodeString(sigA)
+	if err != nil {
+		return SignedState{}, err
+	}
+	b, err := hex.DecodeString(sigB)
+	if err != nil {
+		return SignedState{}, err
+	}
+	return SignedState{State: state, SigA: a, SigB: b}, nil
 }
