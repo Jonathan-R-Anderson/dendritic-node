@@ -316,6 +316,26 @@ func (c *Coordinator) Handle(ctx context.Context, env Envelope) (*Envelope, erro
 		return &reply, nil
 
 	case MsgStateRequest:
+		// Adopt first, for the same reason MsgStatePropose does: a question
+		// about a channel we have not seen is NORMAL when the peer opened it,
+		// and under D3 the peer is exactly who opens it. A recipient's node
+		// hears about most of its channels this way — a tipper funds one and
+		// then asks what state it is in.
+		//
+		// Refusing here would have made the first tip on every new channel
+		// impossible: the tipper cannot learn the opening state, and the node
+		// cannot tell it, though the chain has the answer all along.
+		//
+		// Adoption reads the CHAIN, so this cannot be used to invent a channel;
+		// an id that is not really there fails against the chain, which is
+		// precisely invariant P5-1 doing its job.
+		id, err := parseBytes32(env.Channel)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.Adopt(ctx, id); err != nil {
+			return nil, err
+		}
 		reply, err := c.sess.HandleRequest(env)
 		if err != nil {
 			return nil, err

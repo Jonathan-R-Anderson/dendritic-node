@@ -379,6 +379,12 @@ type storedState struct {
 	BalanceA string       `json:"balance_a"`
 	BalanceB string       `json:"balance_b"`
 	Pending  []storedHTLC `json:"pending,omitempty"`
+	// Withdrawals are part of the signed digest. They live here rather than
+	// only on State because this type is what both the disk and the wire carry,
+	// and a state whose withdrawals did not survive that trip would verify
+	// against nothing.
+	WithdrawA string `json:"withdraw_a,omitempty"`
+	WithdrawB string `json:"withdraw_b,omitempty"`
 }
 
 type storedPending struct {
@@ -450,6 +456,18 @@ func parseDec(s string) (*big.Int, error) {
 	n, ok := new(big.Int).SetString(s, 10)
 	if !ok {
 		return nil, fmt.Errorf("channel: %q is not a decimal amount", s)
+	}
+	return n, nil
+}
+
+// parseUnsignedDec is parseDec for a field the contract stores as uint256.
+func parseUnsignedDec(s, field string) (*big.Int, error) {
+	n, err := parseDec(s)
+	if err != nil {
+		return nil, err
+	}
+	if n.Sign() < 0 {
+		return nil, fmt.Errorf("channel: %s may not be negative", field)
 	}
 	return n, nil
 }

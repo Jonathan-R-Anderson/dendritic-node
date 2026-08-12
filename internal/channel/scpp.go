@@ -195,6 +195,16 @@ func encodeStateWire(s State) storedState {
 		BalanceA: decString(s.BalanceA),
 		BalanceB: decString(s.BalanceB),
 	}
+	// Withdrawals are inside the digest, so a state that arrives without them is
+	// a DIFFERENT state carrying a signature that no longer covers it. Omitted
+	// when zero — which is every ordinary payment — so records written before
+	// checkpoints existed still encode byte for byte as they did.
+	if orZero(s.WithdrawA).Sign() > 0 {
+		out.WithdrawA = decString(s.WithdrawA)
+	}
+	if orZero(s.WithdrawB).Sign() > 0 {
+		out.WithdrawB = decString(s.WithdrawB)
+	}
 	for _, h := range s.Pending {
 		out.Pending = append(out.Pending, storedHTLC{
 			ID:       hex.EncodeToString(h.ID[:]),
@@ -224,7 +234,24 @@ func decodeStateWire(w storedState) (State, error) {
 	if err != nil {
 		return State{}, err
 	}
-	out := State{Channel: channel, Nonce: w.Nonce, BalanceA: balanceA, BalanceB: balanceB}
+	// An absent withdrawal is zero, not an error: only a checkpoint state has
+	// one, and every payment before the first checkpoint legitimately has none.
+	// A NEGATIVE one is refused here rather than later — the contract's field is
+	// uint256, so such a state could never settle, and the useful moment to say
+	// so is before it is stored as though it could.
+	withdrawA, err := parseUnsignedDec(w.WithdrawA, "withdraw_a")
+	if err != nil {
+		return State{}, err
+	}
+	withdrawB, err := parseUnsignedDec(w.WithdrawB, "withdraw_b")
+	if err != nil {
+		return State{}, err
+	}
+	out := State{
+		Channel: channel, Nonce: w.Nonce,
+		BalanceA: balanceA, BalanceB: balanceB,
+		WithdrawA: withdrawA, WithdrawB: withdrawB,
+	}
 
 	var previous [32]byte
 	for i, h := range w.Pending {
