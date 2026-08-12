@@ -406,3 +406,120 @@ func (c *Coordinator) Balances(id [32]byte) (Balances, error) {
 
 // Channels lists what this node tracks.
 func (c *Coordinator) Channels() [][32]byte { return c.store.IDs() }
+
+// ---- opening a channel ---------------------------------------------------------
+
+// Allowance reads how much the token lets a spender move on someone's behalf.
+//
+// Needed because funding a channel is TWO transactions and this is what makes
+// the pair recoverable: a node that died between them cannot know whether the
+// approval landed, but it can ask — the same rule as everywhere else here.
+type Allowance interface {
+	Allowance(ctx context.Context, token, owner, spender Address) (*big.Int, error)
+}
+
+// OpenResult is what an attempt to open a channel produced.
+type OpenResult struct {
+	// ChannelID is the channel this would create. Deterministic from the two
+	// addresses, so it is known BEFORE anything is sent.
+	ChannelID [32]byte
+	// ApprovalTx is set when an approval had to be sent first.
+	ApprovalTx string
+	// OpenTx is the openChannel broadcast.
+	OpenTx string
+	// AlreadyOpen is true when the chain already had this channel, in which
+	// case nothing was sent and the channel was simply adopted.
+	AlreadyOpen bool
+}
+
+// OpenChannel funds a channel with a partner.
+//
+// THE TIPPER SENDS THIS. Roadmap D3 puts channel funding on the tipper, and the
+// deposit rides along in the same transaction — so a recipient spends no gas to
+// be tipped, and "open a receiving channel" on their dashboard is an invitation
+// rather than a transaction.
+//
+// Two transactions, and it says so: `openChannel` calls `safeTransferFrom`, and
+// ERC-20 moves nothing without an allowance. The approval goes to the TOKEN, the
+// open goes to ChannelManagerV2.
+//
+//	allowance? ──insufficient──▶ approve(token) ──▶ openChannel(manager)
+//	     └──sufficient──────────────────────────────▶ openChannel(manager)
+//
+// Crash-safe by asking rather than remembering: the channel id is derivable
+// before anything is sent, so a node that died mid-sequence re-reads the chain,
+// finds the channel already there, and adopts it instead of opening a second
+// one. There is no second one to open — `openChannel` reverts on a channel that
+// exists.
+func (c *Coordinator) OpenChannel(ctx context.Context, writer ChainWriter, allow Allowance,
+	token Address, partner Address, deposit *big.Int) (OpenResult, error) {
+
+	if partner == c.self {
+		return OpenResult{}, errors.New("coordinator: cannot open a channel with yourself")
+	}
+	if deposit == nil || deposit.Sign() < 0 {
+		return OpenResult{}, ErrAmountNotPositive
+	}
+	out := OpenResult{ChannelID: DeriveChannelID(c.self, partner)}
+
+	// Ask the chain first, exactly as settlement does. A channel that already
+	// exists is adopted, not opened again — and this is also the recovery path
+	// for a node that crashed after broadcasting.
+	if _, err := c.chain.ReadChannel(ctx, c.contract, out.ChannelID); err == nil {
+		out.AlreadyOpen = true
+		return out, c.Adopt(ctx, out.ChannelID)
+	} else if !errors.Is(err, ErrChannelNotOnChain) {
+		return out, err
+	}
+
+	// The approval is skipped when one already covers this, so a retry after a
+	// crash does not spend gas re-approving.
+	if deposit.Sign() > 0 && allow != nil {
+		current, err := allow.Allowance(ctx, token, c.self, c.contract)
+		if err != nil {
+			return out, err
+		}
+		if current.Cmp(deposit) < 0 {
+			tx, err := writer.Approve(ctx, token, c.contract, deposit)
+			if err != nil {
+				return out, fmt.Errorf("coordinator: approval failed: %w", err)
+			}
+			out.ApprovalTx = tx
+		}
+	}
+
+	tx, err := writer.OpenChannel(ctx, c.contract, partner, deposit)
+	if err != nil {
+		return out, err
+	}
+	out.OpenTx = tx
+
+	// NOT adopted here. A broadcast is not a channel — the same rule the
+	// settlement worker follows. The caller adopts once the chain shows it,
+	// which Adopt does by reading rather than believing.
+	return out, nil
+}
+
+// Deposit tops up a channel that already exists.
+func (c *Coordinator) Deposit(ctx context.Context, writer ChainWriter, allow Allowance,
+	token Address, id [32]byte, amount *big.Int) (string, error) {
+
+	if amount == nil || amount.Sign() <= 0 {
+		return "", ErrAmountNotPositive
+	}
+	if _, ok := c.store.Get(id); !ok {
+		return "", ErrChannelNotAdopted
+	}
+	if allow != nil {
+		current, err := allow.Allowance(ctx, token, c.self, c.contract)
+		if err != nil {
+			return "", err
+		}
+		if current.Cmp(amount) < 0 {
+			if _, err := writer.Approve(ctx, token, c.contract, amount); err != nil {
+				return "", fmt.Errorf("coordinator: approval failed: %w", err)
+			}
+		}
+	}
+	return writer.Deposit(ctx, c.contract, id, amount)
+}

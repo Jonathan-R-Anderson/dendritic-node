@@ -45,6 +45,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 )
 
@@ -132,6 +133,15 @@ type PayoutRecord struct {
 // The settlement worker talks to this and never constructs a transaction
 // itself, so it can be tested without pretending to be on chain.
 type ChainWriter interface {
+	// Approve authorises a spender to move `amount` of the token on this node's
+	// behalf. Sent to the TOKEN contract, not to ChannelManagerV2 — funding a
+	// channel is two transactions against two contracts, because openChannel
+	// calls safeTransferFrom and ERC-20 moves nothing without an allowance.
+	Approve(ctx context.Context, token, spender Address, amount *big.Int) (string, error)
+	// OpenChannel opens a channel with partner and funds it in one transaction.
+	OpenChannel(ctx context.Context, contract Address, partner Address, deposit *big.Int) (string, error)
+	// Deposit tops up a channel that already exists.
+	Deposit(ctx context.Context, contract Address, id [32]byte, amount *big.Int) (string, error)
 	// Checkpoint submits a co-signed state that takes value out WITHOUT closing.
 	// The channel stays open and keeps its nonce line.
 	Checkpoint(ctx context.Context, contract Address, ch *Channel) (string, error)

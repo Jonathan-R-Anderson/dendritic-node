@@ -58,6 +58,14 @@ var (
 	selCloseCooperative = keccak([]byte("closeCooperative(bytes32,uint64,uint256,uint256,bytes,bytes)"))[:4]
 	selClaimLock        = keccak([]byte("claimLock(bytes32,(bytes32,bytes32,uint256,uint256,bool)[],uint256,bytes32)"))[:4]
 	selExpireLock       = keccak([]byte("expireLock(bytes32,(bytes32,bytes32,uint256,uint256,bool)[],uint256)"))[:4]
+	selOpenChannel      = keccak([]byte("openChannel(address,uint256)"))[:4]
+	selDeposit          = keccak([]byte("deposit(bytes32,uint256)"))[:4]
+
+	// On the TOKEN, not on ChannelManagerV2. openChannel calls
+	// safeTransferFrom, and ERC-20 will not move anything without an allowance
+	// — so funding a channel is two transactions, against two contracts.
+	selApprove   = keccak([]byte("approve(address,uint256)"))[:4]
+	selAllowance = keccak([]byte("allowance(address,address)"))[:4]
 )
 
 // abiEncoder builds calldata one 32-byte word at a time.
@@ -189,6 +197,38 @@ func CloseCooperativeCalldata(ch *Channel) ([]byte, error) {
 	return append(append([]byte{}, selCloseCooperative...), e.bytes()...), nil
 }
 
+// OpenChannelCalldata builds a call to ChannelManagerV2.openChannel.
+//
+// The DEPOSIT goes in here, in the same transaction, which is why the tipper
+// sends this: they are funding it anyway, and splitting "create" from "fund"
+// would cost a second transaction to achieve nothing.
+func OpenChannelCalldata(partner Address, deposit *big.Int) []byte {
+	e := &abiEncoder{}
+	e.word(partner[:])
+	e.u256(deposit)
+	return append(append([]byte{}, selOpenChannel...), e.bytes()...)
+}
+
+// DepositCalldata tops up a channel that is already open.
+func DepositCalldata(id [32]byte, amount *big.Int) []byte {
+	e := &abiEncoder{}
+	e.fixed(id)
+	e.u256(amount)
+	return append(append([]byte{}, selDeposit...), e.bytes()...)
+}
+
+// ApproveCalldata builds an ERC-20 approval, to be sent to the TOKEN.
+//
+// Required before openChannel or deposit: those call safeTransferFrom, which
+// moves nothing without an allowance. Two transactions, against two different
+// contracts, and a caller that forgets the first gets a revert on the second.
+func ApproveCalldata(spender Address, amount *big.Int) []byte {
+	e := &abiEncoder{}
+	e.word(spender[:])
+	e.u256(amount)
+	return append(append([]byte{}, selApprove...), e.bytes()...)
+}
+
 // ClaimLockCalldata builds a call to ChannelManagerV2.claimLock.
 func ClaimLockCalldata(id [32]byte, locks []HTLC, index int, preimage [32]byte) []byte {
 	e := &abiEncoder{}
@@ -238,6 +278,18 @@ func (w *RPCChainWriter) send(ctx context.Context, contract Address, data []byte
 		return "", ErrWriterNotWired
 	}
 	return w.Sender.Send(ctx, contract, data)
+}
+
+func (w *RPCChainWriter) Approve(ctx context.Context, token, spender Address, amount *big.Int) (string, error) {
+	return w.send(ctx, token, ApproveCalldata(spender, amount))
+}
+
+func (w *RPCChainWriter) OpenChannel(ctx context.Context, contract Address, partner Address, deposit *big.Int) (string, error) {
+	return w.send(ctx, contract, OpenChannelCalldata(partner, deposit))
+}
+
+func (w *RPCChainWriter) Deposit(ctx context.Context, contract Address, id [32]byte, amount *big.Int) (string, error) {
+	return w.send(ctx, contract, DepositCalldata(id, amount))
 }
 
 func (w *RPCChainWriter) Checkpoint(ctx context.Context, contract Address, ch *Channel) (string, error) {
@@ -360,7 +412,22 @@ type FakeChainWriter struct {
 	// Chain, when set, is updated to reflect what the call would have done, so
 	// a test can watch the worker converge against a moving chain.
 	Chain *FakeChain
-	next  int
+	// opened records openChannel calls, which carry no channel id yet.
+	opened []FakeOpen
+	next   int
+}
+
+// Opened returns the channel openings attempted.
+func (f *FakeChainWriter) Opened() []FakeOpen {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]FakeOpen(nil), f.opened...)
+}
+
+// FakeOpen records an attempted channel opening.
+type FakeOpen struct {
+	Partner Address
+	Deposit *big.Int
 }
 
 // FakeTx is one recorded call.
@@ -404,6 +471,21 @@ func (f *FakeChainWriter) record(op string, id [32]byte, nonce uint64) (string, 
 		hook(tx)
 	}
 	return tx.Hash, nil
+}
+
+func (f *FakeChainWriter) Approve(_ context.Context, _, _ Address, _ *big.Int) (string, error) {
+	return f.record("approve", [32]byte{}, 0)
+}
+
+func (f *FakeChainWriter) OpenChannel(_ context.Context, _ Address, partner Address, deposit *big.Int) (string, error) {
+	f.mu.Lock()
+	f.opened = append(f.opened, FakeOpen{Partner: partner, Deposit: new(big.Int).Set(orZero(deposit))})
+	f.mu.Unlock()
+	return f.record("openChannel", [32]byte{}, 0)
+}
+
+func (f *FakeChainWriter) Deposit(_ context.Context, _ Address, id [32]byte, _ *big.Int) (string, error) {
+	return f.record("deposit", id, 0)
 }
 
 func (f *FakeChainWriter) Checkpoint(_ context.Context, _ Address, ch *Channel) (string, error) {

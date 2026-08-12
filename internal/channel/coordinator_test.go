@@ -363,3 +363,190 @@ func TestTheSessionCommitsThroughTheCoordinator(t *testing.T) {
 	// tests run without a chain.
 	var _ Committer = payer.store
 }
+
+// ---- opening a channel (P7-a) ---------------------------------------------------
+//
+// Funding is TWO transactions against TWO contracts: approve on the token, then
+// openChannel on the manager. The tests below are mostly about what happens when
+// a node dies between them.
+
+// fakeAllowance answers what the token would.
+type fakeAllowance struct {
+	value *big.Int
+	err   error
+	asked int
+}
+
+func (f *fakeAllowance) Allowance(context.Context, Address, Address, Address) (*big.Int, error) {
+	f.asked++
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.value == nil {
+		return new(big.Int), nil
+	}
+	return f.value, nil
+}
+
+func openingRig(t *testing.T) (*Coordinator, *FakeChain, *FakeChainWriter, *signer, Address) {
+	t.Helper()
+	me, partner := newSigner(t), newSigner(t)
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	chain := NewFakeChain()
+	coord := NewCoordinator(store, chain, big.NewInt(1), mustAddr(t, deployedChannelManager),
+		me.address(), func(raw [32]byte) ([]byte, error) { return me.sign(raw), nil })
+	return coord, chain, &FakeChainWriter{Chain: chain}, me, partner.address()
+}
+
+func TestOpeningAChannelApprovesThenOpens(t *testing.T) {
+	coord, _, writer, _, partner := openingRig(t)
+	allow := &fakeAllowance{value: new(big.Int)} // nothing approved yet
+
+	res, err := coord.OpenChannel(context.Background(), writer, allow,
+		Address{19: 0xaa}, partner, anon(500))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if res.ApprovalTx == "" || res.OpenTx == "" {
+		t.Fatalf("result %+v — both transactions should have been sent", res)
+	}
+
+	ops := []string{}
+	for _, c := range writer.Calls() {
+		ops = append(ops, c.Op)
+	}
+	if len(ops) != 2 || ops[0] != "approve" || ops[1] != "openChannel" {
+		t.Fatalf("sent %v, want approve then openChannel", ops)
+	}
+	// The channel id is known before anything is sent, which is what makes the
+	// sequence recoverable.
+	if res.ChannelID != DeriveChannelID(coord.self, partner) {
+		t.Fatal("the result names a different channel")
+	}
+	// And the deposit went in with the open, not separately.
+	opened := writer.Opened()
+	if len(opened) != 1 || opened[0].Deposit.Cmp(anon(500)) != 0 {
+		t.Fatalf("opened %+v", opened)
+	}
+}
+
+// A retry after a crash between the two transactions must not re-approve.
+func TestAnExistingAllowanceIsNotSpentAgain(t *testing.T) {
+	coord, _, writer, _, partner := openingRig(t)
+	allow := &fakeAllowance{value: anon(1000)} // already approved, generously
+
+	res, err := coord.OpenChannel(context.Background(), writer, allow,
+		Address{19: 0xaa}, partner, anon(500))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if res.ApprovalTx != "" {
+		t.Fatal("an approval was sent when the allowance already covered it")
+	}
+	calls := writer.Calls()
+	if len(calls) != 1 || calls[0].Op != "openChannel" {
+		t.Fatalf("sent %+v", calls)
+	}
+}
+
+// THE crash case: the open was broadcast and the node died before recording
+// anything. On restart it asks the chain, finds the channel, and adopts it
+// rather than opening a second one.
+func TestOpeningRecoversFromACrashAfterBroadcast(t *testing.T) {
+	coord, chain, writer, me, partner := openingRig(t)
+	ctx := context.Background()
+	allow := &fakeAllowance{value: anon(1000)}
+
+	if _, err := coord.OpenChannel(ctx, writer, allow, Address{19: 0xaa}, partner, anon(500)); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// It landed, and the node knows nothing about it.
+	chain.Add(me.address(), partner, anon(500), new(big.Int))
+	if len(coord.Channels()) != 0 {
+		t.Fatal("the coordinator recorded a channel from a broadcast")
+	}
+
+	res, err := coord.OpenChannel(ctx, writer, allow, Address{19: 0xaa}, partner, anon(500))
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if !res.AlreadyOpen {
+		t.Fatal("the retry did not notice the channel already existed")
+	}
+	if n := len(writer.Calls()); n != 1 {
+		t.Fatalf("%d transactions in total — the retry sent another one", n)
+	}
+	if len(coord.Channels()) != 1 {
+		t.Fatal("the existing channel was not adopted")
+	}
+}
+
+// A broadcast is not a channel. Nothing is tracked until the chain shows it.
+func TestABroadcastOpenIsNotYetAChannel(t *testing.T) {
+	coord, _, writer, _, partner := openingRig(t)
+	if _, err := coord.OpenChannel(context.Background(), writer, &fakeAllowance{value: anon(1000)},
+		Address{19: 0xaa}, partner, anon(500)); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if len(coord.Channels()) != 0 {
+		t.Fatal("a channel appeared from a transaction that has not landed")
+	}
+}
+
+func TestOpeningRefusesNonsense(t *testing.T) {
+	coord, _, writer, me, partner := openingRig(t)
+	allow := &fakeAllowance{value: anon(1000)}
+	ctx := context.Background()
+
+	if _, err := coord.OpenChannel(ctx, writer, allow, Address{}, me.address(), anon(5)); err == nil {
+		t.Fatal("a channel with yourself was allowed")
+	}
+	if _, err := coord.OpenChannel(ctx, writer, allow, Address{}, partner, anon(-5)); err != ErrAmountNotPositive {
+		t.Fatal("a negative deposit was allowed")
+	}
+	if n := len(writer.Calls()); n != 0 {
+		t.Fatalf("%d transactions sent for refused requests", n)
+	}
+}
+
+// A failed approval must not be followed by an open that would revert.
+func TestAFailedApprovalStopsTheSequence(t *testing.T) {
+	coord, _, writer, _, partner := openingRig(t)
+	writer.FailWith = errors.New("insufficient funds for gas")
+
+	_, err := coord.OpenChannel(context.Background(), writer, &fakeAllowance{value: new(big.Int)},
+		Address{19: 0xaa}, partner, anon(500))
+	if err == nil {
+		t.Fatal("the open proceeded after the approval failed")
+	}
+	if len(writer.Opened()) != 0 {
+		t.Fatal("openChannel was sent after a failed approval")
+	}
+}
+
+func TestDepositingNeedsATrackedChannel(t *testing.T) {
+	coord, _, writer, _, _ := openingRig(t)
+	unknown := [32]byte{0xde, 0xad}
+	if _, err := coord.Deposit(context.Background(), writer, nil, Address{}, unknown, anon(5)); err != ErrChannelNotAdopted {
+		t.Fatalf("got %v, want ErrChannelNotAdopted", err)
+	}
+}
+
+func TestOpeningSelectorsMatchTheContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		got        []byte
+	}{
+		{"openChannel", "24f453d1", selOpenChannel},
+		{"deposit", "1de26e16", selDeposit},
+		{"approve", "095ea7b3", selApprove},
+		{"allowance", "dd62ed3e", selAllowance},
+	} {
+		if hexOf(tc.got) != tc.want {
+			t.Errorf("%s selector %s, want %s", tc.name, hexOf(tc.got), tc.want)
+		}
+	}
+}
