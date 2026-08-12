@@ -89,15 +89,18 @@ func TestARoundWhereNobodyAnsweredBlocksValidation(t *testing.T) {
 	}
 }
 
-func TestHealthyFailoverIsEvidence(t *testing.T) {
-	healthy := FailoverObservation{
+func TestExercisedFailoverIsEvidence(t *testing.T) {
+	// The primary must have FAILED and a fallback must have carried rounds.
+	// A run where the primary answered everything measures a healthy primary,
+	// not recovery — see TestAnUnexercisedFallbackIsNotFailoverEvidence.
+	exercised := FailoverObservation{
 		Endpoints: []EndpointHealth{
-			{Endpoint: "https://a.example", Attempts: 60, WorstLatency: 400 * time.Millisecond},
+			{Endpoint: "https://a.example", Attempts: 60, Failures: 4, WorstLatency: 400 * time.Millisecond},
 			{Endpoint: "https://b.example", Attempts: 4, WorstLatency: 900 * time.Millisecond},
 		},
 		WorstFailover: 3 * time.Second,
 	}
-	e, err := healthy.AsEvidence(1, time.Now().Unix(), "two unrelated providers, separate accounts")
+	e, err := exercised.AsEvidence(1, time.Now().Unix(), "two unrelated providers, separate accounts")
 	if err != nil {
 		t.Fatalf("AsEvidence: %v", err)
 	}
@@ -252,5 +255,53 @@ func TestIndependentEndpointsSpotsTheCommonMistake(t *testing.T) {
 		if got, _ := IndependentEndpoints(tc.urls); got != tc.want {
 			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// A healthy primary means the fallback is never tried, and a run in which
+// nothing recovered cannot validate a term about recovery.
+//
+// This was found by a REAL measurement: 60/60 rounds answered by Alchemy, zero
+// attempts against the secondary, and AsEvidence accepted it.
+func TestAnUnexercisedFallbackIsNotFailoverEvidence(t *testing.T) {
+	healthyPrimary := FailoverObservation{
+		Endpoints: []EndpointHealth{
+			{Endpoint: "https://primary.example", Attempts: 60, Failures: 0, WorstLatency: time.Second},
+			{Endpoint: "https://secondary.example", Attempts: 0},
+		},
+		WorstFailover: time.Second,
+	}
+	_, err := healthyPrimary.AsEvidence(1, time.Now().Unix(), "two unrelated operators")
+	if err == nil {
+		t.Fatal("a run where the fallback was never tried was accepted as failover evidence")
+	}
+	if !strings.Contains(err.Error(), "not failover") {
+		t.Errorf("the refusal does not name the problem: %v", err)
+	}
+
+	// Once the primary has actually failed and a fallback carried rounds, it is
+	// evidence.
+	exercised := healthyPrimary
+	exercised.Endpoints[0].Failures = 12
+	exercised.Endpoints[1].Attempts = 12
+	if _, err := exercised.AsEvidence(1, time.Now().Unix(), "two unrelated operators"); err != nil {
+		t.Fatalf("an exercised fallback was refused: %v", err)
+	}
+}
+
+// A THIRD endpoint left untried is fine: a working secondary means the tertiary
+// is legitimately never needed. What must be true is that failover HAPPENED,
+// not that it exhausted the list.
+func TestAnUntriedTertiaryIsStillValidFailoverEvidence(t *testing.T) {
+	obs := FailoverObservation{
+		Endpoints: []EndpointHealth{
+			{Endpoint: "https://dead.invalid", Attempts: 40, Failures: 40},
+			{Endpoint: "https://secondary.example", Attempts: 40, WorstLatency: 200 * time.Millisecond},
+			{Endpoint: "https://tertiary.example", Attempts: 0},
+		},
+		WorstFailover: 300 * time.Millisecond,
+	}
+	if _, err := obs.AsEvidence(1, time.Now().Unix(), "three unrelated operators"); err != nil {
+		t.Fatalf("real failover with an untried tertiary was refused: %v", err)
 	}
 }

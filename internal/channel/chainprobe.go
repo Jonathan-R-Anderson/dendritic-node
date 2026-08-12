@@ -326,6 +326,34 @@ func (o FailoverObservation) AsEvidence(chainID int64, takenAt int64, attested s
 			"chainprobe: %d round(s) where no endpoint answered; that is an unbounded wait, not a measured one",
 			o.AllFailed)
 	}
+	// THE FALLBACK MUST ACTUALLY HAVE BEEN EXERCISED.
+	//
+	// ObserveFailover stops at the first endpoint that answers, so a healthy
+	// primary means the secondary is never tried — and the result measures "the
+	// primary worked", not failover. Filing that as rpc-failure evidence would
+	// validate a term about recovery using a run in which nothing recovered.
+	//
+	// Found by a real measurement: 60/60 rounds answered by the primary, zero
+	// attempts against the secondary, and this function accepted it.
+	// AT LEAST ONE fallback must have carried rounds, and the primary must have
+	// failed at least once. Requiring EVERY endpoint to be tried would be wrong
+	// — a working secondary means the tertiary is legitimately never needed —
+	// so what is required is that failover HAPPENED, not that it exhausted the
+	// list.
+	fallbackUsed := false
+	for i, e := range o.Endpoints {
+		if i > 0 && e.Attempts > 0 {
+			fallbackUsed = true
+			break
+		}
+	}
+	if !fallbackUsed || o.Endpoints[0].Failures == 0 {
+		return Evidence{}, fmt.Errorf(
+			"chainprobe: the primary answered every round (%d attempts, %d failures) "+
+				"and no fallback carried any — this measures a healthy primary, not "+
+				"failover. Induce a primary failure to measure the recovery path",
+			o.Endpoints[0].Attempts, o.Endpoints[0].Failures)
+	}
 	attempts := 0
 	for _, e := range o.Endpoints {
 		attempts += e.Attempts
