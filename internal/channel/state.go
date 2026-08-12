@@ -536,6 +536,14 @@ func (c *Channel) Clone() *Channel {
 		k.Theirs = cloneSigned(c.Conflict.Theirs)
 		out.Conflict = &k
 	}
+	if c.Payout != nil {
+		// Copied like everything else here. Sharing the pointer would let
+		// Store.Update's trial mutate the live record before the write it is
+		// trialling has succeeded — the same failure the deep copy exists to
+		// prevent, arriving through a field added later.
+		p := *c.Payout
+		out.Payout = &p
+	}
 	return &out
 }
 

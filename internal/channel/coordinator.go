@@ -140,6 +140,24 @@ func (c *Coordinator) Adopt(ctx context.Context, id [32]byte) error {
 	return nil
 }
 
+// Refresh re-reads a tracked channel's collateral and status from the chain.
+//
+// Call after anything that could have changed the collateral — a checkpoint, a
+// further deposit, a settlement. Cheap to call when nothing moved, and the
+// alternative is a node that quietly refuses every payment after a checkpoint
+// because it is measuring conservation against collateral that no longer
+// exists.
+func (c *Coordinator) Refresh(ctx context.Context, id [32]byte) error {
+	if _, ok := c.store.Get(id); !ok {
+		return ErrChannelNotAdopted
+	}
+	occ, err := c.chain.ReadChannel(ctx, c.contract, id)
+	if err != nil {
+		return err
+	}
+	return c.store.RefreshFromChain(occ)
+}
+
 // AdoptAnnounced handles a peer's CHANNEL_ANNOUNCE.
 //
 // Note what is taken from the message: the channel id, and nothing else. The

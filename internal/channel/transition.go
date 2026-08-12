@@ -56,6 +56,14 @@ const (
 	// no locks may remain — the contract's closeCooperative refuses a state
 	// with a non-zero root.
 	KindClose TransitionKind = "CLOSE"
+	// KindCheckpoint takes value OUT of the channel without closing it. The
+	// amount leaves the proposer's balance and enters neither — it goes to the
+	// chain, which pays it to them and reduces the collateral.
+	//
+	// A checkpoint is co-signed like any other state, which is the point: a
+	// withdrawal nobody agreed to is not expressible, and the contract verifies
+	// the amounts against the same signatures.
+	KindCheckpoint TransitionKind = "CHECKPOINT"
 )
 
 var (
@@ -103,6 +111,10 @@ func (t StateTransition) Apply(ch *Channel, proposer Address) (State, error) {
 	}
 	prev := ch.Latest.State
 
+	// Withdrawals are deliberately NOT carried forward. They belong to the one
+	// state that took value out; the next state starts from the balances that
+	// checkpoint left behind, with nothing leaving. Copying them would submit
+	// the same withdrawal again at a higher nonce.
 	next := State{
 		Channel:  ch.ID,
 		Nonce:    prev.Nonce + 1,
@@ -186,6 +198,22 @@ func (t StateTransition) Apply(ch *Channel, proposer Address) (State, error) {
 		give(&next, lock.PayerIsA, lock.Amount)
 		next.Pending = removeAt(next.Pending, i)
 
+	case KindCheckpoint:
+		if err := requirePositive(t.Amount); err != nil {
+			return State{}, err
+		}
+		// Out of the proposer's balance and out of the channel entirely. Not
+		// into the other party's balance — this value is leaving, and the
+		// contract pays it to whoever the withdrawal is recorded against.
+		if err := take(&next, proposerIsA, t.Amount); err != nil {
+			return State{}, err
+		}
+		if proposerIsA {
+			next.WithdrawA = new(big.Int).Set(t.Amount)
+		} else {
+			next.WithdrawB = new(big.Int).Set(t.Amount)
+		}
+
 	case KindClose:
 		if len(next.Pending) > 0 {
 			return State{}, ErrLocksRemain
@@ -227,6 +255,12 @@ func (s State) Equal(other State) error {
 	}
 	if orZero(s.BalanceB).Cmp(orZero(other.BalanceB)) != 0 {
 		return fmt.Errorf("balanceB %s != %s", orZero(s.BalanceB), orZero(other.BalanceB))
+	}
+	if orZero(s.WithdrawA).Cmp(orZero(other.WithdrawA)) != 0 {
+		return fmt.Errorf("withdrawA %s != %s", orZero(s.WithdrawA), orZero(other.WithdrawA))
+	}
+	if orZero(s.WithdrawB).Cmp(orZero(other.WithdrawB)) != 0 {
+		return fmt.Errorf("withdrawB %s != %s", orZero(s.WithdrawB), orZero(other.WithdrawB))
 	}
 	if len(s.Pending) != len(other.Pending) {
 		return fmt.Errorf("lock count %d != %d", len(s.Pending), len(other.Pending))

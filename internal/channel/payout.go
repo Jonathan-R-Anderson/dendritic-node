@@ -132,6 +132,9 @@ type PayoutRecord struct {
 // The settlement worker talks to this and never constructs a transaction
 // itself, so it can be tested without pretending to be on chain.
 type ChainWriter interface {
+	// Checkpoint submits a co-signed state that takes value out WITHOUT closing.
+	// The channel stays open and keeps its nonce line.
+	Checkpoint(ctx context.Context, contract Address, ch *Channel) (string, error)
 	// CloseCooperative submits a fully signed, lock-free state. Returns the
 	// transaction hash.
 	//
@@ -301,13 +304,38 @@ func (w *PayoutWorker) trySubmit(ctx context.Context, id [32]byte) (PayoutOutcom
 		// and closing would spend gas to move nothing.
 		return OutcomeNothingToDo, nil
 	}
-	// Locks first. settle() reverts while any remain, and they cannot be
-	// force-returned without stealing a payment that may still be claimable.
+	// Which operation depends on the policy, and they are genuinely different:
+	// a checkpoint draws value down and leaves the channel open, a close ends
+	// it. Both submit a state both parties signed.
+	drawing := hasWithdrawal(ch.Latest.State)
+	if drawing && ch.Payout != nil && ch.Payout.Policy.Mode == PayoutOnInterval {
+		txHash, err := w.writer.Checkpoint(ctx, w.contract, ch)
+		return w.afterSubmit(id, ch, txHash, err)
+	}
+
+	// Closing needs the locks resolved: closeCooperative refuses a state with a
+	// non-zero root, and they cannot be force-returned without stealing a
+	// payment that may still be claimable.
 	if len(ch.Latest.State.Pending) > 0 {
 		return OutcomeLocksPending, ErrLocksUnresolved
 	}
+	if drawing {
+		// A state that takes value out is not a state that closes: the close
+		// paths sign zero withdrawals, so this would revert on chain.
+		return OutcomeFailed, errors.New("payout: the latest state is a checkpoint; it cannot be used to close")
+	}
 
 	txHash, err := w.writer.CloseCooperative(ctx, w.contract, ch)
+	return w.afterSubmit(id, ch, txHash, err)
+}
+
+// hasWithdrawal reports whether a state takes value out of the channel.
+func hasWithdrawal(s State) bool {
+	return orZero(s.WithdrawA).Sign() > 0 || orZero(s.WithdrawB).Sign() > 0
+}
+
+// afterSubmit records a broadcast, or its failure.
+func (w *PayoutWorker) afterSubmit(id [32]byte, ch *Channel, txHash string, err error) (PayoutOutcome, error) {
 	if err != nil {
 		_ = w.mark(id, func(s *PayoutRecord) {
 			s.Phase = PhaseFailed
@@ -319,7 +347,7 @@ func (w *PayoutWorker) trySubmit(ctx context.Context, id [32]byte) (PayoutOutcom
 	}
 
 	// SUBMITTED, not confirmed. A hash is a broadcast; the next pass reads the
-	// chain to find out whether it became a settlement.
+	// chain to find out what became of it.
 	if err := w.mark(id, func(s *PayoutRecord) {
 		s.Phase = PhaseSubmitted
 		s.TxHash = txHash
@@ -330,8 +358,8 @@ func (w *PayoutWorker) trySubmit(ctx context.Context, id [32]byte) (PayoutOutcom
 		s.LastError = ""
 	}); err != nil {
 		// The transaction is already out. Failing to record it is exactly the
-		// case the chain-first rule covers: the next pass will see Settled and
-		// catch up, so this is reported and not treated as a lost settlement.
+		// case the chain-first rule covers: the next pass reads the chain and
+		// catches up, so this is reported rather than treated as lost.
 		return OutcomeSubmitted, fmt.Errorf("payout: broadcast %s but could not record it: %w", txHash, err)
 	}
 	return OutcomeSubmitted, nil

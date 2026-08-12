@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -206,6 +207,7 @@ func trim0x(s string) string {
 // It lives in the package rather than a test file because the guard it has to
 // set is unexported — which is the same reason it cannot be abused from outside.
 type FakeChain struct {
+	mu       sync.Mutex
 	Channels map[[32]byte]OnChainChannel
 	Err      error
 }
@@ -217,6 +219,8 @@ func NewFakeChain() *FakeChain {
 
 // Add records a channel as the chain would report it.
 func (f *FakeChain) Add(partyA, partyB Address, depositA, depositB *big.Int) [32]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	a, b := SortParties(partyA, partyB)
 	id := DeriveChannelID(a, b)
 	da, db := depositA, depositB
@@ -232,6 +236,8 @@ func (f *FakeChain) Add(partyA, partyB Address, depositA, depositB *big.Int) [32
 }
 
 func (f *FakeChain) ReadChannel(_ context.Context, _ Address, id [32]byte) (OnChainChannel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.Err != nil {
 		return OnChainChannel{}, f.Err
 	}

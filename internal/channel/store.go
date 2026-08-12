@@ -183,6 +183,35 @@ func (s *Store) TrackFromChain(chainID *big.Int, contract Address, occ OnChainCh
 	return nil
 }
 
+// RefreshFromChain updates a tracked channel's collateral and status from a
+// chain read.
+//
+// NEEDED BECAUSE OF CHECKPOINTS. A checkpoint takes value out and reduces the
+// deposits on chain while the channel stays open. A node that did not notice
+// would keep checking conservation against the OLD collateral, and every state
+// after the checkpoint would look unconserved — the payments would be correct
+// and the node would refuse them all.
+//
+// Only the deposits and the status move. The signed state is not touched: the
+// chain knows what collateral exists and what has settled, and this node knows
+// what the parties have signed. Those stay separate sources for separate facts
+// — letting a chain read overwrite `Latest` would put the last SETTLED state in
+// the place the newest SIGNED one belongs.
+func (s *Store) RefreshFromChain(occ OnChainChannel) error {
+	if !occ.fromChain {
+		return ErrNotFromChain
+	}
+	return s.Update(occ.ID, func(c *Channel) error {
+		if occ.PartyA != c.PartyA || occ.PartyB != c.PartyB {
+			return errors.New("channel: on-chain parties do not match the stored record")
+		}
+		c.DepositA = new(big.Int).Set(orZero(occ.DepositA))
+		c.DepositB = new(big.Int).Set(orZero(occ.DepositB))
+		c.Status = occ.Status
+		return nil
+	})
+}
+
 // Get returns a COPY of a channel's record.
 //
 // A copy because a caller holding a pointer into the store could mutate a
