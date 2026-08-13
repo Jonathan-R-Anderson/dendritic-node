@@ -408,3 +408,136 @@ func TestP146ECurrentPlanThroughput(t *testing.T) {
 		"throughput only. Monthly CU is reported separately and is not a " +
 		"constraint at our volume.")
 }
+
+// ---------------------------------------------------------------------------
+// P14.6f — the upgrade TRIGGER.
+//
+// The 2,000-block confirmatory run measured a 54% skip rate, against 75-82% from
+// earlier 60-200 block samples. That is not noise to average away: the break-even
+// for the 4-hour budget is 75.4%, so the two samples fall on OPPOSITE SIDES of
+// the line and the small ones were too small to decide it.
+//
+// The skip rate has TWO independent drivers, and only one is ours:
+//
+//	true positives   our contract actually emitted   <- our channel activity
+//	false positives  saturation^3, 3 hash positions  <- everyone ELSE's activity
+//
+// A trigger built only on our own activity would miss the half of the problem
+// that mainnet congestion causes. This measures both.
+// ---------------------------------------------------------------------------
+
+func TestP146FSkipRateAndUpgradeTrigger(t *testing.T) {
+	if os.Getenv("P146F") == "" || os.Getenv("CHAIN_PROBE") == "" {
+		t.Skip("set P146F=1 CHAIN_PROBE=1")
+	}
+	rpc, beaconURL := os.Getenv("ETH_RPC_URL"), os.Getenv("BEACON_API_URL")
+	if rpc == "" || beaconURL == "" {
+		t.Skip("set ETH_RPC_URL and BEACON_API_URL")
+	}
+	// Headers only: 20 CU each, so 25/sec fits inside the measured 500 CU/s.
+	src := &RPCSource{Endpoint: rpc, MaxRetries: 5, MinInterval: 0, MaxBatch: 100}
+	beacon := &BeaconFinalizedSource{Beacon: NewBeaconClient(beaconURL), Spec: SpecAltair}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
+	defer cancel()
+
+	head, err := beacon.FinalizedBlock(ctx)
+	if err != nil {
+		t.Fatalf("finalized: %v", err)
+	}
+	blocks := 3000
+	if v := os.Getenv("P146F_BLOCKS"); v != "" {
+		fmt.Sscanf(v, "%d", &blocks)
+	}
+
+	ours := addr20("ae70526931FF460894133201f6C8cA91bbA0E177")
+	headers, err := src.HeadersDescending(ctx, head.Number, blocks)
+	if err != nil {
+		t.Fatalf("headers: %v", err)
+	}
+
+	// Walk by hash so every bloom read is an AUTHENTICATED one, not a claim.
+	expected := head.Hash
+	var satTotal, hits int
+	buckets := map[int]int{}
+	for i, h := range headers {
+		fork, err := ExecutionForkAt(1, h.Time)
+		if err != nil {
+			t.Fatalf("fork: %v", err)
+		}
+		b, err := BlockFromParentLink(h, fork, expected)
+		if err != nil {
+			t.Fatalf("walk at %d: %v", i, err)
+		}
+		expected = b.ParentHash
+		s := BloomBitsSet(b.LogsBloom)
+		satTotal += s
+		buckets[s*10/2048]++
+		if b.MayContainAddress(ours) {
+			hits++
+		}
+	}
+
+	n := len(headers)
+	skip := 100 * float64(n-hits) / float64(n)
+	avgSat := float64(satTotal) / float64(n) / 2048
+	t.Logf("AUTHENTICATED BLOOM SAMPLE: %d consecutive finalised blocks", n)
+	t.Logf("  skip rate      : %.1f%%  (%d of %d blocks excluded outright)", skip, n-hits, n)
+	t.Logf("  bloom hit rate : %.1f%%", 100*float64(hits)/float64(n))
+	t.Logf("  avg saturation : %.1f%% of 2048 bits", 100*avgSat)
+	t.Logf("  theory: FP = saturation^3 = %.1f%%  (our contract is IDLE, so every "+
+		"hit is a false positive)", 100*avgSat*avgSat*avgSat)
+	t.Logf("  saturation distribution (decile of 2048 bits -> blocks):")
+	for d := 0; d <= 10; d++ {
+		if buckets[d] > 0 {
+			t.Logf("    %2d0-%2d0%%: %5d", d, d+1, buckets[d])
+		}
+	}
+
+	// What the measured rate means for the budget, at the MEASURED throughput.
+	const (
+		cuPerSec   = 500.0 // measured: 1.00 receipts/sec x 500 throughput CU
+		weekBlocks = 50400.0
+		budgetSec  = 4 * 3600.0
+	)
+	hdrSec := weekBlocks * cuBlockByNumber / cuPerSec
+	fetches := weekBlocks * float64(hits) / float64(n)
+	rcptSec := fetches * cuThroughputReceipts / cuPerSec
+	total := hdrSec + rcptSec
+	t.Logf("")
+	t.Logf("ONE-WEEK CATCH-UP at this skip rate and the MEASURED 1.00 receipts/sec:")
+	t.Logf("  headers %.0f min + receipts %.2f h = %.2f h  (%.0f%% of the 4h budget)",
+		hdrSec/60, rcptSec/3600, total/3600, 100*total/budgetSec)
+
+	// The break-even, and what it means as a trigger.
+	avail := budgetSec - hdrSec
+	beFetches := avail * cuPerSec / cuThroughputReceipts
+	beSkip := 100 * (1 - beFetches/weekBlocks)
+	t.Logf("")
+	t.Logf("BREAK-EVEN skip rate for a one-week catch-up inside 4h: %.1f%%", beSkip)
+	if skip < beSkip {
+		t.Logf("  MEASURED %.1f%% IS BELOW IT — the current throughput does NOT meet "+
+			"the requirement today.", skip)
+	} else {
+		t.Logf("  measured %.1f%% is above it, by %.1f points", skip, skip-beSkip)
+	}
+
+	// The trigger: at what emit-rate does OUR activity push us under, given the
+	// false-positive floor we do not control?
+	fp := avgSat * avgSat * avgSat
+	t.Logf("")
+	t.Logf("UPGRADE TRIGGER — skip = (1 - ourEmitRate) x (1 - FP), FP = %.3f measured", fp)
+	if 1-fp > 0 {
+		maxEmit := 1 - (beSkip/100)/(1-fp)
+		if maxEmit < 0 {
+			t.Logf("  FP ALONE (%.1f%%) already puts skip below break-even.", 100*fp)
+			t.Logf("  ZERO channel activity is required to breach it — congestion did it.")
+		} else {
+			t.Logf("  our contract may emit in at most %.2f%% of blocks (%.0f blocks/day)",
+				100*maxEmit, maxEmit*7200)
+		}
+	}
+	t.Log("")
+	t.Log("NOT A VALIDATION OF THE 4-HOUR OUTAGE TERM. This measures one input to " +
+		"it — catch-up throughput — on one provider over one window. The budget " +
+		"is unchanged.")
+}
