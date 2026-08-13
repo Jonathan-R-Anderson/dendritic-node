@@ -51,11 +51,17 @@ type cuCounter struct {
 	mu           sync.Mutex
 	headerCalls  int
 	receiptCalls int
+	receiptTime  time.Duration
+	headerTime   time.Duration
+	receiptLat   []time.Duration
 }
 
 func (c *cuCounter) HeadersDescending(ctx context.Context, from uint64, count int) ([]ExecutionHeader, error) {
+	start := time.Now()
 	h, err := c.inner.HeadersDescending(ctx, from, count)
+	took := time.Since(start)
 	c.mu.Lock()
+	c.headerTime += took
 	// Every header in the batch is a separate eth_getBlockByNumber invocation as
 	// far as billing is concerned, whether or not they shared a request.
 	c.headerCalls += count
@@ -64,11 +70,34 @@ func (c *cuCounter) HeadersDescending(ctx context.Context, from uint64, count in
 }
 
 func (c *cuCounter) ReceiptsByNumber(ctx context.Context, n uint64) ([]Receipt, error) {
+	start := time.Now()
 	r, err := c.inner.ReceiptsByNumber(ctx, n)
+	took := time.Since(start)
 	c.mu.Lock()
 	c.receiptCalls++
+	c.receiptTime += took
+	c.receiptLat = append(c.receiptLat, took)
 	c.mu.Unlock()
 	return r, err
+}
+
+// latency reports the per-call distribution. A call that waited on a provider
+// backoff shows up here as a multi-second outlier, so this is how "backoff time"
+// is evidenced rather than asserted.
+func (c *cuCounter) latency() (median, p95, max time.Duration, overTwoSec int) {
+	c.mu.Lock()
+	d := append([]time.Duration(nil), c.receiptLat...)
+	c.mu.Unlock()
+	if len(d) == 0 {
+		return
+	}
+	sortDurations(d)
+	for _, x := range d {
+		if x >= 2*time.Second {
+			overTwoSec++
+		}
+	}
+	return pct(d, 0.5), pct(d, 0.95), d[len(d)-1], overTwoSec
 }
 
 func (c *cuCounter) totals() (headers, receipts, cu int) {
@@ -223,11 +252,14 @@ func TestP146DCatchUpOnUpgradedTier(t *testing.T) {
 	}
 	st := src.Stats()
 	hdrCalls, rcptCalls, cu := counted.totals()
+	_ = hdrCalls
 
 	per := elapsed / time.Duration(max2(1, prog.BlocksExamined))
 	t.Logf("MEASURED CATCH-UP on the upgraded tier")
 	t.Logf("  %d blocks in %s = %s/block", prog.BlocksExamined,
 		elapsed.Round(time.Millisecond), per.Round(time.Microsecond))
+	t.Logf("  effective %.2f eth_getBlockReceipts/sec", float64(rcptCallsOf(counted))/elapsed.Seconds())
+	t.Logf("  batch size configured %d, shrinks %d, settled %d", 100, st.BatchShrinks, st.LastBatch)
 	t.Logf("  bloom-skipped %d/%d (%.0f%%), receipts fetched %d",
 		prog.BlocksSkipped, prog.BlocksExamined,
 		100*float64(prog.BlocksSkipped)/float64(max2(1, prog.BlocksExamined)),
@@ -242,6 +274,21 @@ func TestP146DCatchUpOnUpgradedTier(t *testing.T) {
 			"below still contains backoff and must not be reported as clean.",
 			st.RateLimited)
 	}
+	t.Logf("")
+	med, p95, mx, slow := counted.latency()
+	t.Logf("  BACKOFF: %s", func() string {
+		if st.RateLimited == 0 && st.Retries == 0 {
+			return "ZERO — no provider refusal, so no backoff was entered"
+		}
+		return fmt.Sprintf("%d retries; backoff starts at 2s and doubles, so at "+
+			"least %s was spent waiting", st.Retries, time.Duration(st.Retries)*2*time.Second)
+	}())
+	t.Logf("  receipt call latency: median %s, p95 %s, max %s (%d calls >= 2s)",
+		med.Round(time.Millisecond), p95.Round(time.Millisecond),
+		mx.Round(time.Millisecond), slow)
+	t.Logf("  time in receipt calls %s, in header batches %s, of %s wall",
+		counted.receiptTime.Round(time.Second), counted.headerTime.Round(time.Second),
+		elapsed.Round(time.Second))
 	t.Logf("")
 	t.Logf("  ACTUAL CU: %d eth_getBlockByNumber + %d eth_getBlockReceipts = %d CU",
 		hdrCalls, rcptCalls, cu)
@@ -540,4 +587,97 @@ func TestP146FSkipRateAndUpgradeTrigger(t *testing.T) {
 	t.Log("NOT A VALIDATION OF THE 4-HOUR OUTAGE TERM. This measures one input to " +
 		"it — catch-up throughput — on one provider over one window. The budget " +
 		"is unchanged.")
+}
+
+// probeOfferedRate launches requests at a TARGET RATE regardless of how long
+// each takes.
+//
+// The earlier paced probe issued them sequentially, so its ceiling was 1/latency
+// — about 12/s at 80 ms. That is fine for measuring a 1/s limit and useless for
+// measuring a 20/s one: it would report the prober's own bound as the provider's.
+// Here each request goes in its own goroutine on a fixed schedule, so the offered
+// rate is independent of latency.
+func probeOfferedRate(t *testing.T, endpoint string, head uint64,
+	perSec float64, window time.Duration) probeResult {
+	t.Helper()
+
+	src := &RPCSource{Endpoint: endpoint, MaxRetries: 0, MinInterval: 0}
+	res := probeResult{concurrency: 0}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	interval := time.Duration(float64(time.Second) / perSec)
+	deadline := time.Now().Add(window)
+	start := time.Now()
+	i := 0
+	for time.Now().Before(deadline) {
+		wg.Add(1)
+		go func(n uint64) {
+			defer wg.Done()
+			_, err := src.ReceiptsByNumber(context.Background(), n)
+			mu.Lock()
+			if err == nil {
+				res.ok++
+			} else {
+				res.refused++
+			}
+			mu.Unlock()
+		}(head - uint64(i%4000))
+		i++
+		time.Sleep(interval)
+	}
+	wg.Wait()
+	res.duration = time.Since(start)
+	res.http429 = src.Stats().RateLimited
+	return res
+}
+
+func TestP146GUpgradedThroughputCeiling(t *testing.T) {
+	if os.Getenv("P146G") == "" || os.Getenv("CHAIN_PROBE") == "" {
+		t.Skip("set P146G=1 CHAIN_PROBE=1")
+	}
+	endpoint := os.Getenv("ETH_RPC_URL")
+	if endpoint == "" {
+		t.Skip("set ETH_RPC_URL")
+	}
+	src := &RPCSource{Endpoint: endpoint, MaxRetries: 3, MinInterval: 100 * time.Millisecond}
+	head := p146Head(t, src)
+
+	window := 15 * time.Second
+	t.Logf("UPGRADED-TIER THROUGHPUT CEILING — eth_getBlockReceipts")
+	t.Logf("  free tier measured: 1.00/s clean, 429 at 1.5/s")
+	t.Logf("  PAYG expectation: 10,000 CU/s / 500 throughput CU = 20/s")
+	t.Logf("")
+
+	var clean float64
+	for _, rate := range []float64{5, 10, 15, 20, 25, 30} {
+		r := probeOfferedRate(t, endpoint, head, rate, window)
+		verdict := "CLEAN"
+		if r.refused > 0 {
+			verdict = "REFUSALS"
+		}
+		t.Logf("  offered %4.0f/s: %4d ok, %4d refused (%.0f%%), %d HTTP 429 => served %5.2f/s  %s",
+			rate, r.ok, r.refused, r.refusalRate(), r.http429, r.okPerSec(), verdict)
+		if r.refused == 0 && r.okPerSec() > clean {
+			clean = r.okPerSec()
+		}
+		time.Sleep(10 * time.Second)
+	}
+	t.Logf("")
+	if clean == 0 {
+		t.Logf("NO RATE WAS CLEAN at or above 5/s")
+	} else {
+		t.Logf("HIGHEST CLEAN SUSTAINED RATE: %.2f eth_getBlockReceipts/sec", clean)
+		t.Logf("  = %.0f effective throughput CU/s", clean*cuThroughputReceipts)
+		t.Logf("  vs free tier's measured 1.00/s => %.0fx", clean/1.0)
+	}
+	t.Log("")
+	t.Log("Throughput only. Monthly CU volume is a separate resource and is " +
+		"reported separately.")
+}
+
+func rcptCallsOf(c *cuCounter) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.receiptCalls
 }
