@@ -78,6 +78,11 @@ func TestSnapshotCarriesNoIdentifyingFields(t *testing.T) {
 		"HTLCsCreated": true, "HTLCsSettled": true, "HTLCsRefunded": true,
 		"RoutedPayments": true, "MultipathPayments": true, "MultipathLegs": true,
 		"ExecutorFailures": true, "TipsAtClose": true,
+		// P14.5 chain-follower counters. Each is a COUNT of blocks or receipts
+		// examined, never a height, hash or identifier — "Blocks" trips the
+		// "lock" substring and "ChainReceiptsVerified" is a total, not a list.
+		"ChainBlocksAuthenticated": true, "ChainBlocksSkipped": true,
+		"ChainReceiptsVerified": true, "ChainRateLimited": true,
 	}
 
 	st := reflect.TypeOf(Snapshot{})

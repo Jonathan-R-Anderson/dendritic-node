@@ -147,8 +147,16 @@ type Metrics struct {
 	// Watchtower and verification.
 	watchtowerObservations uint64
 	watchtowerRecoveries   uint64
-	proofsVerified         uint64
-	proofsRejected         uint64
+
+	// The authenticated-chain path (P14.5). Counts only — a block number is not
+	// an identifier of anybody, but a per-block series aligned against payment
+	// counters would time them, so these are totals like everything else here.
+	chainBlocksAuthenticated uint64
+	chainBlocksSkipped       uint64
+	chainReceiptsVerified    uint64
+	chainRateLimited         uint64
+	proofsVerified           uint64
+	proofsRejected           uint64
 
 	// Evidence store.
 	dhtReads      uint64
@@ -352,6 +360,47 @@ func (m *Metrics) WatchtowerRecovery() {
 	m.bump(&m.watchtowerRecoveries)
 }
 
+// ChainBlockAuthenticated counts a finalised block whose identity and
+// commitments were established. One per block examined, however cheap.
+func (m *Metrics) ChainBlockAuthenticated() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.chainBlocksAuthenticated)
+}
+
+// ChainBlockSkippedByBloom counts a block the AUTHENTICATED bloom excluded, so
+// no receipts were fetched. The gap between this and ChainBlockAuthenticated is
+// the workload the design exists to remove.
+func (m *Metrics) ChainBlockSkippedByBloom() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.chainBlocksSkipped)
+}
+
+// ChainReceiptsVerified counts receipts rebuilt into a trie whose root matched
+// the authenticated receiptsRoot. The count, never which block.
+func (m *Metrics) ChainReceiptsVerified(count int) {
+	if m == nil || count <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.chainReceiptsVerified += uint64(count)
+	m.mu.Unlock()
+}
+
+// ChainRateLimited counts provider refusals for capacity.
+//
+// SEPARATE on purpose. Folded into a latency figure a rate limit disappears; on
+// its own it is a number that climbs before the watchtower stops working.
+func (m *Metrics) ChainRateLimited() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.chainRateLimited)
+}
+
 // ProofVerified records a verification outcome. A bool, not a reason string —
 // a reason is free text and free text is where identifiers end up.
 func (m *Metrics) ProofVerified(ok bool) {
@@ -467,9 +516,17 @@ type Snapshot struct {
 	ExecutorFailures  uint64 `json:"executor_failures"`
 
 	WatchtowerObservations uint64 `json:"watchtower_observations"`
-	WatchtowerRecoveries   uint64 `json:"watchtower_recoveries"`
-	ProofsVerified         uint64 `json:"proofs_verified"`
-	ProofsRejected         uint64 `json:"proofs_rejected"`
+
+	// The authenticated-chain path. ChainRateLimited is its own field rather
+	// than an error total, because "the provider refused us" is operationally
+	// different from "the provider was wrong".
+	ChainBlocksAuthenticated uint64 `json:"chain_blocks_authenticated"`
+	ChainBlocksSkipped       uint64 `json:"chain_blocks_skipped_by_bloom"`
+	ChainReceiptsVerified    uint64 `json:"chain_receipts_verified"`
+	ChainRateLimited         uint64 `json:"chain_rate_limited"`
+	WatchtowerRecoveries     uint64 `json:"watchtower_recoveries"`
+	ProofsVerified           uint64 `json:"proofs_verified"`
+	ProofsRejected           uint64 `json:"proofs_rejected"`
 
 	DHTFailures   uint64 `json:"dht_failures"`
 	DHTReads      uint64 `json:"dht_reads"`
@@ -512,7 +569,12 @@ func (m *Metrics) Snapshot() Snapshot {
 
 		WatchtowerObservations: m.watchtowerObservations,
 		WatchtowerRecoveries:   m.watchtowerRecoveries,
-		ProofsVerified:         m.proofsVerified, ProofsRejected: m.proofsRejected,
+
+		ChainBlocksAuthenticated: m.chainBlocksAuthenticated,
+		ChainBlocksSkipped:       m.chainBlocksSkipped,
+		ChainReceiptsVerified:    m.chainReceiptsVerified,
+		ChainRateLimited:         m.chainRateLimited,
+		ProofsVerified:           m.proofsVerified, ProofsRejected: m.proofsRejected,
 
 		DHTReads: m.dhtReads, DHTWrites: m.dhtWrites, DHTFailures: m.dhtFailures,
 		DHTBytesRead: m.dhtBytesRead, DHTBytesWrite: m.dhtBytesWrite,
