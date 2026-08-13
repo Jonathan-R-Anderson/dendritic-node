@@ -72,6 +72,8 @@ type Forwarder struct {
 	coord *Coordinator
 	vault *PreimageVault
 	self  Address
+	// metrics is aggregate-only: a routed payment happened, not whose.
+	metrics *Metrics
 
 	now    func() int64
 	margin int64
@@ -87,6 +89,9 @@ func NewForwarder(coord *Coordinator, vault *PreimageVault, self Address) *Forwa
 		margin: int64(DefaultHopMargin / time.Second),
 	}
 }
+
+// SetMetrics attaches an aggregate collector.
+func (f *Forwarder) SetMetrics(m *Metrics) { f.metrics = m }
 
 // SetClock replaces the clock and the hop margin.
 func (f *Forwarder) SetClock(now func() int64, marginSeconds int64) {
@@ -155,6 +160,10 @@ func (f *Forwarder) Forward(ctx context.Context, in Incoming, outChannel [32]byt
 			"%w: incoming expires in %ds, margin is %ds",
 			ErrNoMargin, in.Lock.Expiry-f.now(), f.margin)
 	}
+
+	// A forward is one routed payment. The channels, the lock and the hash are
+	// all in scope here and none is passed: the metric is that routing was used.
+	f.metrics.RoutedPayment()
 
 	return f.coord.Pay(ctx, outChannel, intent, StateTransition{
 		Kind:   KindLockAdd,

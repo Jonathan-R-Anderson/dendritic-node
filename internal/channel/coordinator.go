@@ -61,6 +61,10 @@ type Coordinator struct {
 
 	sess *PeerSession
 
+	// metrics is optional and aggregate-only. Nil is a working collector, so no
+	// call site below needs a guard.
+	metrics *Metrics
+
 	// vault answers "does this node hold the secret for that lock", which is
 	// what separates a claimable payment from one still in flight. Optional.
 	vault *PreimageVault
@@ -90,6 +94,13 @@ func NewCoordinator(store *Store, chain ChainReader, chainID *big.Int,
 // Session exposes the protocol engine for clock configuration. It is not a way
 // to bypass the coordinator: the session commits through it either way.
 func (c *Coordinator) Session() *PeerSession { return c.sess }
+
+// SetMetrics attaches an aggregate collector.
+//
+// A setter rather than a constructor argument, deliberately: instrumentation
+// must never be something a caller has to supply to get a working payment path,
+// and nil is a working collector.
+func (c *Coordinator) SetMetrics(m *Metrics) { c.metrics = m }
 
 // ---- Committer, for PeerSession --------------------------------------------
 
@@ -228,12 +239,27 @@ func (c *Coordinator) Pay(ctx context.Context, id [32]byte, intent [32]byte,
 	// Already applied: answer from the record rather than paying again. The
 	// protocol is idempotent underneath as well, but a caller asking twice
 	// deserves the same answer without a round trip.
+	//
+	// NOT COUNTED. This is a retry of something already recorded, and counting
+	// it would inflate both attempts and completions every time a caller asked
+	// twice — which is the ordinary case after an ambiguous outcome.
 	if nonce, applied := ch.AppliedAt(intent); applied {
 		return PaymentResult{Done: true, Nonce: nonce, Route: "direct"}, nil
 	}
 
+	// One attempt, counted once, at the point past which a payment is genuinely
+	// being tried. `tr` is in scope and carries an amount; nothing here needs the
+	// channel id, the intent or either party, so none is available to pass.
+	c.metrics.TipAttempted()
+
 	propose, err := c.sess.Propose(id, intent, tr)
 	if err != nil {
+		// Refused by THIS node, before the peer was asked — a non-conserving
+		// amount, a lock past its expiry, a nonce already signed. Still a
+		// terminal outcome of the attempt counted above, and omitting it left
+		// attempted > completed + failed with nothing to show where the
+		// difference went.
+		c.metrics.TipFailed()
 		return PaymentResult{}, err
 	}
 
@@ -251,6 +277,7 @@ func (c *Coordinator) Pay(ctx context.Context, id [32]byte, intent [32]byte,
 			ch.NotePayment(rec)
 			return nil
 		})
+		c.metrics.TipFailed()
 		return PaymentResult{}, err
 	}
 
@@ -260,6 +287,9 @@ func (c *Coordinator) Pay(ctx context.Context, id [32]byte, intent [32]byte,
 			return PaymentResult{}, err
 		}
 		fresh, _ := c.store.Get(id)
+		// The AMOUNT and the KIND, nothing else. Which channel carried it and who
+		// the parties are stay here; the collector could not accept them anyway.
+		c.recordCompletion(tr)
 		return PaymentResult{Done: true, Nonce: fresh.Latest.State.Nonce, Route: "direct"}, nil
 
 	case MsgStateReject:
@@ -269,6 +299,10 @@ func (c *Coordinator) Pay(ctx context.Context, id [32]byte, intent [32]byte,
 		}
 		var body StateRejectBody
 		_ = reply.Body_(&body)
+		// A refusal is a failure. The REASON is not recorded: reject codes are a
+		// small enum today, but a code plus a timestamp narrows which payment
+		// failed, and the aggregate question ("how many fail") does not need it.
+		c.metrics.TipFailed()
 		return PaymentResult{Rejected: code, Detail: body.Detail}, nil
 
 	case MsgStateResponse:
@@ -285,6 +319,33 @@ func (c *Coordinator) Pay(ctx context.Context, id [32]byte, intent [32]byte,
 
 	default:
 		return PaymentResult{}, fmt.Errorf("coordinator: unexpected reply %s", reply.Type)
+	}
+}
+
+// recordCompletion turns an applied transition into aggregate counters.
+//
+// The transition is already in hand at the call site, so this needs nothing
+// fetched and nothing looked up — which matters, because a lookup is where an
+// identifier would have to be handled in order to be discarded, and the rule is
+// that identifiers never reach this layer at all.
+func (c *Coordinator) recordCompletion(tr StateTransition) {
+	switch tr.Kind {
+	case KindPay:
+		c.metrics.TipCompleted(tr.Amount)
+	case KindLockAdd:
+		// Counted on APPLICATION, not on attempt. A lock the peer refused was
+		// never created, and counting it at the attempt made a 3-leg split with
+		// one dead counterparty report three HTLCs where two exist.
+		//
+		// No value moves yet either — a lock is out of the payer's balance and
+		// into neither party's, so it becomes a tip only when it settles.
+		c.metrics.HTLCCreated()
+	case KindLockSettle:
+		c.metrics.HTLCSettled()
+	case KindLockRefund:
+		c.metrics.HTLCRefunded()
+	case KindCheckpoint, KindClose:
+		// Value leaving the channel, not a tip.
 	}
 }
 

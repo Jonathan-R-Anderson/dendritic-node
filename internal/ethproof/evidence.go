@@ -225,6 +225,19 @@ type EvidenceBackend interface {
 	List(ctx context.Context, prefix string) ([]string, error)
 }
 
+// EvidenceMetrics receives aggregate counts about evidence-store traffic.
+//
+// Defined HERE, in primitives, rather than importing the channel package's
+// collector: ethproof must not depend on channel, and a narrow interface of
+// ints is also the strongest possible statement of what may cross. There is no
+// method that could carry a key, an evidence id, a channel id or a hash — the
+// interface cannot express them.
+type EvidenceMetrics interface {
+	EvidenceRead(bytes int)
+	EvidenceWrite(bytes int)
+	EvidenceFailure()
+}
+
 // EvidenceStore keeps verified evidence durably.
 //
 // Sealing is supplied by the caller rather than built in, so this file has one
@@ -237,6 +250,10 @@ type EvidenceStore struct {
 	// to disperse a record across nodes nobody here controls.
 	Seal func([]byte) ([]byte, error)
 	Open func([]byte) ([]byte, error)
+
+	// Metrics is optional and aggregate-only. Every call below has the key in
+	// hand and passes only a byte count.
+	Metrics EvidenceMetrics
 }
 
 // Put stores verified evidence. Refuses anything else.
@@ -255,7 +272,18 @@ func (s *EvidenceStore) Put(ctx context.Context, e Evidence) error {
 	if err != nil {
 		return err
 	}
-	return s.Backend.Put(ctx, e.Key(), blob)
+	// The KEY is right here — e.Key() names the chain, contract and channel — and
+	// it goes to the backend, never to the collector. Only the size crosses.
+	if err := s.Backend.Put(ctx, e.Key(), blob); err != nil {
+		if s.Metrics != nil {
+			s.Metrics.EvidenceFailure()
+		}
+		return err
+	}
+	if s.Metrics != nil {
+		s.Metrics.EvidenceWrite(len(blob))
+	}
+	return nil
 }
 
 // Get fetches a record and RE-VERIFIES it before returning.
@@ -266,7 +294,15 @@ func (s *EvidenceStore) Put(ctx context.Context, e Evidence) error {
 func (s *EvidenceStore) Get(ctx context.Context, key string) (Evidence, error) {
 	blob, err := s.Backend.Get(ctx, key)
 	if err != nil {
+		if s.Metrics != nil {
+			s.Metrics.EvidenceFailure()
+		}
 		return Evidence{}, err
+	}
+	// `key` is a parameter of this function and is not forwarded: the collector
+	// learns that a read happened and how big it was.
+	if s.Metrics != nil {
+		s.Metrics.EvidenceRead(len(blob))
 	}
 	plain, err := s.Open(blob)
 	if err != nil {

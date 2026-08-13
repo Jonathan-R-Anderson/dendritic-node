@@ -122,6 +122,12 @@ type Watchtower struct {
 	Sender   DisputeSender
 	Contract Address
 
+	// Metrics is aggregate-only. A Watch carries the channel id and the tx hash;
+	// NEITHER is passed to the collector. The measured facts are "a channel was
+	// examined" and "a recovery was attempted", which is what the workload
+	// question needs and all it needs.
+	Metrics *Metrics
+
 	// Interval is how often Run sweeps. This is DETECTION LATENCY, and it is
 	// the first term in the challengePeriod budget — see doc/watchtower.md.
 	Interval time.Duration
@@ -199,6 +205,9 @@ func (w *Watchtower) Sweep(ctx context.Context) []Watch {
 	}
 	out := []Watch{}
 	for _, id := range w.Store.IDs() {
+		// One observation per channel examined. `id` is right here and is not
+		// passed: the aggregate is how MUCH was watched, never what.
+		w.Metrics.WatchtowerObservation()
 		result := w.Check(ctx, id)
 		if w.OnResult != nil {
 			w.OnResult(result)
@@ -282,6 +291,9 @@ func (w *Watchtower) Check(ctx context.Context, id [32]byte) Watch {
 		result.Err = fmt.Errorf("watchtower: submitting the challenge: %w", err)
 		return result
 	}
+	// A recovery happened. txHash is in hand and stays in the Watch, which is an
+	// operator-facing result; the collector gets the fact, not the transaction.
+	w.Metrics.WatchtowerRecovery()
 	result.Outcome = WatchChallenged
 	result.TxHash = txHash
 	return result

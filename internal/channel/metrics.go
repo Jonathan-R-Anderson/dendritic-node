@@ -38,6 +38,11 @@ package channel
 // stream that was live at that moment. Counters and histograms cannot be
 // replayed into an ordering.
 
+// NIL IS A WORKING COLLECTOR. Every method tolerates a nil receiver and does
+// nothing, so a production path can hold a *Metrics that was never set and needs
+// no guard at the call site. Instrumentation that requires an `if m != nil`
+// around it gets forgotten in exactly one place.
+
 import (
 	"encoding/json"
 	"math/big"
@@ -148,6 +153,7 @@ type Metrics struct {
 	// Evidence store.
 	dhtReads      uint64
 	dhtWrites     uint64
+	dhtFailures   uint64
 	dhtBytesRead  uint64
 	dhtBytesWrite uint64
 
@@ -195,10 +201,30 @@ func intsToInt64(in []int) []int64 {
 // all, because the interesting fact is that one failed, and any detail that
 // would explain WHICH one is the detail that identifies it.
 
-func (m *Metrics) TipAttempted() { m.bump(&m.tipsAttempted) }
-func (m *Metrics) TipFailed()    { m.bump(&m.tipsFailed) }
+// NIL SAFETY LIVES IN EACH METHOD, NOT IN bump.
+//
+// `m.bump(&m.counter)` evaluates &m.counter BEFORE bump is entered, and taking
+// the address of a field on a nil pointer panics — so a guard inside bump is
+// unreachable. An earlier version had exactly that, and every un-instrumented
+// deployment would have panicked on its first payment. A real-path test found
+// it, because a node without a collector is the ordinary case there.
+func (m *Metrics) TipAttempted() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.tipsAttempted)
+}
+func (m *Metrics) TipFailed() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.tipsFailed)
+}
 
 func (m *Metrics) TipCompleted(amount *big.Int) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.tipsCompleted++
@@ -206,6 +232,9 @@ func (m *Metrics) TipCompleted(amount *big.Int) {
 }
 
 func (m *Metrics) TipRefunded(amount *big.Int) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.tipsRefunded++
@@ -215,6 +244,9 @@ func (m *Metrics) TipRefunded(amount *big.Int) {
 // ---- channels ---------------------------------------------------------------
 
 func (m *Metrics) ChannelOpened(deposit *big.Int) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.channelOpens++
@@ -226,6 +258,9 @@ func (m *Metrics) ChannelOpened(deposit *big.Int) {
 // carried over its life — a COUNT, passed at the moment of closing, so nothing
 // has to be retained per channel to produce it.
 func (m *Metrics) ChannelClosed(kind CloseKind, tips int) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.channelCloses++
@@ -247,6 +282,9 @@ func (m *Metrics) ChannelClosed(kind CloseKind, tips int) {
 // A duration, computed by the caller at the moment it settles; nothing here
 // remembers when anything happened.
 func (m *Metrics) ObserveSettlementInterval(d time.Duration) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.settlementInterval.observe(int64(d / time.Second))
@@ -254,15 +292,43 @@ func (m *Metrics) ObserveSettlementInterval(d time.Duration) {
 
 // ---- HTLCs, routing, executor ----------------------------------------------
 
-func (m *Metrics) HTLCCreated()     { m.bump(&m.htlcsCreated) }
-func (m *Metrics) HTLCSettled()     { m.bump(&m.htlcsSettled) }
-func (m *Metrics) HTLCRefunded()    { m.bump(&m.htlcsRefunded) }
-func (m *Metrics) RoutedPayment()   { m.bump(&m.routedPayments) }
-func (m *Metrics) ExecutorFailure() { m.bump(&m.executorFailures) }
+func (m *Metrics) HTLCCreated() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.htlcsCreated)
+}
+func (m *Metrics) HTLCSettled() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.htlcsSettled)
+}
+func (m *Metrics) HTLCRefunded() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.htlcsRefunded)
+}
+func (m *Metrics) RoutedPayment() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.routedPayments)
+}
+func (m *Metrics) ExecutorFailure() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.executorFailures)
+}
 
 // MultipathPayment records one split payment and how many legs it used. The leg
 // COUNT is a load figure; which channels carried them is not recorded.
 func (m *Metrics) MultipathPayment(legs int) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.multipathPayments++
@@ -273,12 +339,25 @@ func (m *Metrics) MultipathPayment(legs int) {
 
 // ---- watchtower and verification -------------------------------------------
 
-func (m *Metrics) WatchtowerObservation() { m.bump(&m.watchtowerObservations) }
-func (m *Metrics) WatchtowerRecovery()    { m.bump(&m.watchtowerRecoveries) }
+func (m *Metrics) WatchtowerObservation() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.watchtowerObservations)
+}
+func (m *Metrics) WatchtowerRecovery() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.watchtowerRecoveries)
+}
 
 // ProofVerified records a verification outcome. A bool, not a reason string —
 // a reason is free text and free text is where identifiers end up.
 func (m *Metrics) ProofVerified(ok bool) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if ok {
@@ -293,6 +372,9 @@ func (m *Metrics) ProofVerified(ok bool) {
 // DHTEvidence records one evidence-store operation and its size. Size is a load
 // figure; a size alone does not identify a record, and no key is accepted.
 func (m *Metrics) DHTEvidence(op DHTOp, bytes int) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if bytes < 0 {
@@ -308,7 +390,24 @@ func (m *Metrics) DHTEvidence(op DHTOp, bytes int) {
 	}
 }
 
-func (m *Metrics) RPCCall() { m.bump(&m.rpcCalls) }
+func (m *Metrics) RPCCall() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.rpcCalls)
+}
+
+// EvidenceRead, EvidenceWrite and EvidenceFailure implement
+// ethproof.EvidenceMetrics, so the evidence store can report without importing
+// this package. Byte counts only — the interface has no way to name a record.
+func (m *Metrics) EvidenceRead(bytes int)  { m.DHTEvidence(DHTRead, bytes) }
+func (m *Metrics) EvidenceWrite(bytes int) { m.DHTEvidence(DHTWrite, bytes) }
+func (m *Metrics) EvidenceFailure() {
+	if m == nil {
+		return
+	}
+	m.bump(&m.dhtFailures)
+}
 
 // ObserveResources records one sample of this process's usage.
 //
@@ -317,6 +416,9 @@ func (m *Metrics) RPCCall() { m.bump(&m.rpcCalls) }
 // happened — which is a timing side channel built out of otherwise harmless
 // numbers.
 func (m *Metrics) ObserveResources(cpuPercent float64, rssBytes, diskBytes uint64) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.resourceObs++
@@ -329,6 +431,8 @@ func (m *Metrics) ObserveResources(cpuPercent float64, rssBytes, diskBytes uint6
 	}
 }
 
+// bump increments under the lock. Callers MUST check nil themselves — see
+// below.
 func (m *Metrics) bump(p *uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -367,6 +471,7 @@ type Snapshot struct {
 	ProofsVerified         uint64 `json:"proofs_verified"`
 	ProofsRejected         uint64 `json:"proofs_rejected"`
 
+	DHTFailures   uint64 `json:"dht_failures"`
 	DHTReads      uint64 `json:"dht_reads"`
 	DHTWrites     uint64 `json:"dht_writes"`
 	DHTBytesRead  uint64 `json:"dht_bytes_read"`
@@ -385,6 +490,9 @@ type Snapshot struct {
 
 // Snapshot copies the current values.
 func (m *Metrics) Snapshot() Snapshot {
+	if m == nil {
+		return Snapshot{}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Snapshot{
@@ -406,7 +514,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		WatchtowerRecoveries:   m.watchtowerRecoveries,
 		ProofsVerified:         m.proofsVerified, ProofsRejected: m.proofsRejected,
 
-		DHTReads: m.dhtReads, DHTWrites: m.dhtWrites,
+		DHTReads: m.dhtReads, DHTWrites: m.dhtWrites, DHTFailures: m.dhtFailures,
 		DHTBytesRead: m.dhtBytesRead, DHTBytesWrite: m.dhtBytesWrite,
 		RPCCalls: m.rpcCalls,
 

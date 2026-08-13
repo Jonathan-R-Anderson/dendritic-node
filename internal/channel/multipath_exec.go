@@ -236,7 +236,14 @@ func (l LegState) Terminal() bool { return l.Settled || l.Refunded }
 type MultipathExecutor struct {
 	coord *Coordinator
 	dir   string
+	// metrics is aggregate-only. The executor knows every identifier a payment
+	// has — payment id, per-leg intents, channels — and passes NONE of them: the
+	// only things it supplies are a leg COUNT and a total VALUE.
+	metrics *Metrics
 }
+
+// SetMetrics attaches an aggregate collector.
+func (e *MultipathExecutor) SetMetrics(m *Metrics) { e.metrics = m }
 
 // NewMultipathExecutor builds one. dir holds the attempt journal.
 func NewMultipathExecutor(coord *Coordinator, dir string) (*MultipathExecutor, error) {
@@ -404,11 +411,18 @@ func (e *MultipathExecutor) Lock(ctx context.Context, pay *MultipathPayment, pee
 	if err := e.Journal(pay); err != nil {
 		return nil, fmt.Errorf("multipath: could not journal the attempt: %w", err)
 	}
+	// ONE payment, N legs. Recorded here, once, at the moment the split is
+	// actually attempted — not per leg, which would make a 4-way split look like
+	// four payments, and not with any leg's channel or intent, which the
+	// collector could not accept.
+	e.metrics.MultipathPayment(len(pay.Legs))
+
 	errs := make([]error, len(pay.Legs))
 	for i, leg := range pay.Legs {
 		peer, err := peers(leg.Channel)
 		if err != nil {
 			errs[i] = err
+			e.metrics.ExecutorFailure()
 			continue
 		}
 		tr := StateTransition{
@@ -418,6 +432,9 @@ func (e *MultipathExecutor) Lock(ctx context.Context, pay *MultipathPayment, pee
 		// Coordinator.Pay is idempotent on the intent, so a retry after an
 		// ambiguous outcome converges instead of paying twice.
 		errs[i] = asLegError(e.coord.Pay(ctx, leg.Channel, leg.Intent, tr, peer))
+		if errs[i] != nil {
+			e.metrics.ExecutorFailure()
+		}
 	}
 	return errs, nil
 }
@@ -446,6 +463,15 @@ func (e *MultipathExecutor) Settle(ctx context.Context, pay *MultipathPayment,
 			Preimage: FragmentPreimage(secret, leg.Intent),
 		}
 		errs[i] = asLegError(e.coord.Pay(ctx, leg.Channel, settleIntent(leg.Intent), tr, peer))
+		if errs[i] != nil {
+			e.metrics.ExecutorFailure()
+		}
+	}
+	// The VALUE actually delivered, summed from what the channels confirm — one
+	// number for the whole payment. Summarise reads per-leg state to compute it,
+	// and that state stays inside Summarise; only the total crosses the boundary.
+	if out := e.Summarise(pay); out.Settled > 0 {
+		e.metrics.TipCompleted(out.SettledAmount)
 	}
 	return errs, nil
 }
@@ -469,6 +495,9 @@ func (e *MultipathExecutor) Refund(ctx context.Context, pay *MultipathPayment, p
 		}
 		tr := StateTransition{Kind: KindLockRefund, LockID: leg.LockID}
 		errs[i] = asLegError(e.coord.Pay(ctx, leg.Channel, refundIntent(leg.Intent), tr, peer))
+		if errs[i] != nil {
+			e.metrics.ExecutorFailure()
+		}
 	}
 	return errs, nil
 }
