@@ -20,7 +20,6 @@ package ethproof
 // climb before the thing falls over.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -54,6 +53,10 @@ type RPCSource struct {
 	// MaxBatch caps how many headers go in one request. Zero means "as many as
 	// asked for", and the batch shrinks itself when the provider refuses.
 	MaxBatch int
+
+	// Transport, when set, supplies TRANSPORT failover across several endpoints.
+	// No Ethereum logic; see transport.go. Nil means Endpoint alone.
+	Transport *Endpoints
 
 	mu       sync.Mutex
 	lastCall time.Time
@@ -103,6 +106,45 @@ func (s *RPCSource) client() *http.Client {
 	return &http.Client{Timeout: 120 * time.Second}
 }
 
+// endpoints returns the transport to use: the configured failover list, or a
+// single-endpoint list built from Endpoint.
+func (s *RPCSource) endpoints() *Endpoints {
+	if s.Transport != nil {
+		return s.Transport
+	}
+	return &Endpoints{URLs: []string{s.Endpoint}, HTTP: s.client()}
+}
+
+// send performs one request through the transport and returns the raw body
+// alongside the network time. Rate-limit accounting stays here because it is
+// about THIS source's budget, not about which endpoint answered.
+func (s *RPCSource) send(ctx context.Context, body []byte) ([]byte, time.Duration, int, error) {
+	s.mu.Lock()
+	if s.MinInterval > 0 {
+		if wait := s.MinInterval - time.Since(s.lastCall); wait > 0 {
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				s.mu.Unlock()
+				return nil, 0, -1, ctx.Err()
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	start := time.Now()
+	raw, idx, err := s.endpoints().Post(ctx, body)
+	elapsed := time.Since(start)
+
+	s.mu.Lock()
+	s.lastCall = time.Now()
+	s.mu.Unlock()
+	s.stats.Lock()
+	s.stats.Calls++
+	s.stats.Unlock()
+	return raw, elapsed, idx, err
+}
+
 // isRateLimit recognises a refusal for capacity.
 //
 // Both shapes matter: HTTP 429, and a 200 carrying a JSON-RPC error. Providers
@@ -141,32 +183,24 @@ func isRateLimit(status int, message string) bool {
 func (s *RPCSource) call(ctx context.Context, body []byte) (json.RawMessage, time.Duration, error) {
 	backoff := 2 * time.Second
 	for attempt := 0; ; attempt++ {
-		s.mu.Lock()
-		if s.MinInterval > 0 {
-			if wait := s.MinInterval - time.Since(s.lastCall); wait > 0 {
-				select {
-				case <-time.After(wait):
-				case <-ctx.Done():
-					s.mu.Unlock()
-					return nil, 0, ctx.Err()
+		raw, elapsed, _, err := s.send(ctx, body)
+		if err != nil {
+			var un *UnreachableError
+			if errors.As(err, &un) && un.RateLimited {
+				s.noteRateLimited()
+				if attempt < s.MaxRetries {
+					s.noteRetry()
+					select {
+					case <-time.After(backoff):
+					case <-ctx.Done():
+						return nil, 0, ctx.Err()
+					}
+					backoff *= 2
+					continue
 				}
+				return nil, elapsed, fmt.Errorf("%w: every endpoint refused for capacity", ErrRateLimited)
 			}
-		}
-		s.mu.Unlock()
-
-		req, err := http.NewRequestWithContext(ctx, "POST", s.Endpoint, bytes.NewReader(body))
-		if err != nil {
-			return nil, 0, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		start := time.Now()
-		resp, err := s.client().Do(req)
-		if err != nil {
-			s.mu.Lock()
-			s.lastCall = time.Now()
-			s.mu.Unlock()
-			return nil, 0, err
+			return nil, elapsed, err
 		}
 		var out struct {
 			Result json.RawMessage `json:"result"`
@@ -174,54 +208,29 @@ func (s *RPCSource) call(ctx context.Context, body []byte) (json.RawMessage, tim
 				Message string `json:"message"`
 			} `json:"error"`
 		}
-		decErr := json.NewDecoder(resp.Body).Decode(&out)
-		elapsed := time.Since(start)
-		status := resp.StatusCode
-		resp.Body.Close()
-
-		s.mu.Lock()
-		s.lastCall = time.Now()
-		s.mu.Unlock()
-		s.stats.Lock()
-		s.stats.Calls++
-		s.stats.Unlock()
-
-		message := ""
-		if out.Error != nil {
-			message = out.Error.Message
-		}
-		if isRateLimit(status, message) {
-			s.stats.Lock()
-			s.stats.RateLimited++
-			s.stats.Unlock()
-			if s.Metrics != nil {
-				s.Metrics.RateLimited()
-			}
-			if attempt < s.MaxRetries {
-				s.stats.Lock()
-				s.stats.Retries++
-				s.stats.Unlock()
-				select {
-				case <-time.After(backoff):
-				case <-ctx.Done():
-					return nil, 0, ctx.Err()
-				}
-				backoff *= 2
-				continue
-			}
-			return nil, elapsed, fmt.Errorf("%w: %s", ErrRateLimited, message)
-		}
-		if decErr != nil {
-			return nil, elapsed, decErr
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, elapsed, err
 		}
 		if out.Error != nil {
-			return nil, elapsed, fmt.Errorf("ethproof: rpc error: %s", message)
-		}
-		if status != http.StatusOK {
-			return nil, elapsed, fmt.Errorf("ethproof: rpc http %d", status)
+			return nil, elapsed, fmt.Errorf("ethproof: rpc error: %s", out.Error.Message)
 		}
 		return out.Result, elapsed, nil
 	}
+}
+
+func (s *RPCSource) noteRateLimited() {
+	s.stats.Lock()
+	s.stats.RateLimited++
+	s.stats.Unlock()
+	if s.Metrics != nil {
+		s.Metrics.RateLimited()
+	}
+}
+
+func (s *RPCSource) noteRetry() {
+	s.stats.Lock()
+	s.stats.Retries++
+	s.stats.Unlock()
 }
 
 // ReceiptsByNumber fetches a block's receipts, UNVERIFIED.
@@ -376,86 +385,34 @@ func (s *RPCSource) headerBatch(ctx context.Context, from uint64, count int) ([]
 func (s *RPCSource) callBatch(ctx context.Context, body []byte) (json.RawMessage, time.Duration, error) {
 	backoff := 2 * time.Second
 	for attempt := 0; ; attempt++ {
-		s.mu.Lock()
-		if s.MinInterval > 0 {
-			if wait := s.MinInterval - time.Since(s.lastCall); wait > 0 {
-				select {
-				case <-time.After(wait):
-				case <-ctx.Done():
-					s.mu.Unlock()
-					return nil, 0, ctx.Err()
-				}
-			}
-		}
-		s.mu.Unlock()
-
-		req, err := http.NewRequestWithContext(ctx, "POST", s.Endpoint, bytes.NewReader(body))
+		raw, elapsed, _, err := s.send(ctx, body)
 		if err != nil {
-			return nil, 0, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		start := time.Now()
-		resp, err := s.client().Do(req)
-		if err != nil {
-			return nil, 0, err
-		}
-		var blob json.RawMessage
-		decErr := json.NewDecoder(resp.Body).Decode(&blob)
-		elapsed := time.Since(start)
-		status := resp.StatusCode
-		resp.Body.Close()
-
-		s.mu.Lock()
-		s.lastCall = time.Now()
-		s.mu.Unlock()
-		s.stats.Lock()
-		s.stats.Calls++
-		s.stats.Unlock()
-
-		// A whole-request refusal arrives as a single object with an error.
-		refusal := ""
-		if decErr == nil && len(blob) > 0 && blob[0] == '{' {
-			var single struct {
-				Error *struct {
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if json.Unmarshal(blob, &single) == nil && single.Error != nil {
-				refusal = single.Error.Message
-			}
-		}
-
-		if isRateLimit(status, refusal) {
-			s.stats.Lock()
-			s.stats.RateLimited++
-			s.stats.Unlock()
-			if s.Metrics != nil {
-				s.Metrics.RateLimited()
-			}
-			if attempt < s.MaxRetries {
-				s.stats.Lock()
-				s.stats.Retries++
-				s.stats.Unlock()
-				select {
-				case <-time.After(backoff):
-				case <-ctx.Done():
-					return nil, 0, ctx.Err()
+			var un *UnreachableError
+			if errors.As(err, &un) && un.RateLimited {
+				s.noteRateLimited()
+				if attempt < s.MaxRetries {
+					s.noteRetry()
+					select {
+					case <-time.After(backoff):
+					case <-ctx.Done():
+						return nil, 0, ctx.Err()
+					}
+					backoff *= 2
+					continue
 				}
-				backoff *= 2
-				continue
+				return nil, elapsed, fmt.Errorf("%w: batch refused by every endpoint", ErrRateLimited)
 			}
-			return nil, elapsed, fmt.Errorf("%w: %s", ErrRateLimited, refusal)
+			return nil, elapsed, err
 		}
-		if decErr != nil {
-			return nil, elapsed, decErr
+		// A whole-request refusal arrives as a single object with an error; the
+		// transport already treated a capacity refusal as a failure, so anything
+		// left here is a real answer.
+		if len(raw) > 0 && raw[0] == '{' {
+			if msg, ok := rpcErrorMessage(raw); ok {
+				return nil, elapsed, fmt.Errorf("ethproof: batch refused: %s", msg)
+			}
 		}
-		if refusal != "" {
-			return nil, elapsed, fmt.Errorf("ethproof: batch refused: %s", refusal)
-		}
-		if status != http.StatusOK {
-			return nil, elapsed, fmt.Errorf("ethproof: rpc http %d", status)
-		}
-		return blob, elapsed, nil
+		return raw, elapsed, nil
 	}
 }
 

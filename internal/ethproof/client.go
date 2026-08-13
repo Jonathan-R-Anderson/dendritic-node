@@ -13,7 +13,6 @@ package ethproof
 // records what the chain actually returns so the estimate can be replaced.
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -28,11 +27,39 @@ import (
 type Client struct {
 	Endpoint string
 	HTTP     *http.Client
+
+	// Transport, when set, supplies TRANSPORT failover across several endpoints.
+	// It carries no Ethereum logic and cannot influence verification — see
+	// transport.go. When nil, Endpoint is used alone and behaviour is unchanged.
+	Transport *Endpoints
 }
 
 // NewClient builds one with a bounded timeout.
 func NewClient(endpoint string) *Client {
 	return &Client{Endpoint: endpoint, HTTP: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// NewFailoverClient builds a client that tries endpoints in order.
+//
+// Availability only. Every response, from whichever endpoint, continues through
+// the identical verification path.
+func NewFailoverClient(urls ...string) *Client {
+	e := NewEndpoints(urls...)
+	first := ""
+	if len(e.URLs) > 0 {
+		first = e.URLs[0]
+	}
+	return &Client{Endpoint: first, HTTP: e.HTTP, Transport: e}
+}
+
+// endpoints returns the transport to use: the configured one, or a
+// single-endpoint list built from Endpoint so there is ONE request path rather
+// than two behaviours to keep in step.
+func (c *Client) endpoints() *Endpoints {
+	if c.Transport != nil {
+		return c.Transport
+	}
+	return &Endpoints{URLs: []string{c.Endpoint}, HTTP: c.HTTP}
 }
 
 func (c *Client) call(ctx context.Context, method string, params []any, out any) error {
@@ -42,16 +69,13 @@ func (c *Client) call(ctx context.Context, method string, params []any, out any)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoint, bytes.NewReader(body))
+
+	// TRANSPORT. Answers only "which endpoint supplied bytes"; everything below
+	// this line treats those bytes as equally untrusted whichever answered.
+	raw, _, err := c.endpoints().Post(ctx, body)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", method, err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
 
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
@@ -59,7 +83,7 @@ func (c *Client) call(ctx context.Context, method string, params []any, out any)
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return fmt.Errorf("%s: %w", method, err)
 	}
 	if envelope.Error != nil {
