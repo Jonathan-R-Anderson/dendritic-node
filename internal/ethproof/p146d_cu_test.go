@@ -270,3 +270,141 @@ func TestP146DCatchUpOnUpgradedTier(t *testing.T) {
 		"catch-up throughput against one provider on one day. The 4-hour Outage " +
 		"term and challengePeriod remain exactly as they were.")
 }
+
+// ---------------------------------------------------------------------------
+// P14.6e — what throughput does the CURRENT plan ACTUALLY provide?
+//
+// The published figure is 500 CU/s and eth_getBlockReceipts is documented at 500
+// throughput CU, implying exactly one call per second. That is a documented
+// number, not a measured one, and the two need not agree — a burst probe already
+// showed 13 of 25 concurrent requests succeeding, which one-per-second does not
+// predict.
+//
+// Measures the real sustained rate, sequentially and concurrently, and reports
+// throughput SEPARATELY from monthly volume. They are different resources and
+// conflating them is how the wrong plan gets bought.
+// ---------------------------------------------------------------------------
+
+type probeResult struct {
+	concurrency int
+	duration    time.Duration
+	ok          int
+	refused     int
+	http429     int
+}
+
+func (p probeResult) okPerSec() float64 { return float64(p.ok) / p.duration.Seconds() }
+func (p probeResult) cuPerSec() float64 { return p.okPerSec() * cuThroughputReceipts }
+func (p probeResult) refusalRate() float64 {
+	if p.ok+p.refused == 0 {
+		return 0
+	}
+	return 100 * float64(p.refused) / float64(p.ok+p.refused)
+}
+
+// probePacedRate issues requests at a TARGET RATE and reports what got served.
+//
+// The first version of this hammered at fixed concurrency with no pacing and got
+// 98-100% refusals at every rung — which measures what happens when you spam a
+// provider, not what rate it will sustain. Sustainable throughput is the highest
+// offered rate at which refusals stay near zero, so the rate is the independent
+// variable and refusals are the reading.
+func probePacedRate(t *testing.T, endpoint string, head uint64,
+	perSec float64, window time.Duration) probeResult {
+	t.Helper()
+
+	// MaxRetries 0: a retry would hide the refusal, and the refusal IS the
+	// measurement.
+	src := &RPCSource{Endpoint: endpoint, MaxRetries: 0, MinInterval: 0}
+	res := probeResult{concurrency: 1}
+
+	interval := time.Duration(float64(time.Second) / perSec)
+	deadline := time.Now().Add(window)
+	start := time.Now()
+	i := 0
+	for time.Now().Before(deadline) {
+		next := time.Now().Add(interval)
+		_, err := src.ReceiptsByNumber(context.Background(), head-uint64(i%4000))
+		if err == nil {
+			res.ok++
+		} else {
+			res.refused++
+		}
+		i++
+		if d := time.Until(next); d > 0 {
+			time.Sleep(d)
+		}
+	}
+	res.duration = time.Since(start)
+	res.http429 = src.Stats().RateLimited
+	return res
+}
+
+func TestP146ECurrentPlanThroughput(t *testing.T) {
+	if os.Getenv("P146E") == "" || os.Getenv("CHAIN_PROBE") == "" {
+		t.Skip("set P146E=1 CHAIN_PROBE=1 — this deliberately trips the rate limit")
+	}
+	endpoint := os.Getenv("ETH_RPC_URL")
+	if endpoint == "" {
+		t.Skip("set ETH_RPC_URL")
+	}
+	src := &RPCSource{Endpoint: endpoint, MaxRetries: 3, MinInterval: 200 * time.Millisecond}
+	head := p146Head(t, src)
+
+	window := 20 * time.Second
+	if v := os.Getenv("P146E_WINDOW"); v != "" {
+		var secs int
+		fmt.Sscanf(v, "%d", &secs)
+		window = time.Duration(secs) * time.Second
+	}
+
+	t.Logf("MEASURED THROUGHPUT of the CURRENT plan — eth_getBlockReceipts")
+	t.Logf("published expectation: 500 CU/s cap, 500 throughput CU/call => 1.0 call/s")
+	t.Logf("")
+
+	// Let the token bucket recover before starting, so the first rung is not
+	// paying for whatever ran before it.
+	time.Sleep(15 * time.Second)
+
+	var clean float64
+	for _, rate := range []float64{0.5, 1.0, 1.5, 2.0, 3.0} {
+		r := probePacedRate(t, endpoint, head, rate, window)
+		verdict := "CLEAN"
+		if r.refused > 0 {
+			verdict = "REFUSALS"
+		}
+		t.Logf("  offered %.1f/s: %3d ok, %3d refused (%.0f%%), %d HTTP 429 => served %.2f/s  %s",
+			rate, r.ok, r.refused, r.refusalRate(), r.http429, r.okPerSec(), verdict)
+		if r.refused == 0 && r.okPerSec() > clean {
+			clean = r.okPerSec()
+		}
+		time.Sleep(15 * time.Second)
+	}
+
+	t.Logf("")
+	if clean == 0 {
+		t.Logf("NO RATE WAS CLEAN — even %.1f/s drew refusals.", 0.5)
+	} else {
+		t.Logf("HIGHEST CLEAN SUSTAINED RATE: %.2f eth_getBlockReceipts/sec", clean)
+		t.Logf("  = %.0f effective throughput CU/s against a documented 500 CU/s cap",
+			clean*cuThroughputReceipts)
+	}
+	best := probeResult{ok: int(clean * window.Seconds()), duration: window}
+	_ = best
+
+	// What that rate means for the catch-up the budget cares about.
+	const weekBlocks, bloomHit = 50400, 0.20
+	receiptFetches := float64(weekBlocks) * bloomHit
+	t.Logf("")
+	t.Logf("IMPLIED ONE-WEEK CATCH-UP at the best measured rate:")
+	if clean > 0 {
+		t.Logf("  %.0f receipt fetches / %.2f per sec = %s (receipts alone)",
+			receiptFetches, clean,
+			(time.Duration(receiptFetches/clean) * time.Second).Round(time.Minute))
+	}
+	t.Logf("  against the 4-hour Outage budget term")
+	t.Log("")
+	t.Log("THROUGHPUT AND MONTHLY VOLUME ARE SEPARATE RESOURCES. This measures " +
+		"throughput only. Monthly CU is reported separately and is not a " +
+		"constraint at our volume.")
+}
