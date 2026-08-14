@@ -283,10 +283,22 @@ func TestP15DevnetCheckpointThroughTheNode(t *testing.T) {
 	tip := anon(25)
 	total := new(big.Int).Add(occ.DepositA, occ.DepositB)
 	ch, _ := node.store.Get(channelID)
-	postTip := State{
-		Channel: channelID, Nonce: 1,
-		BalanceA: new(big.Int).Set(tip),
-		BalanceB: new(big.Int).Sub(total, tip),
+
+	// SIDE-AWARE. Which party the recipient is depends on ADDRESS ORDERING, not
+	// on who is paying — the trap tip-channel.js documents. Phase 4 happened to
+	// put the recipient on party A in both channels, so withdrawB was never
+	// exercised; this now follows whichever side the chain actually assigned.
+	recipientIsA := occ.PartyA == recipientSigner.address()
+	t.Logf("RECIPIENT IS PARTY %s (partyA=%s recipient=%s)",
+		map[bool]string{true: "A", false: "B"}[recipientIsA],
+		occ.PartyA.Hex(), recipientSigner.address().Hex())
+	postTip := State{Channel: channelID, Nonce: 1}
+	if recipientIsA {
+		postTip.BalanceA = new(big.Int).Set(tip)
+		postTip.BalanceB = new(big.Int).Sub(total, tip)
+	} else {
+		postTip.BalanceB = new(big.Int).Set(tip)
+		postTip.BalanceA = new(big.Int).Sub(total, tip)
 	}
 	// Store.Accept is the production acceptance path: it enforces monotonicity
 	// and the I4 rules. Using it rather than writing the struct directly is the
@@ -317,8 +329,20 @@ func TestP15DevnetCheckpointThroughTheNode(t *testing.T) {
 			"at the same nonce is the I4 violation this test exists for",
 			next.Nonce, postTip.Nonce)
 	}
-	t.Logf("CHECKPOINT STATE from the node: nonce=%d balanceA=%s balanceB=%s withdrawA=%s",
-		next.Nonce, next.BalanceA, next.BalanceB, next.WithdrawA)
+	t.Logf("CHECKPOINT STATE from the node: nonce=%d balanceA=%s balanceB=%s withdrawA=%v withdrawB=%v",
+		next.Nonce, next.BalanceA, next.BalanceB, next.WithdrawA, next.WithdrawB)
+
+	// The withdrawal must land on the RECIPIENT'S side, whichever that is.
+	withdrew, other := next.WithdrawA, next.WithdrawB
+	if !recipientIsA {
+		withdrew, other = next.WithdrawB, next.WithdrawA
+	}
+	if withdrew == nil || withdrew.Cmp(tip) != 0 {
+		t.Fatalf("the checkpoint withdrew %v on the recipient's side, want %s", withdrew, tip)
+	}
+	if other != nil && other.Sign() != 0 {
+		t.Fatalf("the checkpoint also withdrew %s on the OTHER party's side", other)
+	}
 
 	if err := node.store.Accept(channelID,
 		signBoth(t, next, chainID, manager, recipientSigner, contributorSigner)); err != nil {
@@ -385,9 +409,9 @@ func TestP15DevnetCheckpointThroughTheNode(t *testing.T) {
 	// The RELATIONSHIP, not a literal: whatever left the channel as a
 	// withdrawal is no longer withdrawable from it.
 	moved := new(big.Int).Sub(before.Withdrawable, after.Withdrawable)
-	if moved.Cmp(next.WithdrawA) != 0 {
+	if moved.Cmp(withdrew) != 0 {
 		t.Fatalf("the pool fell by %s but the checkpoint withdrew %s; the view "+
-			"and the withdrawal disagree", moved, next.WithdrawA)
+			"and the withdrawal disagree", moved, withdrew)
 	}
 	if again.Withdrawable.Cmp(after.Withdrawable) != 0 {
 		t.Fatalf("reconstructed view %s differs from %s",

@@ -96,6 +96,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/healthz", a.health)
 	mux.HandleFunc("/v1/channels", a.authed(a.listChannels))
 	mux.HandleFunc("/v1/channels/", a.authed(a.channelRoutes))
+	// The recipient's own pooled-tipping view (P15). Same token, same loopback
+	// surface — a pool is not a new trust domain, so it does not get a new one.
+	mux.HandleFunc("/v1/pool", a.authed(a.pool))
 	return mux
 }
 
