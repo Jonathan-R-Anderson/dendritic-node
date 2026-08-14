@@ -227,3 +227,171 @@ func signerFromHex(t *testing.T, hexKey string) *signer {
 	}
 	return &signer{priv: secp256k1.PrivKeyFromBytes(b)}
 }
+
+// P15 phase 3B — the CORRECT checkpoint, built by the production path.
+//
+// The first attempt derived the nonce from the ON-CHAIN nonce and produced a
+// second signed state at nonce 1, colliding with the state the tip had already
+// co-signed. That transaction was real and moved real tokens, but it is NOT
+// protocol evidence: it bypassed the node and signed with raw wallets, which is
+// exactly how invariant I4 gets skipped.
+//
+// Here the checkpoint comes from StateTransition{KindCheckpoint}.Apply on the
+// channel's ACTUAL post-tip state, so the nonce is chosen by the same machinery
+// production uses, and CheckpointCalldata builds the transaction.
+func TestP15DevnetCheckpointThroughTheNode(t *testing.T) {
+	if os.Getenv("P15_DEVNET") == "" {
+		t.Skip("set P15_DEVNET=1")
+	}
+	rpc := p15Env(t, "P15_RPC")
+	manager := mustAddr(t, p15Env(t, "P15_MANAGER"))
+	recipientSigner := signerFromHex(t, p15Env(t, "P15_RECIPIENT_KEY"))
+	contributorSigner := signerFromHex(t, p15Env(t, "P15_CONTRIBUTOR_KEY"))
+	channelID := p15Channel(t)
+
+	reader := NewRPCChainReader(rpc)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	occ, err := reader.ReadChannel(ctx, manager, channelID)
+	if err != nil {
+		t.Fatalf("reading the devnet channel: %v", err)
+	}
+	chainID := big.NewInt(31337)
+
+	node := newWiredNode(t, recipientSigner, reader, manager)
+	if err := node.store.TrackFromChain(chainID, manager, occ); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+
+	// Rebuild the post-tip state the real payment produced: the recipient (party
+	// A here, because their address sorts lower) is owed 25 ANON.
+	tip := anon(25)
+	total := new(big.Int).Add(occ.DepositA, occ.DepositB)
+	ch, _ := node.store.Get(channelID)
+	postTip := State{
+		Channel: channelID, Nonce: 1,
+		BalanceA: new(big.Int).Set(tip),
+		BalanceB: new(big.Int).Sub(total, tip),
+	}
+	// Store.Accept is the production acceptance path: it enforces monotonicity
+	// and the I4 rules. Using it rather than writing the struct directly is the
+	// whole point of this correction.
+	if err := node.store.Accept(channelID,
+		signBoth(t, postTip, chainID, manager, recipientSigner, contributorSigner)); err != nil {
+		t.Fatalf("accepting the post-tip state: %v", err)
+	}
+	ch, _ = node.store.Get(channelID)
+
+	pool := Pool{Name: "tips", Recipient: recipientSigner.address(),
+		Members: [][32]byte{channelID}, Policy: PoolPolicy{Enabled: true}}
+	before, err := pool.View(node.store)
+	if err != nil {
+		t.Fatalf("pool view before: %v", err)
+	}
+	t.Logf("POOL VIEW BEFORE CHECKPOINT: %s", before.Withdrawable)
+
+	// ---- THE PRODUCTION PATH ------------------------------------------------
+	// The nonce is the transition machinery's to choose, not the harness's.
+	tr := StateTransition{Kind: KindCheckpoint, Amount: new(big.Int).Set(tip)}
+	next, err := tr.Apply(ch, recipientSigner.address())
+	if err != nil {
+		t.Fatalf("KindCheckpoint transition: %v", err)
+	}
+	if next.Nonce != postTip.Nonce+1 {
+		t.Fatalf("the transition produced nonce %d from a state at %d; a checkpoint "+
+			"at the same nonce is the I4 violation this test exists for",
+			next.Nonce, postTip.Nonce)
+	}
+	t.Logf("CHECKPOINT STATE from the node: nonce=%d balanceA=%s balanceB=%s withdrawA=%s",
+		next.Nonce, next.BalanceA, next.BalanceB, next.WithdrawA)
+
+	if err := node.store.Accept(channelID,
+		signBoth(t, next, chainID, manager, recipientSigner, contributorSigner)); err != nil {
+		t.Fatalf("accepting the checkpoint state: %v", err)
+	}
+	ch, _ = node.store.Get(channelID)
+
+	// ---- I4: the SAME nonce cannot carry a DIFFERENT state -----------------
+	clash := next
+	clash.BalanceA = new(big.Int).Add(next.BalanceA, big.NewInt(1))
+	clash.BalanceB = new(big.Int).Sub(next.BalanceB, big.NewInt(1))
+	if err := node.store.Accept(channelID,
+		signBoth(t, clash, chainID, manager, recipientSigner, contributorSigner)); err == nil {
+		t.Fatalf("a DIFFERENT state at nonce %d was accepted; two signed states "+
+			"at one nonce is exactly the defect this phase exists to correct", next.Nonce)
+	} else {
+		t.Logf("I4 HOLDS: a different state at nonce %d was refused (%v)", next.Nonce, err)
+	}
+
+	calldata, err := CheckpointCalldata(ch)
+	if err != nil {
+		t.Fatalf("CheckpointCalldata: %v", err)
+	}
+	t.Logf("CALLDATA built by the production encoder: %d bytes", len(calldata))
+
+	// ---- POOL VIEW AFTER, AND AFTER RECONSTRUCTION -------------------------
+	after, err := pool.View(node.store)
+	if err != nil {
+		t.Fatalf("pool view after: %v", err)
+	}
+	rebuilt := Pool{Name: "tips", Recipient: recipientSigner.address(),
+		Members: [][32]byte{channelID}, Policy: PoolPolicy{Enabled: true}}
+	again, err := rebuilt.View(node.store)
+	if err != nil {
+		t.Fatalf("pool view after reconstruction: %v", err)
+	}
+	t.Logf("POOL VIEW AFTER CHECKPOINT: %s", after.Withdrawable)
+	t.Logf("POOL VIEW RECONSTRUCTED    : %s", again.Withdrawable)
+
+	// The RELATIONSHIP, not a literal: whatever left the channel as a
+	// withdrawal is no longer withdrawable from it.
+	moved := new(big.Int).Sub(before.Withdrawable, after.Withdrawable)
+	if moved.Cmp(next.WithdrawA) != 0 {
+		t.Fatalf("the pool fell by %s but the checkpoint withdrew %s; the view "+
+			"and the withdrawal disagree", moved, next.WithdrawA)
+	}
+	if again.Withdrawable.Cmp(after.Withdrawable) != 0 {
+		t.Fatalf("reconstructed view %s differs from %s",
+			again.Withdrawable, after.Withdrawable)
+	}
+	t.Logf("RELATIONSHIP HOLDS: pool fell by exactly the %s checkpointed", moved)
+	if err := os.WriteFile(os.Getenv("P15_CALLDATA_OUT"),
+		[]byte("0x"+hexOf(calldata)), 0o644); err != nil {
+		t.Fatalf("writing calldata: %v", err)
+	}
+}
+
+func p15Channel(t *testing.T) [32]byte {
+	t.Helper()
+	var id [32]byte
+	raw := strings.TrimPrefix(p15Env(t, "P15_CHANNEL"), "0x")
+	for i := 0; i < 32; i++ {
+		var b byte
+		for j := 0; j < 2; j++ {
+			c := raw[i*2+j]
+			var v byte
+			switch {
+			case c >= '0' && c <= '9':
+				v = c - '0'
+			case c >= 'a' && c <= 'f':
+				v = c - 'a' + 10
+			case c >= 'A' && c <= 'F':
+				v = c - 'A' + 10
+			}
+			b = b<<4 | v
+		}
+		id[i] = b
+	}
+	return id
+}
+
+func signBoth(t *testing.T, st State, chainID *big.Int, contract Address,
+	a, b *signer) SignedState {
+	t.Helper()
+	raw := st.Digest(chainID, contract)
+	sa, sb := a.sign(raw), b.sign(raw)
+	if a.address().Less(b.address()) {
+		return SignedState{State: st, SigA: sa, SigB: sb}
+	}
+	return SignedState{State: st, SigA: sb, SigB: sa}
+}
