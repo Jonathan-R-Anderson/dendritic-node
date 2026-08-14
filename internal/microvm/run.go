@@ -221,17 +221,3 @@ func itoa(n int) string {
 	}
 	return string(digits)
 }
-
-// HasNetworkInterface reports whether a rendered config would give the guest a
-// NIC.
-//
-// A belt-and-braces assertion the runner itself can call. The type system
-// already makes a network interface unrepresentable, so this can only fail if
-// somebody adds the field back — which is exactly the change worth catching,
-// and exactly the one whose author will not think to look here.
-func HasNetworkInterface(cfg []byte) bool {
-	text := string(cfg)
-	return strings.Contains(text, "network-interfaces") ||
-		strings.Contains(text, "host_dev_name") ||
-		strings.Contains(text, "guest_mac")
-}
