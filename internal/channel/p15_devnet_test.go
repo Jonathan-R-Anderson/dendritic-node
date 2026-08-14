@@ -263,6 +263,21 @@ func TestP15DevnetCheckpointThroughTheNode(t *testing.T) {
 		t.Fatalf("adopt: %v", err)
 	}
 
+	// GUARD 1 — the channel must be PRISTINE.
+	//
+	// This is the check that would have caught the 1450-vs-1475 discrepancy.
+	// A channel that has already been checkpointed has REDUCED deposits, so
+	// synthesising a "post-tip" state from the current deposits silently
+	// describes a different history — and the contract accepts it, because
+	// conservation still holds against the reduced figures. The harness bug is
+	// masked by the contract being correct.
+	if occ.Nonce != 0 {
+		t.Fatalf("the devnet channel is already at nonce %d with deposits %s/%s; "+
+			"reconstructing a post-tip state from reduced deposits would invent a "+
+			"history. Redeploy for a pristine channel.",
+			occ.Nonce, occ.DepositA, occ.DepositB)
+	}
+
 	// Rebuild the post-tip state the real payment produced: the recipient (party
 	// A here, because their address sorts lower) is owed 25 ANON.
 	tip := anon(25)
@@ -322,6 +337,30 @@ func TestP15DevnetCheckpointThroughTheNode(t *testing.T) {
 	} else {
 		t.Logf("I4 HOLDS: a different state at nonce %d was refused (%v)", next.Nonce, err)
 	}
+
+	// GUARD 2 — local state must agree with the chain BEFORE broadcasting.
+	//
+	// Parties and deposits are the chain's to state; balances are ours. What
+	// must hold across the boundary is conservation, exactly as the contract
+	// checks it. A harness whose arithmetic has drifted fails here rather than
+	// discovering it from a revert — or worse, not discovering it at all.
+	fresh, err := reader.ReadChannel(ctx, manager, channelID)
+	if err != nil {
+		t.Fatalf("re-reading the chain before broadcast: %v", err)
+	}
+	if fresh.PartyA != occ.PartyA || fresh.PartyB != occ.PartyB {
+		t.Fatalf("the chain's parties changed under the harness")
+	}
+	chainTotal := new(big.Int).Add(fresh.DepositA, fresh.DepositB)
+	localTotal := new(big.Int).Add(next.BalanceA, next.BalanceB)
+	localTotal.Add(localTotal, orZero(next.WithdrawA))
+	localTotal.Add(localTotal, orZero(next.WithdrawB))
+	if localTotal.Cmp(chainTotal) != 0 {
+		t.Fatalf("REFUSING TO BROADCAST: local state totals %s but the chain holds "+
+			"%s of collateral. The harness and the chain disagree about this "+
+			"channel's history.", localTotal, chainTotal)
+	}
+	t.Logf("LOCAL == CHAIN: parties match, conservation %s == %s", localTotal, chainTotal)
 
 	calldata, err := CheckpointCalldata(ch)
 	if err != nil {
