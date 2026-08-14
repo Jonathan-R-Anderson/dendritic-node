@@ -119,7 +119,10 @@ func TestStorageHeartbeatReportsItsCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if payload["capacity_bytes"] != float64(20<<30) {
-		t.Fatalf("capacity_bytes is %v, want %d", payload["capacity_bytes"], 20<<30)
+		// int64, because an untyped 20<<30 defaults to `int` and does not fit in
+		// one on 32-bit platforms — the linux/arm release target. The comparison
+		// above already says float64 and was never affected.
+		t.Fatalf("capacity_bytes is %v, want %d", payload["capacity_bytes"], int64(20<<30))
 	}
 	if payload["gateway_enabled"] != false {
 		t.Fatal("a storage node reported a gateway role it does not have")
