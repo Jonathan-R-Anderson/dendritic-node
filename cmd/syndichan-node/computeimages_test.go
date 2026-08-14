@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 // The rule under test: a node that offers compute must be able to run any

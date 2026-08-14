@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 // The relay and the receiving adapter.

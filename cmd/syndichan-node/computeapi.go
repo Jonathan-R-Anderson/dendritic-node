@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 // The loopback bridge endpoints that let a site submit compute work to this
