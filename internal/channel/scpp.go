@@ -205,6 +205,9 @@ func encodeStateWire(s State) storedState {
 	// a DIFFERENT state carrying a signature that no longer covers it. Omitted
 	// when zero — which is every ordinary payment — so records written before
 	// checkpoints existed still encode byte for byte as they did.
+	if s.Op != 0 && s.Op != OpState {
+		out.Op = s.Op
+	}
 	if orZero(s.WithdrawA).Sign() > 0 {
 		out.WithdrawA = decString(s.WithdrawA)
 	}
@@ -253,10 +256,22 @@ func decodeStateWire(w storedState) (State, error) {
 	if err != nil {
 		return State{}, err
 	}
+	// An absent domain is the ordinary one. A peer that names a domain is not
+	// trusted on it: tr.Matches recomputes the state from the transition it
+	// claimed and State.Equal compares the domain, so a lie is caught before
+	// this node signs anything.
+	op := w.Op
+	if op == 0 {
+		op = OpState
+	}
+	if op != OpState && op != OpCoopClose && op != OpCheckpoint {
+		return State{}, fmt.Errorf("scpp: unknown operation domain %d", op)
+	}
 	out := State{
 		Channel: channel, Nonce: w.Nonce,
 		BalanceA: balanceA, BalanceB: balanceB,
 		WithdrawA: withdrawA, WithdrawB: withdrawB,
+		Op: op,
 	}
 
 	var previous [32]byte

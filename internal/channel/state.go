@@ -179,12 +179,16 @@ func StateDigestV1(chainID *big.Int, contract Address, id [32]byte,
 // it could be submitted asking for a different one. An ordinary payment signs
 // zeros, which is not a special case but the true statement that it moves
 // nothing out of the contract.
-func StateDigest(chainID *big.Int, contract Address, id [32]byte,
+func StateDigest(op uint8, chainID *big.Int, contract Address, id [32]byte,
 	nonce uint64, balanceA, balanceB *big.Int, htlcRoot [32]byte,
 	withdrawA, withdrawB *big.Int) [32]byte {
 
 	var out [32]byte
 	copy(out[:], keccak(
+		// abi.encode pads a uint8 to a full word, exactly like every other
+		// argument. The domain is FIRST so that no shorter prefix of a digest
+		// for one operation can be a valid digest for another.
+		u256(new(big.Int).SetUint64(uint64(op))),
 		u256(chainID),
 		word(contract[:]),
 		id[:],
@@ -317,6 +321,21 @@ type State struct {
 	// different amount than was agreed.
 	WithdrawA *big.Int `json:"withdraw_a,omitempty"`
 	WithdrawB *big.Int `json:"withdraw_b,omitempty"`
+
+	// Op is the OPERATION DOMAIN this state was agreed for, and it is the first
+	// word of the digest.
+	//
+	// It exists because three different contract calls used to accept the same
+	// bytes: with no live locks, an ordinary agreed state hashed identically to
+	// a cooperative close, so a signature meaning "I agree the balance is
+	// 400/100" was also a signature meaning "settle this channel now". Between
+	// two honest parties that was only a surprise. Once a DELEGATE may sign,
+	// it is an authority nobody granted.
+	//
+	// Set by Apply from the transition kind and by nothing else. A peer sends
+	// this field like any other, and a peer that lies about it is caught by the
+	// existing check that the received digest equals the one Apply recomputes.
+	Op uint8 `json:"op,omitempty"`
 }
 
 // Digest is the value both parties sign.
@@ -325,8 +344,31 @@ type State struct {
 // what ChannelManagerV2 computes for an empty lock set — so there is no second
 // encoding to pick between and no path where the locks are silently left out.
 func (s State) Digest(chainID *big.Int, contract Address) [32]byte {
-	return StateDigest(chainID, contract, s.Channel, s.Nonce,
+	return StateDigest(s.op(), chainID, contract, s.Channel, s.Nonce,
 		s.BalanceA, s.BalanceB, s.HTLCRoot(), s.WithdrawA, s.WithdrawB)
+}
+
+// Operation domains. Must match the OP_* constants in ChannelManagerV2.
+//
+// Numbered from 1 so that a zero value — an uninitialised struct, a state
+// decoded from JSON written before this field existed — never names a real
+// operation by accident.
+const (
+	OpState      uint8 = 1 // an ordinary agreed state: pay, challenge, unilateral exit
+	OpCoopClose  uint8 = 2 // settle now, no challenge window
+	OpCheckpoint uint8 = 3 // take value out, channel stays open
+)
+
+// op is the domain to hash under, defaulting to OpState.
+//
+// The default is the ordinary case and the least powerful one: a state that
+// somehow arrived without a domain is treated as a payment, never as an
+// authority to close or to withdraw.
+func (s State) op() uint8 {
+	if s.Op == 0 {
+		return OpState
+	}
+	return s.Op
 }
 
 // HTLCRoot commits to the pending locks in a canonical order.

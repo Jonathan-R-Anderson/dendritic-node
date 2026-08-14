@@ -408,6 +408,11 @@ type storedState struct {
 	// against nothing.
 	WithdrawA string `json:"withdraw_a,omitempty"`
 	WithdrawB string `json:"withdraw_b,omitempty"`
+	// Op is the operation domain, and it is the first word of the digest — so
+	// like the withdrawals it must survive the disk and the wire, or a state
+	// verifies against nothing. Omitted when it is the ordinary OpState, which
+	// keeps records written before domains existed encoding byte for byte.
+	Op uint8 `json:"op,omitempty"`
 }
 
 type storedPending struct {

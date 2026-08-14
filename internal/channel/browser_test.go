@@ -121,9 +121,9 @@ func TestBrowserSignedStatesVerifyHere(t *testing.T) {
 				t.Fatalf("the node cannot decode what the browser sent: %v", err)
 			}
 
-			digest := StateDigest(chainID, contract, state.Channel, state.Nonce,
-				state.BalanceA, state.BalanceB, state.HTLCRoot(),
-				state.WithdrawA, state.WithdrawB)
+			// Through the production entry point, so this covers the operation
+			// domain the state carries rather than one the test chose.
+			digest := state.Digest(chainID, contract)
 
 			if hexOf(digest[:]) != strings.TrimPrefix(tc.Digest, "0x") {
 				t.Fatalf("digest disagrees\n browser %s\n node    %s", tc.Digest, hexOf(digest[:]))

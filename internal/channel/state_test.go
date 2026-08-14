@@ -55,13 +55,28 @@ const (
 	// htlcRoot over the two locks built in goldenLocks.
 	goldenHTLCRoot = "e8303e521e3d9771a180e3f13b1f2d3b27ff1255adf20442232588b9528d6fa2"
 
-	// stateDigest(id, 5, 340e18, 160e18, root) with an empty root and with the
-	// root above. The two must differ, or the locks are not being committed to.
-	goldenDigestNoLocks = "3f1bf2e8e5456fe31a092177c1f0bda2f95004b38bb2ea12276bb5a00c03ef01"
-	goldenDigestLocked  = "48c16e2554db9447dfdd38a94f0a3e58a8a53b4e381156d8e5ebf4b1feac7daa"
+	// stateDigest(OP_STATE, id, 5, 340e18, 160e18, root) with an empty root and
+	// with the root above. The two must differ, or the locks are not being
+	// committed to.
+	//
+	// Regenerated when the operation domain became the digest's first word:
+	// `npx hardhat run scripts/p15-golden-digest.ts` (no --network, so the chain
+	// is fresh and the contract lands at v2Contract deterministically).
+	goldenDigestNoLocks = "a7695ffb8fb18ef9c3376a798b7d47c8de0d05bb7ec6286c8b5ab8a77057e045"
+	goldenDigestLocked  = "b06719805839bfcc1f2bdbd5f6558731193fb40f3c19213b2f84a7f2abc32729"
+
+	// THE SAME ECONOMIC STATE under the other two domains. From the same
+	// contract call, so these are the EVM's answer and not this package's.
+	//
+	// Before the domain existed, goldenDigestCoopClose and goldenDigestNoLocks
+	// were the same 32 bytes: signing "the balance is 340/160" was also signing
+	// "settle this channel now". These three constants differing is the whole
+	// property this phase adds.
+	goldenDigestCoopClose  = "c3634a77abeb6717aea850cd2b7fc92578ebdba4250a208973682221f8e42ca2"
+	goldenDigestCheckpoint = "f9a394ec0af645242bea7544dc3e419ba2cad6bfc1e9c25d554388d2b562db27"
 
 	// stateDigest(id, 5, 340e18, 160e18, emptyRoot, 0, 75e18) — a checkpoint.
-	goldenDigestDraw = "752cea0a7f93b3057c7a10d7df154f516199a7ac53b35e930347b173c7dd7cf7"
+	goldenDigestDraw    = "72f7ab6a1b41016b823e352f7473ab60f204057d911e1395670758d79d08ea5e"
 )
 
 // goldenLocks mirrors the lock set in scripts/v2-golden-vectors.ts exactly.
@@ -191,6 +206,52 @@ func TestStateDigestMatchesTheContract(t *testing.T) {
 	}
 	if goldenDigestDraw == goldenDigestNoLocks {
 		t.Fatal("withdrawals do not change the digest; they are not being committed to")
+	}
+}
+
+// TestOperationDomainsSeparateTheDigest pins the property this phase adds.
+//
+// Before it, closeCooperative and an ordinary lock-free state signed THE SAME
+// BYTES. A party agreeing a balance was unknowingly also authorising an
+// immediate settlement, and once a delegate may sign that becomes an authority
+// nobody granted. The three constants below are the same economics under the
+// three domains, taken from the contract itself.
+func TestOperationDomainsSeparateTheDigest(t *testing.T) {
+	contract := mustAddr(t, v2Contract)
+	var id [32]byte
+	copy(id[:], mustHex(t, goldenChannelID))
+	base := State{Channel: id, Nonce: 5, BalanceA: anon(340), BalanceB: anon(160)}
+
+	seen := map[string]string{}
+	for _, tc := range []struct {
+		name string
+		op   uint8
+		want string
+	}{
+		{"state", OpState, goldenDigestNoLocks},
+		{"cooperative close", OpCoopClose, goldenDigestCoopClose},
+		{"checkpoint", OpCheckpoint, goldenDigestCheckpoint},
+	} {
+		st := base
+		st.Op = tc.op
+		d := st.Digest(big.NewInt(v2ChainID), contract)
+		got := hexOf(d[:])
+		if got != tc.want {
+			t.Fatalf("%s domain\n got  %s\n want %s", tc.name, got, tc.want)
+		}
+		if prev, clash := seen[got]; clash {
+			t.Fatalf("%s and %s produce the SAME digest; a signature for one "+
+				"authorises the other", prev, tc.name)
+		}
+		seen[got] = tc.name
+	}
+
+	// The default must be the least powerful domain: a state that somehow
+	// arrived without one is a payment, never an authority to close.
+	undeclared := base
+	ud := undeclared.Digest(big.NewInt(v2ChainID), contract)
+	if hexOf(ud[:]) != goldenDigestNoLocks {
+		t.Fatal("a state with no declared domain must hash as an ordinary state")
 	}
 }
 

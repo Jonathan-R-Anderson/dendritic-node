@@ -223,7 +223,34 @@ func (t StateTransition) Apply(ch *Channel, proposer Address) (State, error) {
 		return State{}, fmt.Errorf("%w: %q", ErrUnknownKind, t.Kind)
 	}
 
+	// THE ONE PLACE THE OPERATION DOMAIN IS DECIDED.
+	//
+	// Set unconditionally rather than only for the two kinds that differ,
+	// because `next` is built by copying from the previous state and an
+	// inherited domain would make a payment hash as whatever the last state
+	// happened to be. Assigning every time makes the wrong value unreachable
+	// rather than merely unlikely.
+	next.Op = opForKind(t.Kind)
 	return next, nil
+}
+
+// opForKind maps a transition to the digest domain it must be signed under.
+//
+// Only two kinds leave the ordinary domain, and they are exactly the two the
+// contract treats as more than an agreed balance: a checkpoint moves value out,
+// and a cooperative close settles immediately with no challenge window. Every
+// other kind — pay, and the three lock operations — produces a state whose only
+// authority is "this is what we agree the balances are", which is also what a
+// watchtower submits to challenge or to exit.
+func opForKind(kind TransitionKind) uint8 {
+	switch kind {
+	case KindCheckpoint:
+		return OpCheckpoint
+	case KindClose:
+		return OpCoopClose
+	default:
+		return OpState
+	}
 }
 
 // Matches reports whether state is exactly what this transition produces from
