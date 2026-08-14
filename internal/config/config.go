@@ -1325,6 +1325,20 @@ type ChannelsConfig struct {
 	// APIToken gates the operator API. Required whenever APIListen is set.
 	APIToken string `json:"api_token,omitempty"`
 
+	// PeerTLSCert/PeerTLSKey serve the PUBLIC peer surface over HTTPS.
+	//
+	// NOT OPTIONAL IN PRACTICE, even though they are optional fields. A
+	// contributor's browser refuses to hand a signed proposal to a mailbox that
+	// is not https (tip-channel.js, "insecure_endpoint"), because a plain-http
+	// mailbox could be rewritten in flight by anyone on the path. Without these
+	// the peer surface listens on http and no browser will ever talk to it, so
+	// a volunteer configured without them is a volunteer nobody can use.
+	//
+	// Named apart from the node's other TLS fields because this listener has a
+	// different audience: strangers, not the operator.
+	PeerTLSCert string `json:"peer_tls_cert,omitempty"`
+	PeerTLSKey  string `json:"peer_tls_key,omitempty"`
+
 	// RPC is the execution endpoint used to read channel state and delegations.
 	RPC string `json:"rpc,omitempty"`
 	// Manager is the ChannelManagerV2 address.

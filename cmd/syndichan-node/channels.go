@@ -137,13 +137,31 @@ func startPaymentStack(cfg config.Config, logger *log.Logger) (*paymentStack, er
 			WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second,
 			MaxHeaderBytes: 64 << 10,
 		}
+		tls := cc.PeerTLSCert != "" && cc.PeerTLSKey != ""
 		go func() {
-			if err := stack.peerSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			var err error
+			if tls {
+				err = stack.peerSrv.ListenAndServeTLS(cc.PeerTLSCert, cc.PeerTLSKey)
+			} else {
+				err = stack.peerSrv.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
 				logger.Printf("channels: peer surface failed: %v", err)
 			}
 		}()
-		logger.Printf("channels: SCPP/1 listening on %s (public, signature-authorised)",
-			cc.PeerListen)
+		scheme := "http"
+		if tls {
+			scheme = "https"
+		}
+		logger.Printf("channels: SCPP/1 listening on %s://%s (public, signature-authorised)",
+			scheme, cc.PeerListen)
+		if !tls {
+			// Said loudly rather than logged once at debug: a volunteer without
+			// TLS looks healthy and is unreachable, because every browser
+			// refuses to send a signed proposal to a plain-http mailbox.
+			logger.Printf("channels: WARNING — the peer surface has no TLS, so no browser " +
+				"will deliver to this mailbox; set channels.peer_tls_cert/peer_tls_key")
+		}
 	}
 
 	// ---- the operator API, loopback only ------------------------------------
