@@ -158,7 +158,12 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 // ---- reads -------------------------------------------------------------------
 
 type channelSummary struct {
-	ID         string `json:"id"`
+	ID string `json:"id"`
+	// The channel's parties, as the chain recorded them. An input the
+	// operator's browser needs to verify signatures on a volunteer-carried
+	// state; it does not make this API an authority on payment.
+	PartyA     string `json:"party_a"`
+	PartyB     string `json:"party_b"`
 	Mine       string `json:"mine"`
 	Theirs     string `json:"theirs"`
 	Locked     string `json:"locked"`
@@ -187,6 +192,8 @@ func (a *API) listChannels(w http.ResponseWriter, r *http.Request) {
 func summarise(b Balances) channelSummary {
 	return channelSummary{
 		ID:         hex.EncodeToString(b.ChannelID[:]),
+		PartyA:     b.PartyA.Hex(),
+		PartyB:     b.PartyB.Hex(),
 		Mine:       decString(b.Mine),
 		Theirs:     decString(b.Theirs),
 		Locked:     decString(b.Locked),

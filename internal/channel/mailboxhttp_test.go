@@ -218,3 +218,88 @@ func TestTheOperatorAPIGainsNoCORS(t *testing.T) {
 		}
 	}
 }
+
+// ---- channel parties on the operator API (P15) -------------------------------
+//
+// The recipient's browser cannot learn a channel's parties any other way: the id
+// is keccak(sorted(a,b)) and does not run backwards, and taking them from the
+// volunteer would make signature verification circular. So the node reports
+// them — as an INPUT to verification, never as proof of payment.
+
+func TestChannelSummaryCarriesTheChainRecordedParties(t *testing.T) {
+	c, base, payer, payee, id, stop := poolAPIFor(t, 500)
+	defer stop()
+	// The payee adopts on the first message, so give it one.
+	payInto(t, payer, payee, id, 10)
+
+	code, body := do(t, c, http.MethodGet, base+"/v1/channels/"+hexID(id), nil, testToken)
+	if code != http.StatusOK {
+		t.Fatalf("get channel: %d", code)
+	}
+	ch, ok := payee.coord.store.Get(id)
+	if !ok {
+		t.Fatal("the node does not hold the channel")
+	}
+	// The addresses must be the ones the chain gave the store, not anything
+	// derived from the balances beside them.
+	if !strings.EqualFold(str(body["party_a"]), ch.PartyA.Hex()) {
+		t.Fatalf("party_a = %v, want %s", body["party_a"], ch.PartyA.Hex())
+	}
+	if !strings.EqualFold(str(body["party_b"]), ch.PartyB.Hex()) {
+		t.Fatalf("party_b = %v, want %s", body["party_b"], ch.PartyB.Hex())
+	}
+	if str(body["party_a"]) == str(body["party_b"]) {
+		t.Fatal("both parties are the same address")
+	}
+}
+
+func TestPartiesDidNotDisplaceTheBalances(t *testing.T) {
+	// Mine/Theirs are AMOUNTS. Adding two address fields beside them must not
+	// have turned either into an identity.
+	c, base, payer, payee, id, stop := poolAPIFor(t, 500)
+	defer stop()
+	payInto(t, payer, payee, id, 60)
+
+	_, body := do(t, c, http.MethodGet, base+"/v1/channels/"+hexID(id), nil, testToken)
+	if body["mine"] != anon(60).String() {
+		t.Fatalf("mine = %v, want the balance %s", body["mine"], anon(60))
+	}
+	for _, k := range []string{"mine", "theirs", "locked"} {
+		if strings.HasPrefix(str(body[k]), "0x") {
+			t.Fatalf("%s looks like an address, not an amount: %v", k, body[k])
+		}
+	}
+	for _, k := range []string{"party_a", "party_b"} {
+		if !strings.HasPrefix(str(body[k]), "0x") {
+			t.Fatalf("%s is not an address: %v", k, body[k])
+		}
+	}
+}
+
+func TestThePartiesStayBehindTheOperatorGate(t *testing.T) {
+	// Adding them must not have made the route reachable without a token, and
+	// must not have added CORS — this is the operator surface, not the mailbox.
+	c, base, _, _, id, stop := poolAPIFor(t, 500)
+	defer stop()
+
+	for _, token := range []string{"", "wrong"} {
+		code, body := do(t, c, http.MethodGet, base+"/v1/channels/"+hexID(id), nil, token)
+		if code != http.StatusUnauthorized {
+			t.Fatalf("token %q: got %d, want 401", token, code)
+		}
+		if _, leaked := body["party_a"]; leaked {
+			t.Fatal("an unauthorized response carried the channel parties")
+		}
+	}
+
+	req, _ := http.NewRequest(http.MethodOptions, base+"/v1/channels/"+hexID(id), nil)
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("the operator API advertises Allow-Origin %q", got)
+	}
+}

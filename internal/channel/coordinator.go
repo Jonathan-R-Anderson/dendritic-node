@@ -506,7 +506,11 @@ func (c *Coordinator) Balances(id [32]byte) (Balances, error) {
 		other = ch.PartyB
 	}
 	return Balances{
-		ChannelID:  id,
+		ChannelID: id,
+		// Straight from the tracked channel, which TrackFromChain filled from
+		// ChannelManagerV2. Never derived from Mine/Theirs, which are amounts.
+		PartyA:     ch.PartyA,
+		PartyB:     ch.PartyB,
 		Mine:       ch.BalanceOf(c.self),
 		Theirs:     ch.BalanceOf(other),
 		Locked:     ch.Latest.State.lockedTotal(),
