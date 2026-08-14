@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -92,6 +93,70 @@ type Receiving interface {
 	SettleNow(ctx context.Context, id string) (outcome string, err error)
 	// Close asks for the money now and ends the channel.
 	Close(ctx context.Context, id string) (outcome string, err error)
+
+	// ---- mailbox collection (P15) -----------------------------------------
+	//
+	// Here rather than in the browser because acceptance needs the recipient's
+	// channel key, and that key lives in this node so somebody can be tipped
+	// while their browser is closed. A page that could accept would be a page
+	// with custody.
+
+	// WaitingTips lists mailbox proposals held for this node WITHOUT consuming
+	// them. An error means "could not look" and NEVER "nothing is waiting" —
+	// a recipient shown an empty list because their authorization lapsed would
+	// conclude nobody had tipped them.
+	WaitingTips(ctx context.Context) ([]WaitingTip, error)
+	// AcceptTip verifies and countersigns one waiting proposal, through the
+	// node's ordinary acceptance path. Returns one of TipAccepted, TipRefused,
+	// TipConflict or TipUnreachable.
+	AcceptTip(ctx context.Context, channel string, nonce uint64) (outcome string, err error)
+	// PublishTip caches the co-signed state at the volunteer so the contributor
+	// can find it. DISCOVERY ONLY: it moves no value, and failing it does not
+	// undo an acceptance.
+	PublishTip(ctx context.Context, channel string, nonce uint64) (outcome string, err error)
+}
+
+// The outcomes of a collection step, kept apart because they call for different
+// responses. A boolean here would be the "received"/"accepted"/"withdrawn"
+// collapse this whole feature exists to avoid.
+const (
+	// TipWaiting: a contributor signed and a volunteer is holding it. NOBODY
+	// has agreed to anything and no value has moved.
+	TipWaiting = "waiting"
+	// TipAccepted: both parties signed and the node stored it. It is now part
+	// of the recipient's withdrawable pool.
+	TipAccepted = "accepted"
+	// TipUnpublished: accepted, but not yet cached at the volunteer. NOT a
+	// failed payment — the acceptance is real and must never be retried.
+	TipUnpublished = "accepted_unpublished"
+	// TipPublished: the co-signed state is discoverable by the contributor.
+	TipPublished = "published"
+	// TipRefused: the node declined. Its reason travels with it.
+	TipRefused = "refused"
+	// TipConflict: two different states at one update number. I4 — refuse,
+	// never choose.
+	TipConflict = "conflict"
+	// TipUnreachable: the volunteer or the node could not be reached. Nothing
+	// is known, and specifically it is NOT "no tips".
+	TipUnreachable = "unreachable"
+)
+
+// WaitingTip is one mailbox proposal, as the console displays it.
+//
+// Everything here is for reading. The browser cannot assemble a payment from
+// these fields and is not meant to: they exist so a recipient can see what they
+// are agreeing to before they agree to it.
+type WaitingTip struct {
+	Channel string `json:"channel"`
+	Nonce   uint64 `json:"nonce"`
+	// Amount is what this state would add, in ANON.
+	Amount string `json:"amount"`
+	// From is the contributor, DERIVED FROM THE CHAIN by the node. Never taken
+	// from the frame: a volunteer that could name the parties could name itself.
+	From string `json:"from"`
+	// State is one of the constants above.
+	State  string `json:"state"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // SetReceiving attaches a payment node to the dashboard. Without one the
@@ -219,4 +284,94 @@ func (s *Server) receivingAction(w http.ResponseWriter, r *http.Request,
 
 func wantsJSON(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept"), "application/json")
+}
+
+// ---- mailbox collection (P15) ------------------------------------------------
+//
+// Server-rendered, like every other panel here. The browser posts a form and is
+// redirected; it holds no state and runs no protocol. That is deliberate — the
+// node is the state machine, and a page that decided anything about a payment
+// would be a second one that could disagree with it.
+
+// serveTips lists what is waiting, for the panel and for anything scripting
+// against it.
+func (s *Server) serveTips(w http.ResponseWriter, r *http.Request) {
+	rec, ok := s.requireReceiving(w)
+	if !ok {
+		return
+	}
+	tips, err := rec.WaitingTips(r.Context())
+	if err != nil {
+		// 502 with the reason, NOT 200 with an empty list. "I could not look"
+		// and "I looked and there was nothing" are different answers, and only
+		// one of them means nobody tipped you.
+		writeReceivingJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if tips == nil {
+		tips = []WaitingTip{}
+	}
+	writeReceivingJSON(w, http.StatusOK, map[string]any{"tips": tips})
+}
+
+// acceptTip countersigns one waiting proposal.
+func (s *Server) acceptTip(w http.ResponseWriter, r *http.Request) {
+	s.tipAction(w, r, func(rec Receiving, id string, nonce uint64) (string, error) {
+		return rec.AcceptTip(r.Context(), id, nonce)
+	})
+}
+
+// publishTip makes an accepted state findable by the contributor.
+func (s *Server) publishTip(w http.ResponseWriter, r *http.Request) {
+	s.tipAction(w, r, func(rec Receiving, id string, nonce uint64) (string, error) {
+		return rec.PublishTip(r.Context(), id, nonce)
+	})
+}
+
+// tipAction runs one collection step and carries its OUTCOME back.
+//
+// Modelled on receivingAction above and for the same reason: the outcome
+// travels even when the step failed, because "the node refused", "two states
+// were signed at one update number" and "the mailbox could not be reached" call
+// for different responses from the recipient.
+func (s *Server) tipAction(w http.ResponseWriter, r *http.Request,
+	run func(Receiving, string, uint64) (string, error)) {
+
+	if !s.checkToken(w, r) {
+		return
+	}
+	rec, ok := s.requireReceiving(w)
+	if !ok {
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("channel"))
+	// The update number travels with the channel because a volunteer may hold
+	// several states for one channel and the recipient agreed to a particular
+	// one. Accepting "whichever is listed first" would let the volunteer choose.
+	nonce, err := strconv.ParseUint(strings.TrimSpace(r.FormValue("nonce")), 10, 64)
+	if err != nil {
+		http.Error(w, "which tip? the update number is missing", http.StatusBadRequest)
+		return
+	}
+	outcome, runErr := run(rec, id, nonce)
+
+	if wantsJSON(r) {
+		body := map[string]any{"outcome": outcome}
+		code := http.StatusOK
+		if runErr != nil {
+			body["error"] = runErr.Error()
+			// 202, like receivingAction: the step ran and reported a result
+			// that is not success. A 500 would suggest the node broke.
+			code = http.StatusAccepted
+		}
+		writeReceivingJSON(w, code, body)
+		return
+	}
+	// The outcome rides in the URL so the page can say what happened. It is a
+	// label, not a claim about money — the panel re-reads the node either way.
+	dest := "/?tip=" + url.QueryEscape(outcome)
+	if runErr != nil {
+		dest += "&detail=" + url.QueryEscape(runErr.Error())
+	}
+	http.Redirect(w, r, dest, http.StatusSeeOther)
 }

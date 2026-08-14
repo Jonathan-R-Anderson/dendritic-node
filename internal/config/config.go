@@ -1325,6 +1325,17 @@ type ChannelsConfig struct {
 	// APIToken gates the operator API. Required whenever APIListen is set.
 	APIToken string `json:"api_token,omitempty"`
 
+	// Volunteer is the mailbox this node COLLECTS FROM, as opposed to Mailbox
+	// below, which is the mailbox this node RUNS FOR OTHERS. The two are
+	// separate because most nodes are one or the other, and a node that
+	// confused them would go looking for its own tips in its own queue.
+	//
+	// It lives in the config rather than arriving with a request because the
+	// browser must never choose which volunteer the node talks to: a caller who
+	// could name the volunteer could name their own and feed this node frames
+	// of their choosing.
+	Volunteer VolunteerConfig `json:"volunteer,omitempty"`
+
 	// PeerTLSCert/PeerTLSKey serve the PUBLIC peer surface over HTTPS.
 	//
 	// NOT OPTIONAL IN PRACTICE, even though they are optional fields. A
@@ -1363,6 +1374,22 @@ type ChannelsConfig struct {
 }
 
 // MailboxConfig configures volunteer mailbox service.
+// VolunteerConfig names the mailbox holding this node's incoming tips.
+//
+// Both fields or neither: the node id is half of every mailbox challenge, so an
+// endpoint without one produces a signature the volunteer cannot match and a
+// refusal that reads like a permission problem.
+type VolunteerConfig struct {
+	// Endpoint is the volunteer's public mailbox, e.g. "https://vol.example".
+	Endpoint string `json:"endpoint,omitempty"`
+	// NodeID is the volunteer's identifier, as named in the authorization the
+	// recipient signed.
+	NodeID string `json:"node_id,omitempty"`
+}
+
+// Configured reports whether this node can go looking for tips at all.
+func (v VolunteerConfig) Configured() bool { return v.Endpoint != "" && v.NodeID != "" }
+
 type MailboxConfig struct {
 	Enabled bool `json:"enabled"`
 	// NodeID is what recipients name in their authorizations. An authorization
@@ -1407,6 +1434,17 @@ func (c ChannelsConfig) Validate() error {
 	}
 	if c.Delegate.Enabled && c.Delegate.KeyFile == "" {
 		return errors.New("channels.delegate.key_file is required when delegation is enabled")
+	}
+	if (c.Volunteer.Endpoint == "") != (c.Volunteer.NodeID == "") {
+		return fmt.Errorf("channels.volunteer needs both endpoint and node_id, " +
+			"or neither: a half-configured volunteer cannot be queried")
+	}
+	// https only, for the same reason the website refuses a plain-http mailbox:
+	// anyone on the path could substitute the proposals this node is about to
+	// verify. It would still refuse the forged ones, but a volunteer that can be
+	// rewritten in flight can also silently withhold real tips.
+	if c.Volunteer.Endpoint != "" && !strings.HasPrefix(c.Volunteer.Endpoint, "https://") {
+		return fmt.Errorf("channels.volunteer.endpoint must be https, got %q", c.Volunteer.Endpoint)
 	}
 	if c.Mailbox.Enabled && c.Mailbox.NodeID == "" {
 		return errors.New("channels.mailbox.node_id is required when the mailbox is enabled")

@@ -7,6 +7,7 @@ package ui
 // that needs a chain to check a redirect is testing the wrong thing.
 
 import (
+	"fmt"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,30 @@ type fakeReceiving struct {
 	outcome     string
 	actionErr   error
 	policyErr   error
+
+	// P15 collection.
+	tips        []WaitingTip
+	tipsErr     error
+	tipCalls    []string
+	tipOutcome  string
+	tipErr      error
+	publishOut  string
+	publishErr  error
+	publishCall []string
+}
+
+func (f *fakeReceiving) WaitingTips(context.Context) ([]WaitingTip, error) {
+	return f.tips, f.tipsErr
+}
+
+func (f *fakeReceiving) AcceptTip(_ context.Context, id string, nonce uint64) (string, error) {
+	f.tipCalls = append(f.tipCalls, fmt.Sprintf("%s/%d", id, nonce))
+	return f.tipOutcome, f.tipErr
+}
+
+func (f *fakeReceiving) PublishTip(_ context.Context, id string, nonce uint64) (string, error) {
+	f.publishCall = append(f.publishCall, fmt.Sprintf("%s/%d", id, nonce))
+	return f.publishOut, f.publishErr
 }
 
 func (f *fakeReceiving) Channels(context.Context) ([]ReceivingChannel, error) {

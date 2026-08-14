@@ -50,6 +50,10 @@ type paymentStack struct {
 	coord    *channel.Coordinator
 	payout   *channel.PayoutWorker
 	mailbox  *channel.Mailbox
+	// collector reads this node's own mailbox at a volunteer. Nil when no
+	// volunteer is configured, and the console then says so rather than showing
+	// an empty list.
+	collector *ui.Collector
 	delegate *channel.DelegateSigner
 	peerSrv  *http.Server
 	apiSrv   *http.Server
@@ -92,6 +96,24 @@ func startPaymentStack(cfg config.Config, logger *log.Logger) (*paymentStack, er
 		func(raw [32]byte) ([]byte, error) { return channel.SignDigest(key, raw) })
 
 	stack := &paymentStack{coord: coord}
+
+	// ---- collecting from a volunteer ---------------------------------------
+	//
+	// The endpoint comes from THIS FILE'S config, never from a request. A
+	// caller who could name the volunteer could name their own and choose which
+	// proposals this node is shown.
+	if cc.Volunteer.Configured() {
+		disc, err := channel.NewMailboxDiscovery(self,
+			func(raw [32]byte) ([]byte, error) { return channel.SignDigest(key, raw) })
+		if err != nil {
+			return nil, fmt.Errorf("mailbox discovery: %w", err)
+		}
+		stack.collector = &ui.Collector{
+			Discovery: disc, Endpoint: cc.Volunteer.Endpoint, NodeID: cc.Volunteer.NodeID,
+		}
+		logger.Printf("channels: collecting tips from volunteer %q at %s",
+			cc.Volunteer.NodeID, cc.Volunteer.Endpoint)
+	}
 
 	// ---- the volunteer mailbox ---------------------------------------------
 	if cc.Mailbox.Enabled {
@@ -205,7 +227,9 @@ func (p *paymentStack) attachDashboard(srv *ui.Server) {
 	if p == nil || srv == nil {
 		return
 	}
-	srv.SetReceiving(ui.NewPaymentNode(p.coord, p.payout))
+	node := ui.NewPaymentNode(p.coord, p.payout)
+	node.SetCollector(p.collector)
+	srv.SetReceiving(node)
 }
 
 // stop shuts the listeners down.

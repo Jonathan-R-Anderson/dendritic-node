@@ -146,3 +146,53 @@ func (d *MailboxDiscovery) Waiting(ctx context.Context, endpoint, nodeID string)
 	}
 	return out.Frames, nil
 }
+
+// PublishAccepted caches a co-signed state at the volunteer so the contributor
+// can find it.
+//
+// DISCOVERY ONLY. Nothing here moves value: the acceptance already happened in
+// Store.Accept, and this makes the result findable by the person who sent it.
+// A failure is therefore not a failed payment, and the caller must report
+// "accepted but unpublished" rather than rolling anything back.
+func (d *MailboxDiscovery) PublishAccepted(ctx context.Context, endpoint, nodeID,
+	channel string, env Envelope) error {
+
+	if d == nil {
+		return fmt.Errorf("mailbox discovery: not configured")
+	}
+	token := fmt.Sprintf("publish-%d-%d", time.Now().UnixNano(), d.nonce.Add(1))
+	sig, err := d.Sign(PersonalDigest(MailboxChallenge(nodeID, d.Self, token)))
+	if err != nil {
+		return fmt.Errorf("mailbox discovery: could not sign: %w", err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"recipient": d.Self.Hex(), "channel": channel, "token": token,
+		"sig": "0x" + hex.EncodeToString(sig), "envelope": env,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimRight(endpoint, "/")+"/mailbox/v1/accepted", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := d.HTTP
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("mailbox discovery: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		var out struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		if out.Error != "" {
+			return fmt.Errorf("mailbox discovery: volunteer refused: %s", out.Error)
+		}
+		return fmt.Errorf("mailbox discovery: volunteer returned %d", resp.StatusCode)
+	}
+	return nil
+}

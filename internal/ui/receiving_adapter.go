@@ -13,6 +13,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
+	"strings"
 
 	"github.com/syndichan/maniwani/storage-client/internal/channel"
 )
@@ -25,6 +27,9 @@ var errNoSuchChannel = errors.New("receiving: no such channel")
 type PaymentNode struct {
 	Coord  *channel.Coordinator
 	Payout *channel.PayoutWorker
+	// Collect is the mailbox side, optional. Nil means this node does not use a
+	// volunteer, which is a different statement from "no tips waiting".
+	Collect *Collector
 }
 
 // NewPaymentNode wires the adapter.
@@ -168,3 +173,229 @@ func parseChannelID(s string) ([32]byte, error) {
 }
 
 var _ Receiving = (*PaymentNode)(nil)
+
+// ---- mailbox collection (P15) ------------------------------------------------
+//
+// The node is the state machine. These three methods do the looking, the
+// verifying-and-signing and the publishing; the console only renders what they
+// return and passes back which tip the recipient clicked.
+
+// Collector is the mailbox side of a recipient's node. Separate from the
+// payment fields above because a node can receive tips directly without ever
+// using a volunteer, and one that does should say "not configured" rather than
+// "nothing waiting".
+type Collector struct {
+	Discovery *channel.MailboxDiscovery
+	Endpoint  string
+	NodeID    string
+}
+
+// SetCollector attaches the mailbox. Without one the collection methods report
+// that this node is not configured to collect — which is a different statement
+// from an empty mailbox, and the console says so.
+func (p *PaymentNode) SetCollector(c *Collector) { p.Collect = c }
+
+var errNoCollector = errors.New(
+	"this node is not configured to collect from a mailbox: set channels.volunteer")
+
+func (p *PaymentNode) collector() (*Collector, error) {
+	if p.Collect == nil || p.Collect.Discovery == nil || p.Collect.Endpoint == "" {
+		return nil, errNoCollector
+	}
+	return p.Collect, nil
+}
+
+// WaitingTips reads the volunteer without consuming anything.
+func (p *PaymentNode) WaitingTips(ctx context.Context) ([]WaitingTip, error) {
+	c, err := p.collector()
+	if err != nil {
+		return nil, err
+	}
+	frames, err := c.Discovery.Waiting(ctx, c.Endpoint, c.NodeID)
+	if err != nil {
+		// Passed up, not swallowed. The caller must be able to tell "I could not
+		// look" from "I looked and it was empty".
+		return nil, err
+	}
+	out := []WaitingTip{}
+	for _, env := range frames {
+		tip, ok := p.describe(env)
+		if ok {
+			out = append(out, tip)
+		}
+	}
+	return out, nil
+}
+
+// describe turns a frame into something a person can read, or drops it.
+//
+// A frame carrying BOTH signatures is an already-accepted state being cached
+// for the contributor, not something to accept again — offering it would ask
+// the recipient to agree to what they already agreed to.
+func (p *PaymentNode) describe(env channel.Envelope) (WaitingTip, bool) {
+	sum, ok := channel.DescribeFrame(env)
+	if !ok || sum.CoSigned {
+		return WaitingTip{}, false
+	}
+	tip := WaitingTip{
+		Channel: sum.Channel,
+		Nonce:   sum.Nonce,
+		State:   TipWaiting,
+		Amount:  formatANON(sum.Amount),
+	}
+	// The contributor comes from the CHAIN, through the coordinator's own
+	// tracked record. NEVER from the frame: the volunteer wrote that, and a
+	// volunteer that could name the parties could name itself.
+	if p.Coord != nil {
+		if id, err := parseChannelID(sum.Channel); err == nil {
+			if ch, ok := p.Coord.Channel(id); ok {
+				me := p.Coord.Self()
+				other := ch.PartyA
+				if ch.PartyA == me {
+					other = ch.PartyB
+				}
+				tip.From = other.Hex()
+			}
+			// ALREADY ACCEPTED?
+			//
+			// A volunteer's queue is a cache, and nothing removes the original
+			// proposal from it when the recipient accepts — peek does not
+			// consume, and the contributor may still be collecting the
+			// co-signed reply. So the frame stays there afterwards, and a
+			// console that took the queue at face value would keep offering an
+			// accepted tip as though it were still waiting.
+			//
+			// THE NODE'S OWN STORED STATE decides. If it holds a state at this
+			// update number or later, this proposal is history.
+			if bal, err := p.Coord.Balances(id); err == nil && bal.Nonce >= sum.Nonce {
+				tip.State = TipAccepted
+			}
+		}
+	}
+	return tip, true
+}
+
+// AcceptTip runs one waiting proposal through the node's ordinary acceptance
+// path — the same one a directly-connected contributor reaches over SCPP/1.
+//
+// Nothing about the state is rebuilt here. The frame the contributor signed is
+// handed to the coordinator verbatim, because a state re-encoded on the way
+// would have a different digest and the signature would then cover something
+// else.
+func (p *PaymentNode) AcceptTip(ctx context.Context, id string, nonce uint64) (string, error) {
+	c, err := p.collector()
+	if err != nil {
+		return "", err
+	}
+	if p.Coord == nil {
+		return "", errors.New("receiving: no payment coordinator")
+	}
+	env, err := p.waitingFrame(ctx, c, id, nonce)
+	if err != nil {
+		return TipUnreachable, err
+	}
+
+	// Adopt, chain-derived parties, contributor signature, transition, I4,
+	// countersign, Store.Accept — all of it inside the coordinator, where it
+	// already is and already tested.
+	reply, err := p.Coord.Handle(ctx, env)
+	if err != nil {
+		return TipUnreachable, err
+	}
+	if reply == nil {
+		return TipRefused, errors.New("the node had nothing to say about that tip")
+	}
+	if reply.Type == channel.MsgStateReject {
+		code := channel.RejectionCode(*reply)
+		if code == "conflicting_states" {
+			// I4. Two different states at one update number means somebody
+			// signed twice; nothing here can know which is real.
+			return TipConflict, fmt.Errorf("two conflicting tips arrived for update %d", nonce)
+		}
+		return TipRefused, fmt.Errorf("the node declined this tip (%s)", code)
+	}
+	if reply.Type != channel.MsgStateAccept {
+		return TipRefused, fmt.Errorf("unexpected answer %q", reply.Type)
+	}
+	return TipAccepted, nil
+}
+
+// PublishTip makes an accepted state findable by the contributor.
+//
+// Its failure is reported as TipUnpublished, never as a failed acceptance: the
+// value is already committed and asking the recipient to accept again would
+// discard a completed acceptance to fix a cache miss.
+func (p *PaymentNode) PublishTip(ctx context.Context, id string, nonce uint64) (string, error) {
+	c, err := p.collector()
+	if err != nil {
+		return "", err
+	}
+	if p.Coord == nil {
+		return "", errors.New("receiving: no payment coordinator")
+	}
+	parsed, err := parseChannelID(id)
+	if err != nil {
+		return "", err
+	}
+	// Asked for through the node's ordinary state-request path, so what gets
+	// published is the stored co-signed state itself rather than something
+	// reassembled here. Reassembly would change the digest and the signatures
+	// on it would then cover a different state.
+	req, err := channel.StateRequestEnvelope(parsed)
+	if err != nil {
+		return TipUnpublished, err
+	}
+	reply, err := p.Coord.Handle(ctx, req)
+	if err != nil {
+		return TipUnpublished, err
+	}
+	if reply == nil || reply.Type != channel.MsgStateResponse {
+		return TipUnpublished, errors.New("the node has no stored state for that channel")
+	}
+	if err := c.Discovery.PublishAccepted(ctx, c.Endpoint, c.NodeID, id, *reply); err != nil {
+		return TipUnpublished, err
+	}
+	return TipPublished, nil
+}
+
+// waitingFrame finds the frame the recipient clicked, by channel AND update
+// number.
+//
+// Both, because a volunteer may hold several states for one channel and the
+// recipient agreed to a particular one. Matching on the channel alone would
+// accept whichever the volunteer happened to list first.
+func (p *PaymentNode) waitingFrame(ctx context.Context, c *Collector,
+	id string, nonce uint64) (channel.Envelope, error) {
+
+	frames, err := c.Discovery.Waiting(ctx, c.Endpoint, c.NodeID)
+	if err != nil {
+		return channel.Envelope{}, err
+	}
+	for _, env := range frames {
+		sum, ok := channel.DescribeFrame(env)
+		if ok && sum.Channel == id && sum.Nonce == nonce {
+			return env, nil
+		}
+	}
+	return channel.Envelope{}, errors.New("that tip is no longer waiting at your mailbox")
+}
+
+// formatANON renders wei as ANON for a person to read.
+//
+// Exact, by integer division and a padded remainder. A float here would round
+// somebody's tip: 1e18 wei does not survive float64 intact, and a display that
+// is off in the last place invites an argument about a number that is actually
+// correct. Trailing zeroes are trimmed so "5" reads as 5 rather than
+// 5.000000000000000000.
+func formatANON(wei *big.Int) string {
+	if wei == nil {
+		return "0"
+	}
+	unit := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	whole, frac := new(big.Int).QuoRem(wei, unit, new(big.Int))
+	if frac.Sign() == 0 {
+		return whole.String()
+	}
+	digits := strings.TrimRight(fmt.Sprintf("%018s", frac.String()), "0")
+	return whole.String() + "." + digits
+}

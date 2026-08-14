@@ -210,7 +210,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	switch {
 	case r.URL.Path == "/" && r.Method == http.MethodGet:
-		s.dashboard(w)
+		s.dashboard(w, r)
 	case r.URL.Path == "/favicon.png" && r.Method == http.MethodGet:
 		w.Header().Set("Content-Type", "image/png")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -249,6 +249,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.setPayout(w, r)
 	case r.URL.Path == "/api/receiving" && r.Method == http.MethodGet:
 		s.serveReceiving(w, r)
+	case r.URL.Path == "/api/tips" && r.Method == http.MethodGet:
+		s.serveTips(w, r)
+	case r.URL.Path == "/tips/accept" && r.Method == http.MethodPost:
+		s.acceptTip(w, r)
+	case r.URL.Path == "/tips/publish" && r.Method == http.MethodPost:
+		s.publishTip(w, r)
 	case r.URL.Path == "/receiving/policy" && r.Method == http.MethodPost:
 		s.setReceivingPolicy(w, r)
 	case r.URL.Path == "/receiving/settle" && r.Method == http.MethodPost:
@@ -276,7 +282,7 @@ func validDashboardHost(value string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (s *Server) dashboard(w http.ResponseWriter) {
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data := map[string]any{"CSRF": s.csrf, "HasConfig": s.hasConfig()}
 	// Absent rather than empty when this node does not receive: a panel showing
@@ -285,6 +291,19 @@ func (s *Server) dashboard(w http.ResponseWriter) {
 	if s.receiving != nil {
 		if channels, err := s.receiving.Channels(context.Background()); err == nil {
 			data["Receiving"] = channels
+		}
+		// Waiting tips (P15). The ERROR is carried, not discarded: a panel that
+		// fell back to an empty list would tell a recipient whose authorization
+		// had lapsed that nobody has tipped them.
+		data["TipsOn"] = true
+		if tips, err := s.receiving.WaitingTips(context.Background()); err != nil {
+			data["TipsError"] = err.Error()
+		} else {
+			data["Tips"] = tips
+		}
+		if q := r.URL.Query(); q.Get("tip") != "" {
+			data["TipOutcome"] = q.Get("tip")
+			data["TipDetail"] = q.Get("detail")
 		}
 	}
 	if s.hasConfig() {
@@ -656,6 +675,92 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
   {{else}}
   <p class="muted">No channels yet. One appears here when somebody opens a tipping
     channel with this node.</p>
+  {{end}}
+</section>
+{{end}}
+
+{{/* The tips panel sits OUTSIDE the "has channels" guard on purpose: a tip can
+      be waiting at a volunteer before this node has ever tracked a channel with
+      that person, and hiding the panel until a channel exists would hide the
+      very first tip somebody ever received. */}}
+{{if .TipsOn}}
+<section id="tips">
+  <h2>Tips waiting for you</h2>
+
+  {{if .TipOutcome}}
+  <p class="{{if eq .TipOutcome "accepted"}}ok{{else if eq .TipOutcome "published"}}ok{{else}}warn{{end}}" id="tip-outcome" data-outcome="{{.TipOutcome}}">
+    {{if eq .TipOutcome "accepted"}}
+      Tip accepted. Your node checked it and countersigned, and it is part of your
+      pool now. Publish it so the person who sent it can see that you did.
+    {{else if eq .TipOutcome "published"}}
+      Published. The person who tipped you can now see the countersigned state.
+    {{else if eq .TipOutcome "accepted_unpublished"}}
+      <b>The tip is accepted</b> &mdash; that part is done and does not need doing
+      again. It could not be cached at your mailbox yet, which only affects
+      whether the sender can see it. Try publishing again later.
+    {{else if eq .TipOutcome "conflict"}}
+      Two different tips arrived for the same update number. Nothing was accepted:
+      this needs looking at before any of it can be taken.
+    {{else if eq .TipOutcome "refused"}}
+      Your node declined that tip. Nothing was accepted and nothing was lost.
+    {{else if eq .TipOutcome "unreachable"}}
+      That could not be completed. Nothing was accepted, and nothing is lost.
+    {{else}}
+      {{.TipOutcome}}
+    {{end}}
+    {{if .TipDetail}}<br><span class="muted mono">{{.TipDetail}}</span>{{end}}
+  </p>
+  {{end}}
+
+  {{if .TipsError}}
+  <p class="warn" id="tips-error">Your tips could not be checked, so this is not a
+    list of what is waiting &mdash; it is not the same as having none, and nothing
+    has been lost.<br><span class="muted mono">{{.TipsError}}</span></p>
+  {{else if .Tips}}
+  <p class="muted">Somebody has signed a tip to you and a volunteer is holding it.
+    <b>No funds have been accepted yet.</b> Nothing moves until you accept it below,
+    and accepting does not send a transaction or cost gas.</p>
+  {{range .Tips}}
+  <div class="channel tip" data-channel="{{.Channel}}" data-nonce="{{.Nonce}}" data-state="{{.State}}">
+    <h3>{{if eq .State "accepted"}}Tip accepted{{else}}Tip waiting for acceptance{{end}}</h3>
+    <p class="num tip-amount">{{.Amount}} ANON</p>
+    <details>
+      <summary>Review this tip</summary>
+      <table class="locks">
+        <tr><th>Channel</th><td class="mono">{{.Channel}}</td></tr>
+        <tr><th>Update number</th><td class="num">{{.Nonce}}</td></tr>
+        <tr><th>Amount</th><td class="num">{{.Amount}} ANON</td></tr>
+        <tr><th>From</th><td class="mono">{{if .From}}{{.From}}{{else}}&mdash;{{end}}</td></tr>
+        <tr><th>Status</th><td>{{if eq .State "accepted"}}accepted and countersigned by your node{{else}}waiting for your acceptance{{end}}</td></tr>
+      </table>
+      <p class="muted">Reading this does not accept it, and does not remove it from
+        your mailbox. &ldquo;From&rdquo; is read from the chain by this node, not
+        from the message the volunteer handed over.</p>
+    </details>
+    {{if eq .State "accepted"}}
+    <p class="muted">Your node has already accepted this one and it is counted in
+      your pool. Your mailbox still holds the original message &mdash; that is
+      normal, and it is not a second tip. Publishing again is harmless.</p>
+    <form method="post" action="/tips/publish" class="inline">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <input type="hidden" name="channel" value="{{.Channel}}">
+      <input type="hidden" name="nonce" value="{{.Nonce}}">
+      <button type="submit" class="tip-publish">Publish accepted state</button>
+    </form>
+    {{else}}
+    <form method="post" action="/tips/accept" class="inline">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <input type="hidden" name="channel" value="{{.Channel}}">
+      <input type="hidden" name="nonce" value="{{.Nonce}}">
+      <button type="submit" class="tip-accept">Accept tip</button>
+    </form>
+    <p class="muted">Your node will verify the tip and countersign the channel
+      state with its own key. There is no wallet prompt and no transaction.</p>
+    {{end}}
+  </div>
+  {{end}}
+  {{else}}
+  <p class="muted" id="tips-none">No tips waiting.</p>
   {{end}}
 </section>
 {{end}}

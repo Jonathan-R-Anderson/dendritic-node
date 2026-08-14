@@ -3,6 +3,7 @@ package ui
 import (
 	"io"
 	"log"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -34,7 +35,7 @@ func TestDashboardRendersConfigPanels(t *testing.T) {
 	)
 
 	rec := httptest.NewRecorder()
-	s.dashboard(rec)
+	s.dashboard(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := rec.Body.String()
 
 	for _, want := range []string{
