@@ -472,7 +472,21 @@ func (c *Coordinator) RecoverAll(ctx context.Context, peer Peer) map[[32]byte]Re
 // Balances is what a caller may safely be told about a channel. Read-only, and
 // derived from the persisted state rather than recomputed.
 type Balances struct {
-	ChannelID  [32]byte
+	ChannelID [32]byte
+	// PartyA and PartyB are the channel's two parties, as the CHAIN recorded
+	// them — TrackFromChain wrote them from ChannelManagerV2 and nothing else
+	// may set them.
+	//
+	// Reported so the operator's own browser can verify signatures on a state
+	// it was handed by a volunteer. It cannot learn the parties any other way:
+	// a channel id is keccak(sorted(a,b)) and does not run backwards, and
+	// taking them from the volunteer would make the verification circular —
+	// the thing being checked would be supplying the answer.
+	//
+	// This is an INPUT to verification, never a substitute for it. The browser
+	// still recomputes the digest and recovers both signatures itself.
+	PartyA     Address
+	PartyB     Address
 	Mine       *big.Int
 	Theirs     *big.Int
 	Locked     *big.Int
