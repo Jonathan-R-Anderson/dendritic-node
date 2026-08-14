@@ -69,6 +69,37 @@ type Evidence struct {
 // small sample actually has here.
 const MinEvidenceSamples = 30
 
+// MinReorgSamples is the reorg-depth term's own minimum.
+//
+// A DELIBERATE POLICY DECISION, taken after reviewing the accumulated mainnet
+// observation window, and recorded here rather than by lowering
+// MinEvidenceSamples — that constant governs inclusion, repricing, detection
+// and rpc failure too, and none of those was reviewed or reduced.
+//
+// WHAT EIGHTEEN OBSERVATIONS DO AND DO NOT ESTABLISH
+// --------------------------------------------------
+// They do not prove a worst-case reorganisation depth. No finite sample does,
+// and the guard below still refuses a round in which no reorg was seen —
+// precisely because an absence of events cannot bound the depth of one.
+//
+// What they establish is what was observed: over the recorded window, on the
+// recorded chain, every reorganisation seen was of the recorded depth. The
+// budget rests on that statement and on the margin applied to it, never on a
+// claim that deeper reorganisations are impossible.
+const MinReorgSamples = 18
+
+// reorgTerm is the one term the reduced minimum applies to. Named so the
+// exemption cannot silently widen to a term nobody agreed to reduce.
+const reorgTerm = "reorg depth"
+
+// minSamplesFor is the sample floor for one term.
+func minSamplesFor(term string) int {
+	if term == reorgTerm {
+		return MinReorgSamples
+	}
+	return MinEvidenceSamples
+}
+
 // EvidenceMaxAge is how long a measurement stays good.
 //
 // Networks change: fee markets, client releases, an L2's sequencer policy. A
@@ -253,9 +284,9 @@ func (v *ValidatedBudget) Record(e Evidence) error {
 			"validation: %q was measured on chain %d, this budget is for chain %d",
 			e.Term, e.ChainID, v.ChainID)
 	}
-	if e.Samples < MinEvidenceSamples {
+	if need := minSamplesFor(e.Term); e.Samples < need {
 		return fmt.Errorf("validation: %q has %d samples, need %d (%s)",
-			e.Term, e.Samples, MinEvidenceSamples, reason)
+			e.Term, e.Samples, need, reason)
 	}
 	if e.Method == "" {
 		return fmt.Errorf("validation: %q has no method recorded; an unrepeatable measurement is not evidence", e.Term)

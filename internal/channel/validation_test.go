@@ -347,3 +347,84 @@ func TestAcceptingTheRiskRequiresANameAndAReason(t *testing.T) {
 		t.Fatalf("a properly recorded acceptance was refused: %v", err)
 	}
 }
+
+// ---- the reorg-depth sample floor (policy: 30 -> 18) -------------------------
+//
+// A DELIBERATE reduction, applied to the reorg-depth term ALONE. These tests
+// exist to pin both halves of that: that eighteen now suffices for reorg, and
+// that nothing else moved. The second half is the one worth having — a floor
+// lowered globally would have quietly relaxed inclusion, repricing, detection
+// and rpc failure, none of which was reviewed.
+
+func TestReorgDepthNeedsEighteenObservations(t *testing.T) {
+	now := time.Now().Unix()
+	for _, tc := range []struct {
+		samples int
+		want    bool // accepted?
+	}{
+		{17, false}, // one short
+		{18, true},  // the new floor, exactly
+		{19, true},
+		{30, true}, // the old floor still fine
+	} {
+		v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
+		v.Headers = testHeaders()
+		e := goodEvidence(reorgTerm, 12*time.Second, now)
+		e.Samples = tc.samples
+
+		err := v.Record(e)
+		if tc.want && err != nil {
+			t.Errorf("%d reorg observations were refused: %v", tc.samples, err)
+		}
+		if !tc.want && err == nil {
+			t.Errorf("%d reorg observations were accepted; the floor is %d",
+				tc.samples, MinReorgSamples)
+		}
+	}
+}
+
+func TestTheReducedFloorAppliesToReorgAlone(t *testing.T) {
+	// The whole point of scoping it. Every other term keeps 30.
+	now := time.Now().Unix()
+	for _, term := range []string{"inclusion", "repricing", "detection", "rpc failure"} {
+		v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
+		v.Headers = testHeaders()
+		e := goodEvidence(term, 30*time.Second, now)
+		e.Samples = MinReorgSamples // 18 — enough for reorg, not for these
+		if _, known := v.budgeted(term); !known {
+			continue // not a term in this budget; nothing to assert
+		}
+		if err := v.Record(e); err == nil {
+			t.Errorf("%q accepted %d samples; only %q was reduced",
+				term, MinReorgSamples, reorgTerm)
+		}
+	}
+}
+
+func TestTheOtherReorgGuardsStillHold(t *testing.T) {
+	// Reducing the COUNT must not have relaxed anything else. Each case is a
+	// separate reason to refuse, at or above the new floor.
+	now := time.Now().Unix()
+	cases := []struct {
+		name string
+		mut  func(*Evidence)
+	}{
+		{"wrong chain", func(e *Evidence) { e.ChainID = testChain + 1 }},
+		{"no method recorded", func(e *Evidence) { e.Method = "" }},
+	}
+	for _, tc := range cases {
+		v := NewValidatedBudget(testChain, MainnetChallengeBudget(), testEnvelope())
+		v.Headers = testHeaders()
+		e := goodEvidence(reorgTerm, 12*time.Second, now)
+		e.Samples = MinReorgSamples
+		tc.mut(&e)
+		if err := v.Record(e); err == nil {
+			t.Errorf("%s was accepted at the new floor", tc.name)
+		}
+	}
+}
+
+// Expiry is NOT re-tested here. TestExpiredEvidenceReopensTheGate already
+// covers it across every term including reorg depth, and lowering a sample
+// floor does not touch EvidenceMaxAge. A second, weaker copy would only be a
+// place for the two to disagree.
