@@ -122,6 +122,40 @@ func MailboxHandler(m *Mailbox) http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"frames": frames})
 	}))
 
+	// The recipient's own node asking WHETHER anything is waiting.
+	//
+	// Same proof as /collect and deliberately NOT the same effect: collect
+	// empties the queue, so a console that used it to render "a tip is waiting"
+	// would consume the proposal at page load, before the recipient had read it.
+	// /states cannot serve this — it authorises the CONTRIBUTOR and derives the
+	// channel from caller+recipient, which for a recipient asking about itself
+	// derives a channel that does not exist.
+	mux.HandleFunc("/mailbox/v1/peek", public(func(w http.ResponseWriter, r *http.Request) {
+		var req mailboxCollectRequest
+		if !readJSON(w, r, &req) {
+			return
+		}
+		recipient, err := ParseAddress(req.Recipient)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad recipient"})
+			return
+		}
+		sig, err := ParseAuthorizationSig(req.Sig)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		frames, err := m.Peek(recipient, MailboxChallenge(m.NodeID, recipient, req.Token), sig)
+		if err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		if frames == nil {
+			frames = []Envelope{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"frames": frames})
+	}))
+
 	// A contributor rebuilding its own chain. Same public surface, same
 	// signature-in-the-request rule: the caller proves which address it is, and
 	// the channel id is DERIVED from that address and the recipient rather than

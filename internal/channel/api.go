@@ -64,6 +64,8 @@ type PeerResolver func(id [32]byte, counterparty Address) (Peer, error)
 type API struct {
 	coord  *Coordinator
 	payout *PayoutWorker
+	// discovery is optional; nil means the waiting-tips route answers 501.
+	discovery *MailboxDiscovery
 	peers  PeerResolver
 
 	// token is required. An unauthenticated payment API is not a smaller
@@ -90,6 +92,13 @@ func NewAPI(coord *Coordinator, peers PeerResolver, token string) (*API, error) 
 // silently never act on.
 func (a *API) WithPayout(w *PayoutWorker) *API { a.payout = w; return a }
 
+// WithMailboxDiscovery enables the waiting-tips route.
+//
+// Without it the route answers 501 rather than "nothing waiting": a node that
+// cannot look must not report an empty mailbox, because the recipient would
+// read that as nobody having tipped them.
+func (a *API) WithMailboxDiscovery(d *MailboxDiscovery) *API { a.discovery = d; return a }
+
 // Handler returns the routes.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -102,6 +111,10 @@ func (a *API) Handler() http.Handler {
 	// Withdrawing pooled value. Same token; a checkpoint is a financial
 	// operation and gets no weaker a gate than reading the balance.
 	mux.HandleFunc("/v1/pool/checkpoint", a.authed(a.poolCheckpoint))
+	// "Is anything waiting for me at my volunteer?" — read-only, and the only
+	// reason it lives on the node rather than in the page is that only the
+	// recipient's key can authorise the read (see mailboxdiscovery.go).
+	mux.HandleFunc("/v1/mailbox/waiting", a.authed(a.mailboxWaiting))
 	return mux
 }
 
@@ -582,4 +595,43 @@ func (a *API) runPayout(w http.ResponseWriter, r *http.Request, id [32]byte) {
 		return
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+// mailboxWaiting reports what a volunteer is holding, without consuming it.
+//
+// GET-shaped on purpose: it changes nothing. The volunteer endpoint comes in
+// the query because a recipient may move between volunteers and the node should
+// not need restarting to follow them.
+func (a *API) mailboxWaiting(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only"})
+		return
+	}
+	if a.discovery == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "this node has no mailbox discovery configured"})
+		return
+	}
+	q := r.URL.Query()
+	endpoint := strings.TrimSpace(q.Get("volunteer"))
+	if endpoint == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "volunteer required"})
+		return
+	}
+	frames, err := a.discovery.Waiting(r.Context(), endpoint, q.Get("node_id"))
+	if err != nil {
+		// 502, not 200-with-nothing. The caller must be able to tell "I could
+		// not look" from "I looked and it was empty".
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if frames == nil {
+		frames = []Envelope{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"recipient": a.discovery.Self.Hex(),
+		"frames":    frames,
+		// Said explicitly so no caller has to infer it from the route name.
+		"consumed": false,
+	})
 }

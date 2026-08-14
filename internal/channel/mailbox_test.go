@@ -504,3 +504,124 @@ func TestTheMailboxStillCannotSignAfterRetention(t *testing.T) {
 		}
 	}
 }
+
+// ---- non-consuming recipient discovery (P15.5) -------------------------------
+//
+// The recipient's console must be able to say "a tip is waiting" without
+// destroying the tip. Collect is the only other recipient-authorized read and it
+// empties the queue, so discovery through Collect would consume the proposal at
+// page load — before the recipient had reviewed it.
+
+func TestPeekDoesNotConsumeTheQueue(t *testing.T) {
+	m := newTestMailbox(1000)
+	alice := newSigner(t)
+	if err := m.Serve(authFor(t, alice, testNode, 2000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Deliver(alice.address(), Envelope{Type: MsgStatePropose, Channel: "ab"}); err != nil {
+		t.Fatal(err)
+	}
+	ch := MailboxChallenge(testNode, alice.address(), "peek")
+	proof := alice.sign(PersonalDigest(ch))
+
+	for i := 1; i <= 3; i++ {
+		got, err := m.Peek(alice.address(), ch, proof)
+		if err != nil {
+			t.Fatalf("peek %d: %v", i, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("peek %d returned %d frames, want 1", i, len(got))
+		}
+		if m.Pending(alice.address()) != 1 {
+			t.Fatalf("peek %d consumed the queue", i)
+		}
+	}
+
+	// Collect remains the consuming path, and still works afterwards.
+	got, err := m.Collect(alice.address(), ch, proof)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("collect after peek: %v (%d)", err, len(got))
+	}
+	if m.Pending(alice.address()) != 0 {
+		t.Fatal("collect did not consume the queue")
+	}
+}
+
+func TestPeekNeedsTheRecipientsOwnProof(t *testing.T) {
+	m := newTestMailbox(1000)
+	alice, mallory := newSigner(t), newSigner(t)
+	if err := m.Serve(authFor(t, alice, testNode, 2000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Deliver(alice.address(), Envelope{Type: MsgStatePropose}); err != nil {
+		t.Fatal(err)
+	}
+	ch := MailboxChallenge(testNode, alice.address(), "peek")
+
+	if _, err := m.Peek(alice.address(), ch, mallory.sign(PersonalDigest(ch))); !errors.Is(err, ErrNotServed) {
+		t.Fatalf("a stranger peeked: %v", err)
+	}
+	if m.Pending(alice.address()) != 1 {
+		t.Fatal("a refused peek consumed the queue")
+	}
+}
+
+func TestPeekIsRefusedOnceAuthorizationLapses(t *testing.T) {
+	// An expired authorization must read as refused, never as an empty mailbox —
+	// the recipient would otherwise be told nobody had tipped them.
+	m := NewMailbox(testNode, func() int64 { return 1000 })
+	alice := newSigner(t)
+	if err := m.Serve(authFor(t, alice, testNode, 1500)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Deliver(alice.address(), Envelope{Type: MsgStatePropose}); err != nil {
+		t.Fatal(err)
+	}
+	m.Now = func() int64 { return 2000 }
+
+	ch := MailboxChallenge(testNode, alice.address(), "peek")
+	got, err := m.Peek(alice.address(), ch, alice.sign(PersonalDigest(ch)))
+	if !errors.Is(err, ErrNotServed) {
+		t.Fatalf("want ErrNotServed, got %v", err)
+	}
+	if got != nil {
+		t.Fatal("a refused peek returned frames")
+	}
+}
+
+func TestPeekReturnsACopy(t *testing.T) {
+	// The caller must not be able to reach into the queue this promised not to
+	// touch.
+	m := newTestMailbox(1000)
+	alice := newSigner(t)
+	if err := m.Serve(authFor(t, alice, testNode, 2000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Deliver(alice.address(), Envelope{Type: MsgStatePropose, Channel: "aa"}); err != nil {
+		t.Fatal(err)
+	}
+	ch := MailboxChallenge(testNode, alice.address(), "peek")
+	got, err := m.Peek(alice.address(), ch, alice.sign(PersonalDigest(ch)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got[0].Channel = "tampered"
+
+	again, _ := m.Peek(alice.address(), ch, alice.sign(PersonalDigest(ch)))
+	if again[0].Channel != "aa" {
+		t.Fatal("a caller mutated the queued frame through a peek result")
+	}
+}
+
+func TestPeekCannotMakeTheMailboxSign(t *testing.T) {
+	// Reading must never produce a signature. The mailbox holds no key at all,
+	// so this is structural, but discovery is exactly where somebody would be
+	// tempted to add one.
+	m := newTestMailbox(1000)
+	mt := reflect.TypeOf(m)
+	for i := 0; i < mt.NumMethod(); i++ {
+		if strings.Contains(strings.ToLower(mt.Method(i).Name), "sign") {
+			t.Fatalf("Mailbox gained a %s method", mt.Method(i).Name)
+		}
+	}
+}

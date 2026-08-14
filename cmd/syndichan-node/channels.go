@@ -170,6 +170,16 @@ func startPaymentStack(cfg config.Config, logger *log.Logger) (*paymentStack, er
 		if err != nil {
 			return nil, err
 		}
+		// Reading this operator's own mailbox at a volunteer. The same channel
+		// key as above, because only the recipient can authorise a read of the
+		// recipient's mailbox — and it reads only: /mailbox/v1/peek leaves the
+		// proposal in place for the recipient to decide on.
+		disc, err := channel.NewMailboxDiscovery(self,
+			func(raw [32]byte) ([]byte, error) { return channel.SignDigest(key, raw) })
+		if err != nil {
+			return nil, fmt.Errorf("mailbox discovery: %w", err)
+		}
+		api = api.WithMailboxDiscovery(disc)
 		stack.apiSrv = &http.Server{
 			Addr: cc.APIListen, Handler: api.Handler(),
 			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,

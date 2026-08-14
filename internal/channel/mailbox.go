@@ -283,6 +283,47 @@ func (m *Mailbox) Collect(recipient Address, challenge [32]byte, proof []byte) (
 	return out, nil
 }
 
+// Peek returns the recipient's waiting frames WITHOUT consuming them.
+//
+// WHY THIS EXISTS SEPARATELY FROM Collect
+// ---------------------------------------
+// A recipient's console has to show "a tip is waiting" before the recipient has
+// decided anything. Collect is the only other recipient-authorized read and it
+// EMPTIES THE QUEUE, so using it for discovery would destroy the proposal at
+// page load — before it had been reviewed, let alone accepted.
+//
+// StatesFor cannot serve this either: it authorises the CONTRIBUTOR, deriving
+// the channel from caller+recipient, and a recipient asking about their own
+// mailbox derives nothing.
+//
+// So this is Collect's authorization with Collect's side effect removed. It is
+// strictly the weaker of the two: same proof, same recipient, and it changes
+// nothing. Collect remains the consuming path, and acceptance still goes
+// through the recipient's own node.
+func (m *Mailbox) Peek(recipient Address, challenge [32]byte, proof []byte) ([]Envelope, error) {
+	signer, err := RecoverSigner(PersonalDigest(challenge), proof)
+	if err != nil {
+		return nil, fmt.Errorf("mailbox: unreadable proof: %w", err)
+	}
+	if signer != recipient {
+		// Same refusal as an unknown recipient: asking teaches nothing about
+		// who this node serves.
+		return nil, ErrNotServed
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.auth[recipient]
+	if !ok || a.Expires <= m.now() {
+		return nil, ErrNotServed
+	}
+	// A COPY. Handing back the slice itself would let a caller's later append
+	// reach into the queue this promised not to touch.
+	out := make([]Envelope, len(m.queue[recipient]))
+	copy(out, m.queue[recipient])
+	return out, nil
+}
+
 // Pending reports how many frames are waiting, for the operator's console.
 func (m *Mailbox) Pending(recipient Address) int {
 	m.mu.Lock()
