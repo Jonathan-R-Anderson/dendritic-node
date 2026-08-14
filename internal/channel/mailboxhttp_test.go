@@ -9,6 +9,7 @@ package channel
 
 import (
 	"net/http"
+	"strings"
 	"net/http/httptest"
 	"testing"
 )
@@ -119,5 +120,101 @@ func TestAuthorizingForAnotherNodeIsRefusedOverHTTP(t *testing.T) {
 	}
 	if m.Serves(alice.address()) {
 		t.Fatal("the node adopted a recipient authorized elsewhere")
+	}
+}
+
+// ---- the browser preflight (P15) --------------------------------------------
+//
+// A cross-origin JSON POST always triggers OPTIONS first. The mailbox answered
+// 405, so no browser ever sent the delivery — the tip failed before a byte left
+// the page. Found by loading the real site in Firefox; every server-side test
+// passed because curl sends no preflight.
+
+func TestTheMailboxAnswersTheBrowsersPreflight(t *testing.T) {
+	_, srv := mailboxServer(t, 1000)
+
+	for _, route := range []string{"authorize", "deliver", "collect", "states", "accepted"} {
+		req, _ := http.NewRequest(http.MethodOptions, srv.URL+"/mailbox/v1/"+route, nil)
+		// Exactly what tip-channel.js provokes.
+		req.Header.Set("Origin", "https://syndichan.example")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		req.Header.Set("Access-Control-Request-Headers", "content-type")
+
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", route, err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("%s preflight: got %d, want 204 — a browser will not send the POST",
+				route, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Fatalf("%s: Allow-Origin %q", route, got)
+		}
+		if !strings.Contains(resp.Header.Get("Access-Control-Allow-Methods"), "POST") {
+			t.Fatalf("%s: POST is not advertised", route)
+		}
+		if !strings.Contains(strings.ToLower(resp.Header.Get("Access-Control-Allow-Headers")), "content-type") {
+			t.Fatalf("%s: Content-Type is not allowed", route)
+		}
+		// Never credentials alongside a wildcard origin — the browser refuses
+		// that pair anyway, and asking for it would break every tip.
+		if resp.Header.Get("Access-Control-Allow-Credentials") != "" {
+			t.Fatalf("%s advertises credentials with a wildcard origin", route)
+		}
+	}
+}
+
+func TestThePreflightNeedsNoAuthorizationButThePostStillDoes(t *testing.T) {
+	// A preflight carries no body, no signature and no recipient — there is
+	// nothing to authorise. The POST is a different matter.
+	m, srv := mailboxServer(t, 1000)
+	stranger := newSigner(t)
+
+	req, _ := http.NewRequest(http.MethodOptions, srv.URL+"/mailbox/v1/deliver", nil)
+	req.Header.Set("Origin", "https://anywhere.example")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("preflight required authorization: %d", resp.StatusCode)
+	}
+
+	// The actual delivery is still refused for a recipient this node does not
+	// serve. Answering the preflight authorised nothing.
+	code, _ := do(t, srv.Client(), http.MethodPost, srv.URL+"/mailbox/v1/deliver",
+		map[string]any{"recipient": stranger.address().Hex(),
+			"envelope": Envelope{Type: MsgStatePropose}}, "")
+	if code != http.StatusForbidden {
+		t.Fatalf("an unserved recipient was accepted after a preflight: %d", code)
+	}
+	if m.Pending(stranger.address()) != 0 {
+		t.Fatal("a frame was queued for an unserved recipient")
+	}
+}
+
+func TestTheOperatorAPIGainsNoCORS(t *testing.T) {
+	// The mailbox is public by design; the operator API is not, and must not
+	// have been loosened by the same change.
+	c, base, _, _, _, stop := poolAPIFor(t, 500)
+	defer stop()
+
+	for _, path := range []string{"/v1/channels", "/v1/pool", "/v1/pool/checkpoint"} {
+		req, _ := http.NewRequest(http.MethodOptions, base+path, nil)
+		req.Header.Set("Origin", "https://evil.example")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+			t.Fatalf("%s advertises Allow-Origin %q — the operator API must stay "+
+				"unreachable from a web page", path, got)
+		}
 	}
 }
