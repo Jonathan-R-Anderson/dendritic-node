@@ -83,12 +83,20 @@ func NewStreamPeer(addr string) *StreamPeer {
 	}
 }
 
+// ErrPeerUnreachable means the connection was never established.
+//
+// The ONLY safe negative in this file. Every other transport failure leaves
+// open the possibility that the peer received and acted on the message; a dial
+// that never connected wrote no bytes, so the peer provably did not.
+var ErrPeerUnreachable = errors.New("transport: the peer could not be reached")
+
 // Exchange sends one message and returns the reply.
 //
 // An error here says only that the exchange did not complete. It says nothing
 // about whether the peer acted on the message — it may have signed and
 // persisted a state before the connection dropped. The caller resolves that by
-// asking (Coordinator.Recover), never by assuming.
+// asking (Coordinator.Recover), never by assuming. The single exception is
+// ErrPeerUnreachable, which is raised before anything is written.
 func (p *StreamPeer) Exchange(ctx context.Context, out Envelope) (Envelope, error) {
 	timeout := p.Timeout
 	if timeout <= 0 {
@@ -99,7 +107,12 @@ func (p *StreamPeer) Exchange(ctx context.Context, out Envelope) (Envelope, erro
 
 	conn, err := p.Dial(ctx)
 	if err != nil {
-		return Envelope{}, fmt.Errorf("transport: dial: %w", err)
+		// TAGGED, because this failure is different in kind from the ones
+		// below. Nothing has been written yet, so the peer cannot have acted:
+		// this is the one transport failure that is NOT ambiguous, and a caller
+		// that treats every failure as "may have happened" gives up a fact it
+		// actually has. Everything after the first WriteFrame stays ambiguous.
+		return Envelope{}, fmt.Errorf("transport: dial: %w: %w", ErrPeerUnreachable, err)
 	}
 	defer conn.Close()
 

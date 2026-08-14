@@ -15,6 +15,8 @@ package channel
 
 import (
 	"context"
+	"fmt"
+	"net/http/httptest"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -405,4 +407,144 @@ func errText(body map[string]any) string {
 func str(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// ---- telling the refusals apart (P15 final UX pass) --------------------------
+//
+// Three outcomes that a naive implementation collapses into one "error":
+//
+//	nothing to withdraw     there is no money        422
+//	contributor offline     money is there, unsent   503
+//	unknown                 sent, outcome unclear    409
+//
+// Collapsing the middle one into UNKNOWN makes an ordinary situation look like
+// a possible loss. Collapsing it into "nothing to withdraw" tells somebody
+// their money is gone. Both are worse than the extra state.
+
+// unreachablePeer fails the way a dial failure does: tagged, before any write.
+type unreachablePeer struct{}
+
+func (unreachablePeer) Exchange(context.Context, Envelope) (Envelope, error) {
+	return Envelope{}, fmt.Errorf("transport: dial: %w: connection refused", ErrPeerUnreachable)
+}
+
+func TestAnOfflineContributorIsNotUnknown(t *testing.T) {
+	payer, payee, id := wiredPair(t, anon(500))
+	if _, err := payer.coord.Pay(context.Background(), id, intent(91),
+		payTransition(60), directPeer{t, payee.coord}); err != nil {
+		t.Fatalf("pay: %v", err)
+	}
+
+	res, err := payee.coord.Checkpoint(context.Background(), id, nil, unreachablePeer{})
+	if err == nil {
+		t.Fatal("an unreachable contributor produced no error")
+	}
+	if res.Outcome != CheckpointContributorOffline {
+		t.Fatalf("outcome = %q, want CONTRIBUTOR_OFFLINE", res.Outcome)
+	}
+	// The amount travels with the refusal: the UI has to be able to say the
+	// money is there.
+	if res.Amount == nil || res.Amount.Cmp(anon(60)) != 0 {
+		t.Fatalf("amount = %v, want %s", res.Amount, anon(60))
+	}
+	// And nothing may be recorded as unknown, because nothing was sent.
+	ch, _ := payee.coord.store.Get(id)
+	if withdrawnBy(ch.Latest.State, ch.PartyA == payee.coord.self).Sign() != 0 {
+		t.Fatal("value was recorded as withdrawn after a failed dial")
+	}
+}
+
+func TestAFailureAfterTheDialStaysUnknown(t *testing.T) {
+	// The distinction must be narrow. Anything past the dial may have been
+	// received and acted on, and must NOT be reported as safely offline.
+	payer, payee, id := wiredPair(t, anon(500))
+	if _, err := payer.coord.Pay(context.Background(), id, intent(92),
+		payTransition(60), directPeer{t, payee.coord}); err != nil {
+		t.Fatalf("pay: %v", err)
+	}
+	res, err := payee.coord.Checkpoint(context.Background(), id, nil, deadPeer{})
+	if err == nil {
+		t.Fatal("a dead peer produced no error")
+	}
+	if res.Outcome != CheckpointUnknown {
+		t.Fatalf("outcome = %q, want UNKNOWN — a mid-exchange failure is ambiguous", res.Outcome)
+	}
+}
+
+func TestTheThreeRefusalsHaveDistinctStatusCodes(t *testing.T) {
+	c, base, payer, payee, id, stop := checkpointAPIFor(t, 500)
+	defer stop()
+
+	// A real tip, so the channel is known to the recipient and holds value.
+	payInto(t, payer, payee, id, 60)
+
+	// 1. CONTRIBUTOR OFFLINE — the money is there, nothing was sent.
+	offlineAPI, err := NewAPI(payee.coord, func(_ [32]byte, _ Address) (Peer, error) {
+		return unreachablePeer{}, nil
+	}, testToken)
+	if err != nil {
+		t.Fatalf("NewAPI: %v", err)
+	}
+	srv := httptest.NewServer(offlineAPI.Handler())
+	defer srv.Close()
+
+	code, body := do(t, srv.Client(), http.MethodPost, srv.URL+"/v1/pool/checkpoint",
+		map[string]any{"channel": poolChannelHex(id)}, testToken)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("offline contributor: got %d, want 503 (%v)", code, body)
+	}
+	if body["outcome"] != string(CheckpointContributorOffline) {
+		t.Fatalf("outcome = %v, want CONTRIBUTOR_OFFLINE", body["outcome"])
+	}
+	// THE POINT: the response must state that the money is still there, or the
+	// UI cannot honestly say "funds are available".
+	if body["amount"] != anon(60).String() {
+		t.Fatalf("amount = %v, want %s", body["amount"], anon(60))
+	}
+	// And an offline contributor costs the recipient nothing.
+	if v := poolOf(t, c, base); v.Withdrawable != anon(60).String() {
+		t.Fatalf("a failed withdrawal moved the balance: %q", v.Withdrawable)
+	}
+
+	// 2. SUCCESS, with the contributor reachable.
+	code, body = postCheckpoint(t, c, base,
+		map[string]any{"channel": poolChannelHex(id)}, testToken)
+	if code != http.StatusOK {
+		t.Fatalf("withdrawal with a reachable contributor: %d %v", code, body)
+	}
+
+	// 3. NOTHING TO WITHDRAW — distinct from both of the above.
+	code, body = postCheckpoint(t, c, base,
+		map[string]any{"channel": poolChannelHex(id)}, testToken)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("second withdrawal: got %d, want 422 (%v)", code, body)
+	}
+	if code == http.StatusServiceUnavailable {
+		t.Fatal("an empty channel was reported as an offline contributor")
+	}
+}
+
+func TestAnOfflineContributorDoesNotFallBackToUnilateralClose(t *testing.T) {
+	// Closing unilaterally starts a challenge period and ends the channel. It
+	// must never happen because a co-signature was momentarily unavailable —
+	// that would turn a transient outage into a settlement.
+	payer, payee, id := wiredPair(t, anon(500))
+	if _, err := payer.coord.Pay(context.Background(), id, intent(93),
+		payTransition(60), directPeer{t, payee.coord}); err != nil {
+		t.Fatalf("pay: %v", err)
+	}
+	before, _ := payee.coord.store.Get(id)
+	beforeStatus, beforeNonce := before.Status, before.Latest.State.Nonce
+
+	_, _ = payee.coord.Checkpoint(context.Background(), id, nil, unreachablePeer{})
+
+	after, _ := payee.coord.store.Get(id)
+	if after.Status != beforeStatus {
+		t.Fatalf("the channel status changed from %d to %d after an offline contributor",
+			beforeStatus, after.Status)
+	}
+	if after.Latest.State.Nonce != beforeNonce {
+		t.Fatalf("the state advanced from nonce %d to %d with no co-signature",
+			beforeNonce, after.Latest.State.Nonce)
+	}
 }

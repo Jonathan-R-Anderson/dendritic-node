@@ -138,7 +138,12 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrInsufficient), errors.Is(err, ErrAmountNotPositive),
 		errors.Is(err, ErrNotAParty), errors.Is(err, ErrUnknownKind),
 		errors.Is(err, ErrNoSuchLock), errors.Is(err, ErrLockExists),
-		errors.Is(err, ErrPreimageBad), errors.Is(err, ErrLocksRemain):
+		errors.Is(err, ErrPreimageBad), errors.Is(err, ErrLocksRemain),
+		// A withdrawal the state does not support is the caller being wrong,
+		// not the node being broken. Reported as 500 until the devnet run
+		// showed a correctly-refused replay arriving as a server error — which
+		// would push an operator to investigate an outage that never happened.
+		errors.Is(err, ErrCheckpointNotEligible), errors.Is(err, ErrCheckpointTooLarge):
 		code = http.StatusUnprocessableEntity
 	case errors.Is(err, ErrChainUnreachable):
 		code = http.StatusBadGateway

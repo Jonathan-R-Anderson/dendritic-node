@@ -71,6 +71,19 @@ const (
 	// answer after a transport failure, and the caller must re-read state
 	// rather than retry.
 	CheckpointUnknown CheckpointOutcome = "UNKNOWN"
+	// CheckpointContributorOffline means the value is there but the other party
+	// could not be reached to co-sign it.
+	//
+	// DISTINCT FROM UNKNOWN, and the distinction is worth the extra state. The
+	// dial never connected, so nothing was proposed and nothing can have been
+	// signed — the recipient can be told plainly that their money is fine and
+	// the withdrawal simply needs the contributor online. Folding this into
+	// UNKNOWN would make an ordinary, recoverable situation read like a
+	// possible loss.
+	//
+	// DISTINCT FROM "nothing to withdraw" for the opposite reason: that one
+	// says there is no money, and saying it here would be false.
+	CheckpointContributorOffline CheckpointOutcome = "CONTRIBUTOR_OFFLINE"
 )
 
 // CheckpointResult describes one withdrawal attempt.
@@ -199,14 +212,28 @@ func (c *Coordinator) Checkpoint(ctx context.Context, id [32]byte,
 		return CheckpointResult{}, err
 	}
 	if peer == nil {
-		return CheckpointResult{}, ErrCheckpointNoPeer
+		return CheckpointResult{
+			Outcome: CheckpointContributorOffline,
+			// The eligible amount travels with the refusal so the UI can say
+			// "your funds are there" rather than showing a bare error.
+			Amount: new(big.Int).Set(amount),
+		}, ErrCheckpointNoPeer
 	}
 
 	reply, err := peer.Exchange(ctx, propose)
 	if err != nil {
-		// The contributor may or may not have signed. Recorded as unknown for
-		// the same reason Pay does: resync establishes what happened, a guess
-		// here does not.
+		if errors.Is(err, ErrPeerUnreachable) {
+			// NOT AMBIGUOUS. The connection was never established, so the
+			// proposal was never written and the contributor cannot have
+			// signed. Nothing is recorded as unknown, because nothing is.
+			return CheckpointResult{
+				Outcome: CheckpointContributorOffline,
+				Amount:  new(big.Int).Set(amount),
+			}, err
+		}
+		// Past the dial, the contributor may or may not have signed. Recorded
+		// as unknown for the same reason Pay does: resync establishes what
+		// happened, a guess here does not.
 		_ = c.store.Update(id, func(ch *Channel) error {
 			rec := recordFor(intent, tr, false, PayUnknown, c.clock())
 			rec.Detail = err.Error()

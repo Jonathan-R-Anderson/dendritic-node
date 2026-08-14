@@ -232,13 +232,32 @@ func (a *API) poolCheckpoint(w http.ResponseWriter, r *http.Request) {
 	if a.peers != nil {
 		peer, err = a.peers(id, counterparty)
 		if err != nil {
-			writeErr(w, err)
+			// Could not even work out how to reach the contributor. Nothing was
+			// sent, so this is the offline case, not an indeterminate one.
+			eligible, eligErr := a.coord.CheckpointEligible(id)
+			if eligErr != nil {
+				writeErr(w, eligErr)
+				return
+			}
+			writeJSON(w, http.StatusServiceUnavailable, checkpointResponse{
+				Outcome: string(CheckpointContributorOffline),
+				Amount:  decString(eligible),
+			})
 			return
 		}
 	}
 
 	result, err := a.coord.Checkpoint(r.Context(), id, requested, peer)
 	if err != nil {
+		if result.Outcome == CheckpointContributorOffline {
+			// 503, not 4xx: the request was valid and the money is there. The
+			// amount is included so the dashboard can name it.
+			writeJSON(w, http.StatusServiceUnavailable, checkpointResponse{
+				Outcome: string(CheckpointContributorOffline),
+				Amount:  decString(result.Amount),
+			})
+			return
+		}
 		if result.Outcome == CheckpointUnknown {
 			// NOT AN ERROR THE CALLER MAY RETRY. The contributor may have
 			// signed. 409 rather than 5xx so the dashboard can tell this apart
