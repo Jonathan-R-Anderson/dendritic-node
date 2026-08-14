@@ -1,3 +1,5 @@
+//go:build ethbls
+
 package ethproof
 
 // The BLS boundary — roadmap P12-5.4.

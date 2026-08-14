@@ -22,6 +22,46 @@ from authenticated ciphertext, and each shard has a SHA-256 content ID.
 Recovery verifies, in order: shard SHA-256, Reed-Solomon reconstruction,
 XChaCha20-Poly1305 authentication, and the final plaintext SHA-256.
 
+## Ethereum BLS verification is an opt-in build capability (P12)
+
+`internal/ethproof` can verify Ethereum sync-committee signatures — the P12
+light-client path that lets a node authenticate chain data without trusting an
+RPC. That verifier is built on `blst`, which is cgo and **cannot compile with
+`CGO_ENABLED=0` on any target except wasm**. The release build is CGO-free by
+design: seven platforms cross-compiled from one host, static, `-trimpath`.
+
+So BLS is behind a build tag:
+
+| build | tag | BLS |
+|---|---|---|
+| ordinary release (`build-release.sh`) | none | **not compiled** |
+| P12 development and tests | `ethbls` | real `blst` implementation |
+
+The tag **enables** BLS; its absence selects the stub. A forgotten tag therefore
+produces the build that refuses to verify, never one that silently claims it
+did.
+
+**Released binaries do not contain BLS, and that is not a downgrade.** Nothing
+in `cmd/syndichan-node` constructs a `BLSVerifier` — the only callers of
+`NewBLSVerifier` are tests, and `LightClientState` takes its verifier as a
+parameter. BLS arrived as a verified library capability with the consensus-spec
+vectors and was never wired into a runtime path.
+
+**The no-BLS build fails closed.** `NewBLSVerifier` returns a non-nil verifier
+whose every method returns `ErrNoBLSSupport`, naming the missing `ethbls` tag.
+It never returns nil (which would invite a `!= nil` bypass), never returns
+success, and inspects no argument — rejecting only malformed input would imply
+a well-formed one might pass. `ApplyUpdate`, `ApplyFinalityUpdate` and
+`ApplyRotatingUpdate` propagate the refusal, so no update can be applied
+unverified.
+
+**If a future P12 feature needs BLS in production**, it must either ship an
+`ethbls` build with a deliberate release architecture for it, or provide
+another authenticated path. It must not treat `ErrNoBLSSupport` as a soft
+failure, and must never fall back to an unverified source: a build without BLS
+is incapable of claiming that BLS-protected consensus evidence was checked, and
+that incapacity is the point.
+
 ## Admission and abuse controls
 
 Remote `STORE` is denied unless:

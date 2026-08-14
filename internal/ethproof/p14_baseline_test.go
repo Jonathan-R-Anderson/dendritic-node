@@ -1,3 +1,5 @@
+//go:build ethbls
+
 package ethproof
 
 // P14 — baseline measurements for the verification and evidence paths.
@@ -89,21 +91,7 @@ func p14Skip(t *testing.T) {
 }
 
 // percentile over a sorted-in-place slice.
-func pct(d []time.Duration, p float64) time.Duration {
-	if len(d) == 0 {
-		return 0
-	}
-	i := int(p * float64(len(d)-1))
-	return d[i]
-}
 
-func sortDurations(d []time.Duration) {
-	for i := 1; i < len(d); i++ {
-		for j := i; j > 0 && d[j] < d[j-1]; j-- {
-			d[j], d[j-1] = d[j-1], d[j]
-		}
-	}
-}
 
 // ---- evidence store ---------------------------------------------------------
 

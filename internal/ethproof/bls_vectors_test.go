@@ -1,3 +1,5 @@
+//go:build ethbls
+
 package ethproof
 
 // Ethereum consensus-spec BLS vectors — roadmap P12-5.4's completion gate.

@@ -1,3 +1,5 @@
+//go:build ethbls
+
 package ethproof
 
 // Live Ethereum Mainnet validation — roadmap P12-5.9.
