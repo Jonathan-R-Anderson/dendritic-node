@@ -415,3 +415,92 @@ func TestADelegateHoldsNoRecipientKey(t *testing.T) {
 		t.Fatal("the served set carries a value; it must be addresses alone")
 	}
 }
+
+// ---- retained frames, for a contributor rebuilding its chain (P15 Case B) ----
+
+func TestRetainedFramesSurviveCollection(t *testing.T) {
+	// Collecting empties the RECIPIENT's queue — that is what collection means.
+	// A contributor still needs its own chain afterwards, so retention has to
+	// outlive delivery or tip 2 has nothing to build on.
+	m := newTestMailbox(1000)
+	alice, recipient := newSigner(t), newSigner(t)
+	if err := m.Serve(authFor(t, recipient, testNode, 2000)); err != nil {
+		t.Fatal(err)
+	}
+	id := DeriveChannelID(alice.address(), recipient.address())
+	ch := poolChannelHex(id)
+
+	if err := m.Deliver(recipient.address(), Envelope{Type: MsgStatePropose, Channel: ch}); err != nil {
+		t.Fatal(err)
+	}
+	tok := MailboxChallenge(testNode, recipient.address(), "t")
+	if _, err := m.Collect(recipient.address(), tok, recipient.sign(PersonalDigest(tok))); err != nil {
+		t.Fatal(err)
+	}
+	if m.Pending(recipient.address()) != 0 {
+		t.Fatal("the queue was not emptied")
+	}
+	if m.Retained(ch) != 1 {
+		t.Fatal("collection destroyed the contributor's chain")
+	}
+}
+
+func TestOnlyAPartyMayReadAChannelsRetainedFrames(t *testing.T) {
+	m := newTestMailbox(1000)
+	alice, recipient, mallory := newSigner(t), newSigner(t), newSigner(t)
+	if err := m.Serve(authFor(t, recipient, testNode, 2000)); err != nil {
+		t.Fatal(err)
+	}
+	id := DeriveChannelID(alice.address(), recipient.address())
+	ch := poolChannelHex(id)
+	m.Retain(ch, Envelope{Type: MsgStatePropose, Channel: ch})
+
+	// Alice proves she is Alice, and the id she asks about DERIVES from her
+	// address and the recipient's. Nothing is taken on her word.
+	c := MailboxChallenge(testNode, alice.address(), "t")
+	got, err := m.StatesFor(recipient.address(), alice.address(), ch, c,
+		alice.sign(PersonalDigest(c)))
+	if err != nil || len(got) != 1 {
+		t.Fatalf("a party could not read its own chain: %v (%d)", err, len(got))
+	}
+
+	// Mallory proves she is Mallory and asks about Alice's channel. The id does
+	// not derive from her address, so there is nothing to look up.
+	cm := MailboxChallenge(testNode, mallory.address(), "t")
+	if _, err := m.StatesFor(recipient.address(), mallory.address(), ch, cm,
+		mallory.sign(PersonalDigest(cm))); !errors.Is(err, ErrNotServed) {
+		t.Fatalf("a stranger read another channel's frames: %v", err)
+	}
+
+	// And Mallory cannot borrow Alice's identity without Alice's key.
+	if _, err := m.StatesFor(recipient.address(), alice.address(), ch, c,
+		mallory.sign(PersonalDigest(c))); !errors.Is(err, ErrNotServed) {
+		t.Fatalf("an unproven caller read a chain: %v", err)
+	}
+}
+
+func TestRetentionIsBounded(t *testing.T) {
+	m := NewMailbox(testNode, func() int64 { return 1000 })
+	m.Depth = 3
+	ch := poolChannelHex([32]byte{9})
+	for i := 0; i < 6; i++ {
+		m.Retain(ch, Envelope{Type: MsgStatePropose, Channel: ch})
+	}
+	if m.Retained(ch) != 3 {
+		t.Fatalf("retained %d frames, want the cap of 3", m.Retained(ch))
+	}
+}
+
+func TestTheMailboxStillCannotSignAfterRetention(t *testing.T) {
+	// Retention gave the mailbox more to hold. It must not have given it more
+	// to do: the structural no-key rule still applies.
+	ty := reflect.TypeOf(Mailbox{})
+	for i := 0; i < ty.NumField(); i++ {
+		name := strings.ToLower(ty.Field(i).Name)
+		for _, banned := range []string{"key", "sign", "secret", "seed", "priv"} {
+			if strings.Contains(name, banned) {
+				t.Fatalf("Mailbox.%s appeared alongside retention", ty.Field(i).Name)
+			}
+		}
+	}
+}

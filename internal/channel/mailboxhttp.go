@@ -122,7 +122,96 @@ func MailboxHandler(m *Mailbox) http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"frames": frames})
 	})
 
+	// A contributor rebuilding its own chain. Same public surface, same
+	// signature-in-the-request rule: the caller proves which address it is, and
+	// the channel id is DERIVED from that address and the recipient rather than
+	// taken on the caller's word.
+	mux.HandleFunc("/mailbox/v1/states", func(w http.ResponseWriter, r *http.Request) {
+		var req mailboxStatesRequest
+		if !readJSON(w, r, &req) {
+			return
+		}
+		recipient, err := ParseAddress(req.Recipient)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad recipient"})
+			return
+		}
+		caller, err := ParseAddress(req.Caller)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad caller"})
+			return
+		}
+		sig, err := ParseAuthorizationSig(req.Sig)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		frames, err := m.StatesFor(recipient, caller, req.Channel,
+			MailboxChallenge(m.NodeID, caller, req.Token), sig)
+		if err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		if frames == nil {
+			frames = []Envelope{}
+		}
+		// NO "highest" FIELD, deliberately. Naming a winner here would make the
+		// volunteer choose which economic state matters, and choosing is the one
+		// thing it must not do. It returns candidates; the caller verifies every
+		// signature itself and selects.
+		writeJSON(w, http.StatusOK, map[string]any{"frames": frames})
+	})
+
+	// The recipient publishing what it ACCEPTED, so the contributor can find out.
+	//
+	// Case A's missing half. Without it a contributor knows only that a
+	// volunteer took its frame, never that the recipient countersigned — so it
+	// has no base for the next tip. The co-signed state IS the evidence; there
+	// is no separate payment record and nothing here to reconcile.
+	mux.HandleFunc("/mailbox/v1/accepted", func(w http.ResponseWriter, r *http.Request) {
+		var req mailboxAcceptedRequest
+		if !readJSON(w, r, &req) {
+			return
+		}
+		recipient, err := ParseAddress(req.Recipient)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad recipient"})
+			return
+		}
+		sig, err := ParseAuthorizationSig(req.Sig)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		// Only the recipient may publish, and only for itself. Not because the
+		// state would be dangerous otherwise — a contributor verifies every
+		// signature before using one — but because an open write here would let
+		// anyone fill a volunteer's disk with states it will never serve.
+		if err := m.PublishAccepted(recipient, req.Channel, req.Envelope,
+			MailboxChallenge(m.NodeID, recipient, req.Token), sig); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"retained": true})
+	})
+
 	return mux
+}
+
+type mailboxAcceptedRequest struct {
+	Recipient string   `json:"recipient"`
+	Channel   string   `json:"channel"`
+	Token     string   `json:"token"`
+	Sig       string   `json:"sig"`
+	Envelope  Envelope `json:"envelope"`
+}
+
+type mailboxStatesRequest struct {
+	Recipient string `json:"recipient"`
+	Caller    string `json:"caller"`
+	Channel   string `json:"channel"`
+	Token     string `json:"token"`
+	Sig       string `json:"sig"`
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, into any) bool {

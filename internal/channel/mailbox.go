@@ -146,14 +146,19 @@ type Mailbox struct {
 	mu    sync.Mutex
 	auth  map[Address]MailboxAuthorization
 	queue map[Address][]Envelope
+	// retained is indexed by CHANNEL, not by recipient, and outlives
+	// collection: a contributor rebuilding its chain needs these after the
+	// recipient has emptied their queue.
+	retained map[string][]Envelope
 }
 
 // NewMailbox builds one. It takes no key, and there is nowhere to put one.
 func NewMailbox(nodeID string, now func() int64) *Mailbox {
 	return &Mailbox{
 		NodeID: nodeID, Now: now,
-		auth:  make(map[Address]MailboxAuthorization),
-		queue: make(map[Address][]Envelope),
+		auth:     make(map[Address]MailboxAuthorization),
+		queue:    make(map[Address][]Envelope),
+		retained: make(map[string][]Envelope),
 	}
 }
 
@@ -237,6 +242,16 @@ func (m *Mailbox) Deliver(recipient Address, env Envelope) error {
 		return ErrMailboxFull
 	}
 	m.queue[recipient] = append(m.queue[recipient], env)
+	// Retained under the same lock, so a frame is never queued-but-unretained.
+	if env.Channel != "" {
+		if m.retained == nil {
+			m.retained = make(map[string][]Envelope)
+		}
+		if len(m.retained[env.Channel]) >= m.depth() {
+			m.retained[env.Channel] = m.retained[env.Channel][1:]
+		}
+		m.retained[env.Channel] = append(m.retained[env.Channel], env)
+	}
 	return nil
 }
 
@@ -295,4 +310,131 @@ func ParseAuthorizationSig(s string) ([]byte, error) {
 		return nil, fmt.Errorf("mailbox: signature must be 65 bytes, got %d", len(raw))
 	}
 	return raw, nil
+}
+
+// ---- retained frames, so a contributor can rebuild its own chain -------------
+//
+// THE PROBLEM THIS SOLVES. A contributor tipping an offline recipient signs
+// state N+1 and hands it to a mailbox. To tip again it needs N+1 to build N+2
+// from — and N+1 exists nowhere else: the recipient never saw it, and it is
+// off-chain by definition. The mailbox is already holding the exact frame.
+//
+// WHAT THE MAILBOX IS TRUSTED FOR HERE: NOTHING.
+// It returns frames verbatim and picks no winner. Every returned frame carries
+// the contributor's OWN signature, so a volunteer that forged or altered one
+// produces something the contributor's own verification rejects. The worst a
+// hostile volunteer can do is withhold, which stalls the next tip and steals
+// nothing.
+//
+// Deliberately NOT "return the highest": that would make the volunteer choose
+// which economic state matters, and choosing is the one thing it must not do.
+// It returns candidates; the contributor verifies and selects.
+
+// Retain keeps a copy of a frame indexed by its channel.
+//
+// Separate from the delivery queue on purpose. Collecting empties the
+// recipient's queue — that is what collection means — but a contributor still
+// needs its own chain afterwards, so retention outlives delivery.
+func (m *Mailbox) Retain(channel string, env Envelope) {
+	if channel == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.retained == nil {
+		m.retained = make(map[string][]Envelope)
+	}
+	if len(m.retained[channel]) >= m.depth() {
+		// Bounded like everything else here. Dropping the OLDEST is right: a
+		// contributor rebuilding its chain needs the newest states, and the
+		// older ones are subsumed by them anyway.
+		m.retained[channel] = m.retained[channel][1:]
+	}
+	m.retained[channel] = append(m.retained[channel], env)
+}
+
+// StatesFor returns the frames retained for one channel, to a caller that
+// proves it is a party to that channel.
+//
+// The access rule is DERIVED, not asserted: a channel id is
+// keccak(sorted(partyA, partyB)), so given the caller's proven address and the
+// recipient this node serves, the id can be recomputed. A caller asking about a
+// channel that does not derive from those two addresses is not a party to it,
+// and no lookup happens. That check is pure derivation — the mailbox still
+// parses no economic state.
+func (m *Mailbox) StatesFor(recipient, caller Address, channel string,
+	challenge [32]byte, proof []byte) ([]Envelope, error) {
+
+	signer, err := RecoverSigner(PersonalDigest(challenge), proof)
+	if err != nil {
+		return nil, fmt.Errorf("mailbox: unreadable proof: %w", err)
+	}
+	if signer != caller {
+		return nil, ErrNotServed
+	}
+	want := DeriveChannelID(caller, recipient)
+	if !strings.EqualFold(strings.TrimPrefix(channel, "0x"),
+		hex.EncodeToString(want[:])) {
+		// Not this caller's channel with this recipient. Same refusal as an
+		// unknown recipient, so nothing is learned by asking.
+		return nil, ErrNotServed
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if a, ok := m.auth[recipient]; !ok || a.Expires <= m.now() {
+		return nil, ErrNotServed
+	}
+	out := make([]Envelope, len(m.retained[channel]))
+	copy(out, m.retained[channel])
+	return out, nil
+}
+
+// Retained reports how many frames are held for a channel. Operator console.
+func (m *Mailbox) Retained(channel string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.retained[channel])
+}
+
+// PublishAccepted records a co-signed state the recipient has accepted.
+//
+// CASE A's MISSING HALF. A contributor that handed a proposal to a volunteer
+// learns nothing more: the reply that would normally carry the countersignature
+// does not exist, because the recipient was not there. So the recipient
+// publishes the result, and the contributor reads it back through the same
+// retained-frames path it already uses.
+//
+// The volunteer verifies NOTHING about the state and is trusted with nothing:
+// the contributor re-derives the digest and checks both signatures before using
+// it as a base. What is checked here is only that the publisher is the
+// recipient this node serves, which bounds who may spend its disk.
+//
+// If this call fails, the recipient must NOT roll back what it accepted. The
+// state is committed in its own store and is real; failing to cache it costs
+// the contributor a discovery, not a payment.
+func (m *Mailbox) PublishAccepted(recipient Address, channel string, env Envelope,
+	challenge [32]byte, proof []byte) error {
+
+	signer, err := RecoverSigner(PersonalDigest(challenge), proof)
+	if err != nil {
+		return fmt.Errorf("mailbox: unreadable proof: %w", err)
+	}
+	if signer != recipient {
+		return ErrNotServed
+	}
+	m.mu.Lock()
+	served := false
+	if a, ok := m.auth[recipient]; ok && a.Expires > m.now() {
+		served = true
+	}
+	m.mu.Unlock()
+	if !served {
+		return ErrNotServed
+	}
+	if channel == "" {
+		return errors.New("mailbox: an accepted state must name its channel")
+	}
+	m.Retain(channel, env)
+	return nil
 }
