@@ -312,3 +312,73 @@ func (f *FakeChain) ReadChannel(_ context.Context, _ Address, id [32]byte) (OnCh
 	}
 	return ch, nil
 }
+
+// canSignSelector is keccak("canSign(address,address,uint8)")[:4].
+//
+// The contract is the ONLY authority on whether a delegation is live, so a node
+// that wants to act as a delegate asks this rather than keeping its own idea of
+// who authorized it. Revocation takes effect the moment the recipient sends it,
+// and a cached answer would be a signature they have already withdrawn.
+var canSignSelector = keccak([]byte("canSign(address,address,uint8)"))[:4]
+
+// CallCanSign reads ChannelManagerV2.canSign(party, signer, op).
+func (r *RPCChainReader) CallCanSign(ctx context.Context, contract, party, signer Address,
+	op uint8) (bool, error) {
+
+	data := "0x" + hex.EncodeToString(canSignSelector) +
+		hex.EncodeToString(leftPad32(party[:])) +
+		hex.EncodeToString(leftPad32(signer[:])) +
+		hex.EncodeToString(leftPad32([]byte{op}))
+
+	body, err := json.Marshal(rpcRequest{
+		JSONRPC: "2.0", ID: 1, Method: "eth_call",
+		Params: []any{map[string]string{"to": contract.Hex(), "data": data}, "latest"},
+	})
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Endpoint, bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := r.Client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("%w: %v", ErrChainUnreachable, err)
+	}
+	defer resp.Body.Close()
+
+	var out rpcResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, fmt.Errorf("%w: %v", ErrChainUnreachable, err)
+	}
+	if out.Error != nil {
+		return false, fmt.Errorf("%w: %s", ErrChainUnreachable, out.Error.Message)
+	}
+	raw, err := hex.DecodeString(trim0x(out.Result))
+	if err != nil || len(raw) != 32 {
+		return false, fmt.Errorf("%w: canSign returned %q", ErrChainUnreachable, out.Result)
+	}
+	// A bool is one word, zero or one. Anything else is not this function, and
+	// answering "false" to a malformed reply would look like a clean refusal
+	// when it is actually a node talking to the wrong contract.
+	switch raw[31] {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	}
+	return false, fmt.Errorf("%w: canSign returned a non-boolean word", ErrChainUnreachable)
+}
+
+// leftPad32 left-pads to one ABI word.
+func leftPad32(b []byte) []byte {
+	out := make([]byte, 32)
+	copy(out[32-len(b):], b)
+	return out
+}

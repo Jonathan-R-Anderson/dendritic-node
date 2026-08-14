@@ -315,6 +315,20 @@ func main() {
 		WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second,
 		MaxHeaderBytes: 32 << 10,
 	}
+	// The payment stack (P15). Started before the dashboard is told about it so
+	// the console never renders a channel panel backed by nothing. A node with
+	// channels switched off gets nil and behaves exactly as before.
+	payments, err := startPaymentStack(cfg, logger)
+	if err != nil {
+		// Fatal on purpose: a node configured to handle money that cannot do so
+		// should refuse to run rather than accept tips that go nowhere.
+		logger.Fatalf("channels: %v", err)
+	}
+	if payments != nil {
+		payments.attachDashboard(uiServer.Handler.(*ui.Server))
+		defer payments.stop(context.Background())
+	}
+
 	// Told where it is bound, so the page decides for itself whether to demand
 	// a password. Wired here, next to the server it belongs to, rather than in
 	// the start-up block further down: the handler must never exist in a state

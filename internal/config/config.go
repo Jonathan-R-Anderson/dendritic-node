@@ -185,6 +185,14 @@ type Config struct {
 	// this feature does not silently start donating cycles.
 	Compute ComputeConfig `json:"compute"`
 
+	// Channels is the payment-channel node: SCPP/1 to strangers, a loopback
+	// operator API, and optionally a volunteer mailbox or delegate signer.
+	//
+	// OFF BY DEFAULT. A node that has not been configured to handle money
+	// should not be listening for it, and the zero value must therefore be
+	// "no payment surface at all" rather than "a payment surface with no key".
+	Channels ChannelsConfig `json:"channels"`
+
 	// Router is the payment-channel routing role: forwarding other people's
 	// payments for a fee. Absent means OFF.
 	Router RouterConfig `json:"router"`
@@ -1285,4 +1293,112 @@ func generatedDashboardPassword() string {
 		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+
+// ChannelsConfig turns this node into a payment-channel node — roadmap P15.
+//
+// WHY THE TWO LISTENERS ARE SEPARATE FIELDS
+// -----------------------------------------
+// They have opposite audiences and the difference is load-bearing:
+//
+//	PeerListen  SCPP/1 for STRANGERS. Unauthenticated by design — a tipper has
+//	            no token and must never be given one — and authorised instead by
+//	            the signature inside every message. Public.
+//
+//	APIListen   the OPERATOR's own API. It can move this node's money and change
+//	            its payout policy, so it is loopback and bearer-token gated. It
+//	            must never be reachable from a web page.
+//
+// One field for both would be one edit away from serving the operator API to
+// the internet, so they are named apart and documented apart.
+type ChannelsConfig struct {
+	// Enabled turns the payment stack on. Everything below is ignored when false.
+	Enabled bool `json:"enabled"`
+
+	// PeerListen is the public SCPP/1 address, e.g. ":8547". Empty disables it,
+	// which makes this node unable to receive tips at all.
+	PeerListen string `json:"peer_listen,omitempty"`
+	// APIListen is the operator API, e.g. "127.0.0.1:8548". Refused below if it
+	// is not loopback.
+	APIListen string `json:"api_listen,omitempty"`
+	// APIToken gates the operator API. Required whenever APIListen is set.
+	APIToken string `json:"api_token,omitempty"`
+
+	// RPC is the execution endpoint used to read channel state and delegations.
+	RPC string `json:"rpc,omitempty"`
+	// Manager is the ChannelManagerV2 address.
+	Manager string `json:"manager,omitempty"`
+	// ChainID guards against a state signed for one deployment being replayed
+	// against another; it is inside every digest.
+	ChainID int64 `json:"chain_id,omitempty"`
+
+	// KeyFile holds this node's channel key, hex, no 0x. Derived from the node
+	// seed under its own domain rather than reusing the payout key — see
+	// internal/channel/keys.go on why one leaked hot key should cost what is in
+	// open channels and not the address earnings accumulate in.
+	KeyFile string `json:"key_file,omitempty"`
+
+	// Mailbox makes this node a VOLUNTEER: it holds frames for recipients who
+	// authorized it, and holds no key for any of them.
+	Mailbox MailboxConfig `json:"mailbox"`
+	// Delegate makes this node an authorized signer for recipients who opted in
+	// on chain. Strictly more powerful than a mailbox, and separate so that
+	// running one can never turn into running the other by accident.
+	Delegate DelegateConfig `json:"delegate"`
+}
+
+// MailboxConfig configures volunteer mailbox service.
+type MailboxConfig struct {
+	Enabled bool `json:"enabled"`
+	// NodeID is what recipients name in their authorizations. An authorization
+	// for another node is refused, so this cannot be used to poach recipients.
+	NodeID string `json:"node_id,omitempty"`
+	// Depth caps undelivered frames per recipient. Zero uses the default.
+	Depth int `json:"depth,omitempty"`
+}
+
+// DelegateConfig configures delegated signing.
+//
+// The node holds a delegate key. It is NOT any recipient's wallet key, it
+// receives nothing, and the contract still pays the channel party.
+type DelegateConfig struct {
+	Enabled bool `json:"enabled"`
+	// KeyFile holds the delegate key, hex. Separate from the channel key: a
+	// delegate acts for other people, and the two roles should not share a
+	// secret.
+	KeyFile string `json:"key_file,omitempty"`
+}
+
+// Validate refuses configurations that would expose the operator API.
+func (c ChannelsConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.APIListen != "" {
+		if c.APIToken == "" {
+			return errors.New("channels.api_token is required whenever channels.api_listen is set")
+		}
+		host, _, err := net.SplitHostPort(c.APIListen)
+		if err != nil {
+			return fmt.Errorf("channels.api_listen is not host:port: %w", err)
+		}
+		// THE CHECK THAT MATTERS. The operator API can move this node's money;
+		// a config typo that put it on 0.0.0.0 would publish that ability.
+		ip := net.ParseIP(strings.Trim(host, "[]"))
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("channels.api_listen must be loopback, got %q — "+
+				"the operator API can move this node's funds", c.APIListen)
+		}
+	}
+	if c.Delegate.Enabled && c.Delegate.KeyFile == "" {
+		return errors.New("channels.delegate.key_file is required when delegation is enabled")
+	}
+	if c.Mailbox.Enabled && c.Mailbox.NodeID == "" {
+		return errors.New("channels.mailbox.node_id is required when the mailbox is enabled")
+	}
+	if c.RPC == "" || c.Manager == "" {
+		return errors.New("channels.rpc and channels.manager are required when channels are enabled")
+	}
+	return nil
 }
