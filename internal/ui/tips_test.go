@@ -9,6 +9,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -318,5 +319,36 @@ func TestAnAlreadyAcceptedTipIsNotOfferedAgain(t *testing.T) {
 	// republishing is harmless.
 	if !strings.Contains(page, `action="/tips/publish"`) {
 		t.Error("an accepted tip cannot be published")
+	}
+}
+
+func TestASupersededTipIsNotReportedAsARefusal(t *testing.T) {
+	// Re-accepting a tip that a later state already includes must not read as
+	// "your node declined this". Observed on a real node: the coordinator
+	// answers a stale proposal with its own current state to resync the peer,
+	// and that leaked to the operator as: unexpected answer "STATE_RESPONSE".
+	f := waitingFake()
+	f.tipOutcome = TipSuperseded
+	f.tipErr = errors.New("your node already holds a newer state for this channel")
+	s := receivingServer(t, f)
+
+	rec := post(t, s, "/tips/accept",
+		url.Values{"csrf": {s.csrf}, "channel": {tipChannel}, "nonce": {"4"}}, "application/json")
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["outcome"] != TipSuperseded {
+		t.Fatalf("outcome was %v", out["outcome"])
+	}
+
+	page := strings.ToLower(render(t, s, "/?tip="+TipSuperseded))
+	if !strings.Contains(page, "already included") {
+		t.Error("the page does not say the tip is already counted")
+	}
+	for _, wrong := range []string{"declined", "state_response", "unexpected answer"} {
+		if strings.Contains(page, wrong) {
+			t.Errorf("a superseded tip is described as %q", wrong)
+		}
 	}
 }

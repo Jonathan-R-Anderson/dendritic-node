@@ -314,6 +314,17 @@ func (p *PaymentNode) AcceptTip(ctx context.Context, id string, nonce uint64) (s
 		}
 		return TipRefused, fmt.Errorf("the node declined this tip (%s)", code)
 	}
+	if reply.Type == channel.MsgStateResponse {
+		// The node answered a stale proposal with its OWN current state — that
+		// is the protocol resyncing a peer, and it means this tip has already
+		// been superseded by a later one. Reported as its own outcome because
+		// "your node already has a newer state" and "your node declined this
+		// tip" call for completely different reactions, and the raw message
+		// type means nothing to the person reading it.
+		return TipSuperseded, errors.New(
+			"your node already holds a newer state for this channel, so this " +
+				"tip has already been included")
+	}
 	if reply.Type != channel.MsgStateAccept {
 		return TipRefused, fmt.Errorf("unexpected answer %q", reply.Type)
 	}

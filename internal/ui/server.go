@@ -701,6 +701,9 @@ site's keys, and rejecting an item deletes its bytes and refuses that content ID
     {{else if eq .TipOutcome "conflict"}}
       Two different tips arrived for the same update number. Nothing was accepted:
       this needs looking at before any of it can be taken.
+    {{else if eq .TipOutcome "superseded"}}
+      That tip is already included. Your node holds a newer state for this
+      channel, which counts it &mdash; nothing was lost and there is nothing to do.
     {{else if eq .TipOutcome "refused"}}
       Your node declined that tip. Nothing was accepted and nothing was lost.
     {{else if eq .TipOutcome "unreachable"}}

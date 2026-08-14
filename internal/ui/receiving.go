@@ -136,6 +136,10 @@ const (
 	// TipConflict: two different states at one update number. I4 — refuse,
 	// never choose.
 	TipConflict = "conflict"
+	// TipSuperseded: a LATER state is already stored, so this proposal is
+	// history. Not a refusal and not a loss — the value it carried is in the
+	// newer state the node already holds.
+	TipSuperseded = "superseded"
 	// TipUnreachable: the volunteer or the node could not be reached. Nothing
 	// is known, and specifically it is NOT "no tips".
 	TipUnreachable = "unreachable"
