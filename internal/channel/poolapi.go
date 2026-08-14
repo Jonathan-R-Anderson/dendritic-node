@@ -24,7 +24,10 @@ package channel
 // support. There is no field to corrupt and no cache to invalidate.
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
+	"math/big"
 	"net/http"
 	"strings"
 )
@@ -147,6 +150,133 @@ func (a *API) pool(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	writeJSON(w, http.StatusOK, out)
+}
+
+// checkpointRequest is what the recipient's dashboard sends.
+//
+// It NAMES a channel and may state an amount. It does not describe the channel's
+// state, and nothing in it is trusted as financial authority — the node reads
+// the co-signed state from its own Store and validates the request against it.
+// There is deliberately no nonce, no balance, no signature and no party field:
+// every one of those is knowable from the Store, and accepting them would let a
+// request assert something the signatures do not support.
+type checkpointRequest struct {
+	Channel string `json:"channel"`
+	// Amount is optional and decimal. Omitted means "everything eligible",
+	// which is what the Withdraw button asks for.
+	Amount string `json:"amount,omitempty"`
+}
+
+type checkpointResponse struct {
+	Outcome string `json:"outcome"`
+	Amount  string `json:"amount"`
+	Nonce   uint64 `json:"nonce"`
+	TxHash  string `json:"tx_hash,omitempty"`
+}
+
+// poolCheckpoint answers POST /v1/pool/checkpoint — withdraw pooled value from
+// one bilateral channel.
+//
+// ONE CHANNEL PER CALL, because a checkpoint is bilateral: the contract takes a
+// single channel id and both parties' signatures. A batching endpoint would be
+// a lie about what the chain does, and the honest cost of non-custodial pooling
+// is N transactions. The dashboard loops; the protocol does not.
+func (a *API) poolCheckpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
+		return
+	}
+
+	var req checkpointRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+
+	id, err := parseBytes32(req.Channel)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad channel id"})
+		return
+	}
+
+	var requested *big.Int
+	if strings.TrimSpace(req.Amount) != "" {
+		parsed, ok := new(big.Int).SetString(strings.TrimSpace(req.Amount), 10)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "amount must be a decimal integer"})
+			return
+		}
+		requested = parsed
+	}
+
+	// Eligibility is decided BEFORE the peer is contacted, from the Store. A
+	// channel this node is not party to, or holds nothing in, never reaches the
+	// network — so a probe cannot use the endpoint to discover who it can talk
+	// to.
+	if _, err := a.coord.CheckpointEligible(id); err != nil {
+		writeErr(w, err)
+		return
+	}
+
+	ch, ok := a.coord.store.Get(id)
+	if !ok {
+		writeErr(w, ErrNoSuchChannel)
+		return
+	}
+	counterparty := ch.PartyB
+	if ch.PartyB == a.coord.self {
+		counterparty = ch.PartyA
+	}
+	var peer Peer
+	if a.peers != nil {
+		peer, err = a.peers(id, counterparty)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
+
+	result, err := a.coord.Checkpoint(r.Context(), id, requested, peer)
+	if err != nil {
+		if result.Outcome == CheckpointUnknown {
+			// NOT AN ERROR THE CALLER MAY RETRY. The contributor may have
+			// signed. 409 rather than 5xx so the dashboard can tell this apart
+			// from a refusal and show its own UNKNOWN state.
+			writeJSON(w, http.StatusConflict, checkpointResponse{
+				Outcome: string(CheckpointUnknown), Amount: "0",
+			})
+			return
+		}
+		writeErr(w, err)
+		return
+	}
+
+	out := checkpointResponse{
+		Outcome: string(result.Outcome),
+		Amount:  decString(result.Amount),
+		Nonce:   result.Nonce,
+	}
+
+	// Broadcasting is separate and may be absent: a node with no chain writer
+	// can still co-sign, and saying so is better than pretending the value has
+	// been paid out.
+	if a.payout == nil {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	txHash, err := a.payout.BroadcastCheckpoint(r.Context(), id)
+	if err != nil {
+		// SIGNED BUT NOT SENT. The state is safe and re-sendable; reporting a
+		// failure here would invite a second withdrawal against a state that
+		// already took the value out.
+		out.Outcome = string(CheckpointUnknown)
+		writeJSON(w, http.StatusConflict, out)
+		return
+	}
+	out.Outcome = string(CheckpointBroadcast)
+	out.TxHash = txHash
 	writeJSON(w, http.StatusOK, out)
 }
 

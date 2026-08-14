@@ -99,6 +99,9 @@ func (a *API) Handler() http.Handler {
 	// The recipient's own pooled-tipping view (P15). Same token, same loopback
 	// surface — a pool is not a new trust domain, so it does not get a new one.
 	mux.HandleFunc("/v1/pool", a.authed(a.pool))
+	// Withdrawing pooled value. Same token; a checkpoint is a financial
+	// operation and gets no weaker a gate than reading the balance.
+	mux.HandleFunc("/v1/pool/checkpoint", a.authed(a.poolCheckpoint))
 	return mux
 }
 
