@@ -170,25 +170,39 @@ func TestLiveMainnetSyncAuthenticatesRealExecutionState(t *testing.T) {
 	}
 
 	// 3. REAL COMMITTEE ROTATION and 4. REAL SIGNATURES.
+	//
+	// These are two claims, and this test used to conflate them: it counted only
+	// rotation updates and, on finding none, declared "the consensus path does not
+	// work". That diagnosis can be flatly wrong, and was.
+	//
+	// A rotation update exists only for a COMPLETED sync committee period. An
+	// operator supplying the current finalised checkpoint — the honest thing to
+	// supply, and the only root the checkpoint providers serve — anchors inside
+	// the current period, and there is no completed period ahead of it to rotate
+	// into. Nothing is broken in that situation; there is simply no rotation to
+	// apply until the period ends, ~27 hours later.
+	//
+	// So the two are counted separately. What must hold is that at least one REAL
+	// sync committee SIGNATURE was verified by our BLS code against the operator's
+	// anchor, whether it arrived on a rotation update or a finality update. Which
+	// of the two it was is reported rather than assumed, so a run that could not
+	// exercise rotation says so instead of quietly claiming it did.
 	period := SyncCommitteePeriod(boot.Header.Slot)
 	updates, err := beacon.Updates(ctx, period, 4)
 	if err != nil {
 		t.Fatalf("updates: %v", err)
 	}
-	applied := 0
+	rotations := 0
 	for i, u := range updates {
 		if err := state.ApplyRotatingUpdate(u, verifier); err != nil {
 			t.Logf("update %d (period %d) refused: %v",
 				i, SyncCommitteePeriod(u.SignatureSlot), err)
 			continue
 		}
-		applied++
+		rotations++
 		t.Logf("update %d applied: finalised slot %d, period %d, %d/%d participation",
 			i, u.FinalizedHeader.Slot, SyncCommitteePeriod(u.SignatureSlot),
 			u.Participation.Count(), SyncCommitteeSize)
-	}
-	if applied == 0 {
-		t.Fatal("no real sync committee update authenticated — the consensus path does not work")
 	}
 
 	// 5. REAL FINALITY.
@@ -196,9 +210,26 @@ func TestLiveMainnetSyncAuthenticatesRealExecutionState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("finality update: %v", err)
 	}
+	anchoredAt := state.FinalizedHeader.Slot
+	finalityApplied := false
 	if err := state.ApplyFinalityUpdate(final, verifier); err != nil {
 		t.Logf("finality update refused (may be several periods ahead): %v", err)
+	} else {
+		finalityApplied = true
+		t.Logf("finality update applied: attested slot %d, finalised slot %d, "+
+			"signature slot %d, %d/%d participation",
+			final.AttestedHeader.Slot, final.FinalizedHeader.Slot, final.SignatureSlot,
+			final.Participation.Count(), SyncCommitteeSize)
 	}
+
+	// THE ASSERTION. Not "a rotation happened" — "a real committee signed real
+	// mainnet data and our verifier checked it against an anchor the provider
+	// could not choose".
+	if rotations == 0 && !finalityApplied {
+		t.Fatal("no real sync committee signature authenticated by either path — " +
+			"the consensus implementation does not verify mainnet")
+	}
+
 	level, err := state.TrustLevelOf(state.FinalizedHeader)
 	if err != nil {
 		t.Fatalf("TrustLevelOf: %v", err)
@@ -212,18 +243,47 @@ func TestLiveMainnetSyncAuthenticatesRealExecutionState(t *testing.T) {
 	// beacon API carries on Capella+ light client headers. Recorded as the
 	// remaining step rather than asserted, because a run that cannot reach it
 	// has still established 1-5 and should say exactly that.
-	t.Logf("REACHED: committee validated, %d updates authenticated, finality established", applied)
+	t.Logf("REACHED: chain identity, %d real committee keys validated, "+
+		"%d rotation update(s) applied, finality update applied: %v, finality established",
+		len(boot.CurrentSyncCommittee.Pubkeys), rotations, finalityApplied)
+
+	// The boundaries of THIS run, stated. A reader of the log should never have to
+	// infer what was not covered.
+	if rotations == 0 {
+		t.Logf("NOT EXERCISED: committee rotation across a period boundary. The anchor "+
+			"is at slot %d, inside period %d, which has not completed; no rotation "+
+			"update exists ahead of it. Rotation is exercised only by an anchor at "+
+			"least one full period (%d slots) behind the head.",
+			boot.Header.Slot, period, SlotsPerSyncCommitteePeriod)
+	}
+	if state.FinalizedHeader.Slot == anchoredAt {
+		t.Logf("NOT EXERCISED: head advancement. The anchor was already the finalised "+
+			"head at slot %d, so the verified finality update carried it no further. "+
+			"The signature was checked; the head simply had nowhere to move.", anchoredAt)
+	}
 	t.Log("REMAINING: execution payload bridge + storage proof cross-check (steps 6-7)")
 
-	// Capture whatever was established, as a permanent fixture.
+	// Capture whatever was established, as a permanent fixture. It records what
+	// was NOT exercised alongside what was — a fixture that reports only its
+	// successes is how an unproven step becomes a proven one by attrition.
 	if dir := os.Getenv("FIXTURE_OUT"); dir != "" {
 		blob, err := json.MarshalIndent(map[string]any{
-			"checkpoint_root":    checkpointRoot,
-			"bootstrap_slot":     boot.Header.Slot,
-			"updates_applied":    applied,
-			"finalized_slot":     state.FinalizedHeader.Slot,
-			"committee_root":     hex.EncodeToString(committeeRoot[:]),
-			"genesis_validators": genesis.GenesisValidatorsRoot,
+			"checkpoint_root":       checkpointRoot,
+			"checkpoint_source":     "operator-supplied, independent of BEACON_API_URL",
+			"beacon_provider":       providerOf(os.Getenv("BEACON_API_URL")),
+			"execution_provider":    providerOf(os.Getenv("ETH_RPC_URL")),
+			"bootstrap_slot":        boot.Header.Slot,
+			"bootstrap_period":      period,
+			"committee_keys":        len(boot.CurrentSyncCommittee.Pubkeys),
+			"rotations_applied":     rotations,
+			"finality_applied":      finalityApplied,
+			"finality_participants": final.Participation.Count(),
+			"committee_size":        SyncCommitteeSize,
+			"finalized_slot":        state.FinalizedHeader.Slot,
+			"head_advanced_slots":   state.FinalizedHeader.Slot - anchoredAt,
+			"rotation_exercised":    rotations > 0,
+			"committee_root":        hex.EncodeToString(committeeRoot[:]),
+			"genesis_validators":    genesis.GenesisValidatorsRoot,
 		}, "", "  ")
 		if err == nil {
 			_ = os.WriteFile(dir+"/live-mainnet-summary.json", blob, 0o644)

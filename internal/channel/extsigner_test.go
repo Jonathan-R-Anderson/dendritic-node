@@ -256,16 +256,26 @@ func TestNoGuardMeansUnlimitedAndThatIsDeliberate(t *testing.T) {
 
 func TestVerifyRefusesAnIncompleteConfiguration(t *testing.T) {
 	addr, _ := ParseAddress(treasury)
+	// Built by a function rather than held as a value: ExternalSigner carries a
+	// mutex, and ranging over a slice of them would copy it.
 	for _, tc := range []struct {
 		name string
-		s    ExternalSigner
+		make func() *ExternalSigner
 	}{
-		{"no signer endpoint", ExternalSigner{NodeURL: "http://x", From: addr, ChainID: big.NewInt(1)}},
-		{"no node endpoint", ExternalSigner{SignerURL: "http://x", From: addr, ChainID: big.NewInt(1)}},
-		{"no chain id", ExternalSigner{SignerURL: "http://x", NodeURL: "http://y", From: addr}},
-		{"no address", ExternalSigner{SignerURL: "http://x", NodeURL: "http://y", ChainID: big.NewInt(1)}},
+		{"no signer endpoint", func() *ExternalSigner {
+			return &ExternalSigner{NodeURL: "http://x", From: addr, ChainID: big.NewInt(1)}
+		}},
+		{"no node endpoint", func() *ExternalSigner {
+			return &ExternalSigner{SignerURL: "http://x", From: addr, ChainID: big.NewInt(1)}
+		}},
+		{"no chain id", func() *ExternalSigner {
+			return &ExternalSigner{SignerURL: "http://x", NodeURL: "http://y", From: addr}
+		}},
+		{"no address", func() *ExternalSigner {
+			return &ExternalSigner{SignerURL: "http://x", NodeURL: "http://y", ChainID: big.NewInt(1)}
+		}},
 	} {
-		if err := tc.s.Verify(context.Background()); err == nil {
+		if err := tc.make().Verify(context.Background()); err == nil {
 			t.Errorf("%s was accepted", tc.name)
 		}
 	}
