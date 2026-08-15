@@ -328,3 +328,101 @@ func hexBytes(b []byte) string {
 	}
 	return string(out)
 }
+
+// ---- confirmation ------------------------------------------------------------
+//
+// TxSender.Send returns a hash, which is all settlement needs: a payout either
+// lands or is retried, and the timing is nobody's evidence. Measurement needs
+// more — how long it took, how many blocks passed, and what the fee market
+// looked like at broadcast — so the pipeline continues here rather than
+// widening the interface every caller already depends on.
+
+// SendReceipt is what a measurement needs and settlement does not.
+type SendReceipt struct {
+	TxHash string
+	Nonce  uint64
+	// BaseFeeGwei is the market at BROADCAST, not at inclusion. It records which
+	// regime the sample came from; reading it afterwards would describe the
+	// block that happened to include it instead.
+	BaseFeeGwei float64
+	// BroadcastAt and SentBlock are the starting line, taken before the
+	// transaction was sent.
+	BroadcastAt time.Time
+	SentBlock   uint64
+}
+
+// SendMeasured broadcasts and reports everything the evidence needs.
+//
+// Same pipeline as Send — it IS Send, with the intermediate values kept instead
+// of discarded.
+func (s *ExternalSigner) SendMeasured(ctx context.Context, to Address, data []byte) (SendReceipt, error) {
+	s.mu.Lock()
+	verified := s.verified
+	s.mu.Unlock()
+	if !verified {
+		return SendReceipt{}, ErrUnverified
+	}
+
+	nonce, err := s.hexUint(ctx, "eth_getTransactionCount", []any{s.From.Hex(), "pending"})
+	if err != nil {
+		return SendReceipt{}, fmt.Errorf("signer: nonce: %w", err)
+	}
+	head, err := s.hexUint(ctx, "eth_blockNumber", nil)
+	if err != nil {
+		return SendReceipt{}, fmt.Errorf("signer: head: %w", err)
+	}
+	baseFee, err := s.baseFee(ctx)
+	if err != nil {
+		return SendReceipt{}, fmt.Errorf("signer: base fee: %w", err)
+	}
+
+	hash, err := s.Send(ctx, to, data)
+	if err != nil {
+		return SendReceipt{}, err
+	}
+	// Gwei as a float purely for the Method string. Never used for arithmetic
+	// that decides anything — wei stays integral everywhere it matters.
+	gwei, _ := new(big.Float).Quo(new(big.Float).SetInt(baseFee), big.NewFloat(1e9)).Float64()
+	return SendReceipt{
+		TxHash: hash, Nonce: nonce, BaseFeeGwei: gwei,
+		BroadcastAt: time.Now(), SentBlock: head,
+	}, nil
+}
+
+// AwaitInclusion waits for a receipt and reports the sample.
+//
+// RETURNS AN UNCONFIRMED SAMPLE RATHER THAN AN ERROR when the deadline passes.
+// That is deliberate and it matters: InclusionObservation.AsEvidence refuses a
+// run containing an abandoned transaction, because the worst case of a run with
+// an unconfirmed transaction is UNKNOWN, not the slowest one that landed.
+// Dropping the sample here would hide exactly the observation the worst case is
+// made of.
+func (s *ExternalSigner) AwaitInclusion(ctx context.Context, r SendReceipt, poll time.Duration) InclusionSample {
+	sample := InclusionSample{TxHash: r.TxHash, BaseFeeGwei: r.BaseFeeGwei}
+	if poll <= 0 {
+		poll = 4 * time.Second
+	}
+	for {
+		var receipt *struct {
+			BlockNumber string `json:"blockNumber"`
+		}
+		if err := s.call(ctx, s.NodeURL, "eth_getTransactionReceipt",
+			[]any{r.TxHash}, &receipt); err == nil && receipt != nil && receipt.BlockNumber != "" {
+
+			if got, ok := new(big.Int).SetString(strings.TrimPrefix(receipt.BlockNumber, "0x"), 16); ok {
+				sample.Confirmed = true
+				sample.Delay = time.Since(r.BroadcastAt)
+				if b := got.Uint64(); b > r.SentBlock {
+					sample.BlocksWaited = b - r.SentBlock
+				}
+				return sample
+			}
+		}
+		select {
+		case <-ctx.Done():
+			// Unconfirmed, and said so. The caller files it as-is.
+			return sample
+		case <-time.After(poll):
+		}
+	}
+}

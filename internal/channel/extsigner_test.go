@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 var _ TxSender = (*ExternalSigner)(nil)
@@ -299,3 +300,75 @@ var errRefused = &refusal{}
 type refusal struct{}
 
 func (*refusal) Error() string { return "over the ceiling" }
+
+// ---- confirmation ------------------------------------------------------------
+
+func TestAwaitInclusionReportsAConfirmedSample(t *testing.T) {
+	s, _, node := wired(t)
+	node.answers["eth_blockNumber"] = "0x64" // 100
+	node.answers["eth_getTransactionReceipt"] = map[string]any{"blockNumber": "0x67"} // 103
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	to, _ := ParseAddress(treasury)
+	r, err := s.SendMeasured(context.Background(), to, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Nonce != 7 {
+		t.Errorf("nonce %d, want 7", r.Nonce)
+	}
+	if r.BaseFeeGwei != 1 {
+		t.Errorf("base fee %v gwei, want 1", r.BaseFeeGwei)
+	}
+	sample := s.AwaitInclusion(context.Background(), r, time.Millisecond)
+	if !sample.Confirmed {
+		t.Fatal("a mined transaction was reported unconfirmed")
+	}
+	if sample.BlocksWaited != 3 {
+		t.Errorf("blocks waited %d, want 3", sample.BlocksWaited)
+	}
+	if sample.Delay <= 0 {
+		t.Error("no delay recorded")
+	}
+}
+
+func TestAnAbandonedTransactionIsReportedNotDropped(t *testing.T) {
+	// The sample that decides whether the whole run is admissible. Dropping it
+	// would leave a run whose worst case is unknown looking like a clean one —
+	// AsEvidence refuses precisely this, and can only refuse what it is told.
+	s, _, node := wired(t)
+	node.answers["eth_blockNumber"] = "0x64"
+	node.answers["eth_getTransactionReceipt"] = nil // never mined
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	to, _ := ParseAddress(treasury)
+	r, err := s.SendMeasured(context.Background(), to, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	sample := s.AwaitInclusion(ctx, r, time.Millisecond)
+
+	if sample.Confirmed {
+		t.Fatal("an unmined transaction was reported as confirmed")
+	}
+	if sample.TxHash != r.TxHash {
+		t.Error("the abandoned sample lost its hash, so it cannot be investigated")
+	}
+	// And the evidence layer must refuse a run containing it.
+	obs := InclusionObservation{Samples: []InclusionSample{sample}, Account: treasury}
+	if _, err := obs.AsEvidence(1, time.Now().Unix()); err == nil {
+		t.Fatal("a run with an abandoned transaction produced evidence")
+	}
+}
+
+func TestSendMeasuredRefusesBeforeVerification(t *testing.T) {
+	s, _, _ := wired(t)
+	to, _ := ParseAddress(treasury)
+	if _, err := s.SendMeasured(context.Background(), to, nil); err != ErrUnverified {
+		t.Fatalf("got %v, want ErrUnverified", err)
+	}
+}
