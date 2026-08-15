@@ -70,6 +70,20 @@ type ExternalSigner struct {
 	// is why the measurement runners must supply one — see SpendGuard.
 	Guard SpendGuard
 
+	// Dialect selects the signer's JSON-RPC vocabulary.
+	//
+	// Clef and Web3Signer do the same job through different namespaces, and
+	// neither implements the other's — Web3Signer's documentation names clef's
+	// methods explicitly as NOT supported, so this is a real protocol
+	// difference rather than an alias:
+	//
+	//	clef        account_list   account_signTransaction
+	//	web3signer  eth_accounts   eth_signTransaction
+	//
+	// The zero value is clef, so every existing caller and test keeps the
+	// behaviour it already had.
+	Dialect SignerDialect
+
 	mu       sync.Mutex
 	verified bool
 }
@@ -84,6 +98,30 @@ type SpendGuard interface {
 	// Authorise is called with the gas cost this transaction may incur, before
 	// anything is signed or sent. Returning an error stops the transaction.
 	Authorise(maxCostWei *big.Int) error
+}
+
+// SignerDialect names an external signer's JSON-RPC vocabulary.
+type SignerDialect int
+
+const (
+	// DialectClef is the default: account_list / account_signTransaction.
+	DialectClef SignerDialect = iota
+	// DialectWeb3Signer is eth_accounts / eth_signTransaction.
+	DialectWeb3Signer
+)
+
+func (d SignerDialect) listMethod() string {
+	if d == DialectWeb3Signer {
+		return "eth_accounts"
+	}
+	return "account_list"
+}
+
+func (d SignerDialect) signMethod() string {
+	if d == DialectWeb3Signer {
+		return "eth_signTransaction"
+	}
+	return "account_signTransaction"
 }
 
 // ErrUnverified is returned by Send when Verify has not run or did not pass.
@@ -109,7 +147,7 @@ func (s *ExternalSigner) Verify(ctx context.Context) error {
 	// 1. The signer's own account list. This is the proof: the key holder says
 	//    which addresses it can sign for, and we check ours is among them.
 	var accounts []string
-	if err := s.call(ctx, s.SignerURL, "account_list", nil, &accounts); err != nil {
+	if err := s.call(ctx, s.SignerURL, s.Dialect.listMethod(), nil, &accounts); err != nil {
 		return fmt.Errorf("signer: could not list accounts: %w", err)
 	}
 	want := strings.ToLower(s.From.Hex())
@@ -211,15 +249,32 @@ func (s *ExternalSigner) Send(ctx context.Context, to Address, data []byte) (str
 		"value": "0x0", "data": "0x" + hexBytes(data),
 		"chainId": hexBig(s.ChainID),
 	}
-	var signed struct {
-		Raw string `json:"raw"`
-	}
-	if err := s.call(ctx, s.SignerURL, "account_signTransaction", []any{tx}, &signed); err != nil {
+	// The response shapes differ as much as the method names do: clef wraps the
+	// signed transaction in an object, Web3Signer returns the RLP hex directly.
+	// Decoded into a RawMessage first so one dialect's branch cannot silently
+	// accept the other's shape and hand back an empty string.
+	var reply json.RawMessage
+	if err := s.call(ctx, s.SignerURL, s.Dialect.signMethod(), []any{tx}, &reply); err != nil {
 		return "", fmt.Errorf("signer: signing refused: %w", err)
 	}
-	if signed.Raw == "" {
+	var raw string
+	if s.Dialect == DialectWeb3Signer {
+		if err := json.Unmarshal(reply, &raw); err != nil {
+			return "", fmt.Errorf("signer: unreadable signed transaction: %w", err)
+		}
+	} else {
+		var wrapped struct {
+			Raw string `json:"raw"`
+		}
+		if err := json.Unmarshal(reply, &wrapped); err != nil {
+			return "", fmt.Errorf("signer: unreadable signed transaction: %w", err)
+		}
+		raw = wrapped.Raw
+	}
+	if strings.TrimSpace(raw) == "" || raw == "0x" {
 		return "", fmt.Errorf("signer: returned no signed transaction")
 	}
+	signed := struct{ Raw string }{Raw: raw}
 
 	var hash string
 	if err := s.call(ctx, s.NodeURL, "eth_sendRawTransaction", []any{signed.Raw}, &hash); err != nil {

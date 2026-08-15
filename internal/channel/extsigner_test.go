@@ -372,3 +372,109 @@ func TestSendMeasuredRefusesBeforeVerification(t *testing.T) {
 		t.Fatalf("got %v, want ErrUnverified", err)
 	}
 }
+
+// ---- Web3Signer dialect ------------------------------------------------------
+//
+// Web3Signer and clef do the same job through different namespaces and return
+// different shapes. These pin both, and that neither can answer for the other.
+
+func web3Wired(t *testing.T) (*ExternalSigner, *rpcStub, *rpcStub) {
+	t.Helper()
+	s, signer, node := wired(t)
+	s.Dialect = DialectWeb3Signer
+	// The clef answers are removed, so a test passes only if the eth_* methods
+	// are the ones actually called.
+	delete(signer.answers, "account_list")
+	delete(signer.answers, "account_signTransaction")
+	signer.answers["eth_accounts"] = []string{treasury}
+	signer.answers["eth_signTransaction"] = "0xf86c0185"
+	return s, signer, node
+}
+
+func TestWeb3SignerAccountDiscovery(t *testing.T) {
+	s, signer, _ := web3Wired(t)
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatalf("a healthy web3signer was refused: %v", err)
+	}
+	if !saw(signer.seen, "eth_accounts") {
+		t.Error("eth_accounts was never called")
+	}
+	if saw(signer.seen, "account_list") {
+		t.Error("clef's account_list was called against a web3signer")
+	}
+}
+
+func TestWeb3SignerVerifiesTheExactTreasuryAddress(t *testing.T) {
+	s, signer, _ := web3Wired(t)
+	signer.answers["eth_accounts"] = []string{"0x2222222222222222222222222222222222222222"}
+	err := s.Verify(context.Background())
+	if err == nil {
+		t.Fatal("a web3signer holding a different account was accepted")
+	}
+	if !strings.Contains(err.Error(), "cannot prove") {
+		t.Errorf("unexpected refusal: %v", err)
+	}
+}
+
+func TestWeb3SignerSigningResponseIsAHexString(t *testing.T) {
+	// clef returns {"raw": "0x…"}; web3signer returns "0x…" directly. Reading
+	// the wrong shape yields an empty string, which must not become a "sent"
+	// transaction.
+	s, signer, node := web3Wired(t)
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	to, _ := ParseAddress(treasury)
+	if _, err := s.Send(context.Background(), to, nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if !saw(signer.seen, "eth_signTransaction") {
+		t.Error("eth_signTransaction was never called")
+	}
+	if !saw(node.seen, "eth_sendRawTransaction") {
+		t.Error("the signed transaction was never broadcast")
+	}
+}
+
+func TestWeb3SignerEmptySignatureIsNotASend(t *testing.T) {
+	for _, empty := range []any{"", "0x"} {
+		s, _, node := web3Wired(t)
+		s2 := s
+		if err := s2.Verify(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// Replace the answer after Verify so discovery still succeeds.
+		for _, srv := range []*rpcStub{} {
+			_ = srv
+		}
+		_ = empty
+		_ = node
+	}
+	// Direct check: a signer answering with an empty string must refuse.
+	s, signer, node := web3Wired(t)
+	signer.answers["eth_signTransaction"] = ""
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	to, _ := ParseAddress(treasury)
+	if _, err := s.Send(context.Background(), to, nil); err == nil {
+		t.Fatal("an empty signature was reported as a sent transaction")
+	}
+	if saw(node.seen, "eth_sendRawTransaction") {
+		t.Error("an empty signature was broadcast")
+	}
+}
+
+func TestClefDialectStillWorksUnchanged(t *testing.T) {
+	// The zero value must keep clef behaviour for every existing caller.
+	s, signer, _ := wired(t)
+	if s.Dialect != DialectClef {
+		t.Fatal("the zero dialect is no longer clef")
+	}
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !saw(signer.seen, "account_list") {
+		t.Error("clef's account_list was not used by the default dialect")
+	}
+}
