@@ -53,6 +53,8 @@ type reorgEvent struct {
 
 func main() {
 	events := flag.String("events", "", "path to the reorg observer's events.jsonl")
+	inclusion := flag.String("inclusion", "", "path to a recorded mainnet inclusion run")
+	repricing := flag.String("repricing", "", "path to a recorded mainnet repricing campaign")
 	file := flag.Bool("file", false, "actually record the evidence (default: dry run)")
 	flag.Parse()
 
@@ -110,7 +112,42 @@ func main() {
 		AtChannels: envelope.Channels,
 	}
 
+	// The two runs that were already measured against mainnet. Optional flags,
+	// because a caller may want to file only what it has — but the gate lists
+	// them either way, so omitting one is visible rather than silent.
+	extra := map[string]channel.Evidence{}
+	if *inclusion != "" {
+		run, err := readInclusion(*inclusion)
+		if err != nil {
+			fail("inclusion fixture: %v", err)
+		}
+		ev, err := run.AsEvidence(mainnet, now)
+		if err != nil {
+			fail("inclusion evidence: %v", err)
+		}
+		extra["inclusion"] = ev
+	}
+	if *repricing != "" {
+		run, err := readRepricing(*repricing)
+		if err != nil {
+			fail("repricing fixture: %v", err)
+		}
+		ev, err := run.AsEvidence(mainnet, now)
+		if err != nil {
+			fail("repricing evidence: %v", err)
+		}
+		extra["repricing"] = ev
+	}
+
 	report(obs, reorgEv, outageEv, envelope)
+	for _, name := range []string{"inclusion", "repricing"} {
+		if ev, ok := extra[name]; ok {
+			fmt.Printf("\n== %s, from a recorded mainnet run\n", name)
+			fmt.Printf("  measured         %v (budget %v)\n", ev.Measured, budgetFor(name))
+			fmt.Printf("  samples          %d\n", ev.Samples)
+			fmt.Printf("  method           %s\n", ev.Method)
+		}
+	}
 
 	if !*file {
 		fmt.Println("\nDRY RUN — nothing was recorded. Re-run with -file to record.")
@@ -118,7 +155,13 @@ func main() {
 		return
 	}
 
-	for _, e := range []channel.Evidence{reorgEv, outageEv} {
+	filing := []channel.Evidence{reorgEv, outageEv}
+	for _, name := range []string{"inclusion", "repricing"} {
+		if ev, ok := extra[name]; ok {
+			filing = append(filing, ev)
+		}
+	}
+	for _, e := range filing {
 		if err := v.Record(e); err != nil {
 			fail("recording %q: %v", e.Term, err)
 		}
@@ -235,4 +278,17 @@ func report(o channel.ReorgObservation, reorgEv, outageEv channel.Evidence, env 
 func fail(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "p12-evidence: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// budgetFor is the term's budgeted value, for the report. Read from the budget
+// rather than restated, so the printout cannot drift from what validation uses.
+func budgetFor(term string) time.Duration {
+	b := channel.MainnetChallengeBudget()
+	switch term {
+	case "inclusion":
+		return b.Inclusion
+	case "repricing":
+		return b.Repricing
+	}
+	return 0
 }
