@@ -121,10 +121,29 @@ func TestLiveMainnetSyncAuthenticatesRealExecutionState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("genesis: %v", err)
 	}
-	forkVersion, err := hex.DecodeString(strings.TrimPrefix(genesis.GenesisForkVersion, "0x"))
-	if err != nil || len(forkVersion) != 4 {
-		t.Fatalf("fork version %q: %v", genesis.GenesisForkVersion, err)
-	}
+	// THE FORK VERSION OF THE SIGNING DOMAIN, NOT OF GENESIS.
+	//
+	// This harness used to decode genesis_fork_version from the beacon API,
+	// which on mainnet is 0x00000000 — and Checkpoint.Valid() rejects a zero
+	// fork version, correctly, because a zero here means the signing domain is
+	// undefined. The two are different quantities that happen to share a name:
+	//
+	//	genesis_fork_version   chain identity at slot 0 (mainnet: all zeros)
+	//	Checkpoint.ForkVersion the domain a sync-committee signature is checked
+	//	                       against, which after Altair is NOT the genesis one
+	//
+	// checkpoint.go says so directly — "GenesisValidatorsRoot and ForkVersion
+	// define the signing domain" — and lightclient.go already derives it the
+	// right way when it verifies an update:
+	//
+	//	era.ForkVersion = ForkVersionAtSlot(u.SignatureSlot)
+	//
+	// So the anchor is sealed with the same function, at the bootstrap header's
+	// slot. Relaxing Valid() to accept zero would have made mainnet's genesis
+	// value indistinguishable from an uninitialised checkpoint and let a
+	// signature be checked against an undefined domain.
+	forkVersion := ForkVersionAtSlot(boot.Header.Slot)
+	_ = genesis
 
 	committeeRoot, err := boot.CurrentSyncCommittee.HashTreeRoot()
 	if err != nil {
@@ -139,7 +158,7 @@ func TestLiveMainnetSyncAuthenticatesRealExecutionState(t *testing.T) {
 	if root, err := decodeHex32(checkpointRoot); err == nil {
 		cp.BlockRoot = root
 	}
-	copy(cp.ForkVersion[:], forkVersion)
+	cp.ForkVersion = forkVersion
 
 	state := &LightClientState{
 		Spec: SpecAltair, Checkpoint: cp,
