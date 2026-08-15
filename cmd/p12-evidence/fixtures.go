@@ -139,3 +139,74 @@ func readJSON(path string, into any) error {
 	}
 	return nil
 }
+
+// ---- failover and detection --------------------------------------------------
+
+type failoverFixture struct {
+	ChainID   int64  `json:"chain_id"`
+	Rounds    int    `json:"rounds"`
+	Attested  string `json:"attested"`
+	Worst     string `json:"worst_failover"`
+	AllFailed int    `json:"all_failed"`
+	Endpoints []struct {
+		Endpoint string `json:"endpoint"`
+		Attempts int    `json:"attempts"`
+		Failures int    `json:"failures"`
+	} `json:"endpoints"`
+}
+
+type detectionFixture struct {
+	ChainID   int64  `json:"chain_id"`
+	Channels  int    `json:"channels_per_watchtower"`
+	Worst     string `json:"worst_sweep"`
+	Samples   int    `json:"samples"`
+	Method    string `json:"method"`
+}
+
+// readFailover rebuilds the observation so AsEvidence applies its own guards —
+// two endpoints, independent providers, an attestation, no all-failed round,
+// and a primary that actually failed. Reconstructing rather than trusting the
+// fixture's stored verdict means the refusals still run.
+func readFailover(path string) (channel.FailoverObservation, string, error) {
+	var f failoverFixture
+	if err := readJSON(path, &f); err != nil {
+		return channel.FailoverObservation{}, "", err
+	}
+	if f.ChainID != mainnet {
+		return channel.FailoverObservation{}, "", fmt.Errorf(
+			"failover fixture is chain %d, not mainnet", f.ChainID)
+	}
+	worst, err := time.ParseDuration(f.Worst)
+	if err != nil {
+		return channel.FailoverObservation{}, "", fmt.Errorf("worst failover %q: %w", f.Worst, err)
+	}
+	obs := channel.FailoverObservation{WorstFailover: worst, AllFailed: f.AllFailed}
+	for _, e := range f.Endpoints {
+		obs.Endpoints = append(obs.Endpoints, channel.EndpointHealth{
+			Endpoint: e.Endpoint, Attempts: e.Attempts, Failures: e.Failures,
+		})
+	}
+	return obs, f.Attested, nil
+}
+
+// readDetection builds the evidence directly: there is no DetectionObservation
+// type, so the harness records the fields Record() needs and this hands them
+// over unchanged. AtChannels is what Record() checks against the envelope.
+func readDetection(path string, now int64) (channel.Evidence, error) {
+	var f detectionFixture
+	if err := readJSON(path, &f); err != nil {
+		return channel.Evidence{}, err
+	}
+	if f.ChainID != mainnet {
+		return channel.Evidence{}, fmt.Errorf("detection fixture is chain %d, not mainnet", f.ChainID)
+	}
+	worst, err := time.ParseDuration(f.Worst)
+	if err != nil {
+		return channel.Evidence{}, fmt.Errorf("worst sweep %q: %w", f.Worst, err)
+	}
+	return channel.Evidence{
+		Term: "detection", Measured: worst, Samples: f.Samples,
+		ChainID: mainnet, Method: f.Method, TakenAt: now,
+		AtChannels: f.Channels,
+	}, nil
+}

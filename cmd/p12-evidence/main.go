@@ -55,6 +55,10 @@ func main() {
 	events := flag.String("events", "", "path to the reorg observer's events.jsonl")
 	inclusion := flag.String("inclusion", "", "path to a recorded mainnet inclusion run")
 	repricing := flag.String("repricing", "", "path to a recorded mainnet repricing campaign")
+	failover := flag.String("failover", "", "path to a recorded failover run")
+	detection := flag.String("detection", "", "path to a recorded detection measurement")
+	anchor := flag.String("anchor", "", "the independently-obtained beacon block root that anchored canonicality")
+	impl := flag.String("impl", "", "what verified canonicality, e.g. \"native sync committee verifier\"")
 	file := flag.Bool("file", false, "actually record the evidence (default: dry run)")
 	flag.Parse()
 
@@ -139,10 +143,47 @@ func main() {
 		extra["repricing"] = ev
 	}
 
+	if *failover != "" {
+		run, attested, err := readFailover(*failover)
+		if err != nil {
+			fail("failover fixture: %v", err)
+		}
+		ev, err := run.AsEvidence(mainnet, now, attested)
+		if err != nil {
+			fail("failover evidence: %v", err)
+		}
+		extra["rpc failure"] = ev
+	}
+	if *detection != "" {
+		ev, err := readDetection(*detection, now)
+		if err != nil {
+			fail("detection fixture: %v", err)
+		}
+		extra["detection"] = ev
+	}
+
+	// CANONICALITY. Declared by the operator, never by this tool on its own —
+	// both values must be supplied, and they are the ones the successful live
+	// verification actually used.
+	if *anchor != "" || *impl != "" {
+		if *anchor == "" || *impl == "" {
+			fail("canonicality needs BOTH -impl and -anchor; a verifier without a " +
+				"stated trust anchor is not verification")
+		}
+		v.Headers = channel.HeaderTrust{
+			Status:         channel.CanonicalityVerified,
+			Implementation: *impl,
+			Anchor:         *anchor,
+		}
+		if err := v.Headers.Check(); err != nil {
+			fail("canonicality: %v", err)
+		}
+	}
+
 	report(obs, reorgEv, outageEv, envelope)
-	for _, name := range []string{"inclusion", "repricing"} {
+	for _, name := range []string{"inclusion", "repricing", "rpc failure", "detection"} {
 		if ev, ok := extra[name]; ok {
-			fmt.Printf("\n== %s, from a recorded mainnet run\n", name)
+			fmt.Printf("\n== %s, from a recorded run\n", name)
 			fmt.Printf("  measured         %v (budget %v)\n", ev.Measured, budgetFor(name))
 			fmt.Printf("  samples          %d\n", ev.Samples)
 			fmt.Printf("  method           %s\n", ev.Method)
@@ -156,7 +197,7 @@ func main() {
 	}
 
 	filing := []channel.Evidence{reorgEv, outageEv}
-	for _, name := range []string{"inclusion", "repricing"} {
+	for _, name := range []string{"inclusion", "repricing", "rpc failure", "detection"} {
 		if ev, ok := extra[name]; ok {
 			filing = append(filing, ev)
 		}
@@ -289,6 +330,10 @@ func budgetFor(term string) time.Duration {
 		return b.Inclusion
 	case "repricing":
 		return b.Repricing
+	case "rpc failure":
+		return b.RPCFailure
+	case "detection":
+		return b.Detection
 	}
 	return 0
 }
