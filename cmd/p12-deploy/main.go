@@ -22,7 +22,7 @@ import (
 const (
 	mainnetChainID  = 1
 	treasuryAddr    = "0xE36e04b6Df20C00479005ba23233F67192f38421"
-	anonToken       = "0x3ee18868078962f430A4Da5E827E8Cfc8b4066ac"
+	axonToken       = "0x3ee18868078962f430A4Da5E827E8Cfc8b4066ac"
 	challengePeriod = 28800
 )
 
@@ -55,7 +55,7 @@ func main() {
 	fmt.Printf("  chain id       %d  VERIFIED (checked against the node)\n", mainnetChainID)
 
 	fmt.Println("\n== constructor")
-	token, err := channel.ParseAddress(anonToken)
+	token, err := channel.ParseAddress(axonToken)
 	if err != nil {
 		fail("token address: %v", err)
 	}

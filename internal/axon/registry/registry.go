@@ -3,7 +3,7 @@
 // §12.4a so they can be tested before any contract is deployed.
 //
 // NOTHING HERE TALKS TO A CHAIN. The registry, the registrar and the token are
-// undeployed -- AnonToken.sol is written, the registry is not written at all --
+// undeployed -- AxonToken.sol is written, the registry is not written at all --
 // so this package is the specification the contract must mirror, expressed in a
 // form that can be executed and tested today. Where a rule is enforced on chain
 // (§12.3), the comment says so, and the Go copy exists to be compared against
