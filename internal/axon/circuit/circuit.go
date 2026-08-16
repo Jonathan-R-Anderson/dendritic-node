@@ -390,6 +390,16 @@ type CircuitTable struct {
 
 	maxCircuits int
 	now         func() time.Time
+
+	// highWater is the largest the tables have been since the last compaction.
+	//
+	// A GO MAP NEVER RELEASES ITS BUCKET ARRAY. Deleting every entry leaves the
+	// backing store at its high-water mark for the life of the map, so a relay
+	// that once carried 100k circuits holds that much table forever even while
+	// idle. It is bounded rather than monotone, which is why it took an exit
+	// criterion to notice -- E5.3 measured 160 % of baseline after 1000
+	// build/teardown cycles with every entry deleted.
+	highWater int
 }
 
 type linkKey struct {
@@ -505,7 +515,8 @@ func (t *CircuitTable) Teardown(rc *RelayCircuit) (notifyPrev, notifyNext string
 	return rc.PrevPeer, rc.NextPeer
 }
 
-// PruneQuarantine drops expired quarantine entries and returns how many.
+// PruneQuarantine drops expired quarantine entries, compacts the tables when
+// they have emptied out, and returns how many entries it dropped.
 func (t *CircuitTable) PruneQuarantine() int {
 	now := t.now()
 	t.mu.Lock()
@@ -517,7 +528,43 @@ func (t *CircuitTable) PruneQuarantine() int {
 			n++
 		}
 	}
+	t.compactLocked()
 	return n
+}
+
+// compactThreshold is how far occupancy must fall below the high-water mark
+// before the tables are rebuilt. A quarter is a compromise: rebuilding on every
+// prune would make teardown O(table) instead of O(1), and never rebuilding
+// leaves a relay holding its busiest hour's memory for the rest of its life.
+const compactThreshold = 4
+
+// compactLocked rebuilds the maps when they are mostly empty.
+//
+// Rebuilding is the only way to release a Go map's buckets. The cost is one
+// allocation and a copy of the live entries, paid on a prune rather than on the
+// teardown path, so a burst of teardowns does not pay for it.
+func (t *CircuitTable) compactLocked() {
+	live := len(t.byPrev) + len(t.byNext) + len(t.quarantine)
+	if live > t.highWater {
+		t.highWater = live
+	}
+	if t.highWater < 64 || live > t.highWater/compactThreshold {
+		return
+	}
+	byPrev := make(map[linkKey]*RelayCircuit, len(t.byPrev))
+	for k, v := range t.byPrev {
+		byPrev[k] = v
+	}
+	byNext := make(map[linkKey]*RelayCircuit, len(t.byNext))
+	for k, v := range t.byNext {
+		byNext[k] = v
+	}
+	quar := make(map[linkKey]time.Time, len(t.quarantine))
+	for k, v := range t.quarantine {
+		quar[k] = v
+	}
+	t.byPrev, t.byNext, t.quarantine = byPrev, byNext, quar
+	t.highWater = live
 }
 
 // -----------------------------------------------------------------------------
