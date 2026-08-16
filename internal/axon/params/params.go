@@ -53,6 +53,46 @@ const (
 	// MinHops is permitted only for explicitly non-anonymous performance
 	// contexts and is never a default.
 	MinHops = 2
+
+	// RelayBuildBudget caps RELAY_BUILD cells per circuit (T5.8, PAR-08).
+	//
+	// THE NUMBER, derived rather than chosen: MaxHops (4) extension requests,
+	// plus section 8.4's two permitted redraws, plus two spare = 8. Tor arrived
+	// at the same figure for RELAY_EARLY by the same reasoning.
+	//
+	// It exists because an unbounded extension budget is an unbounded circuit,
+	// and because the early/normal distinction has been used as a signalling
+	// side channel between a hostile entry and a hostile directory node.
+	RelayBuildBudget = 8
+
+	// DropCellThreshold is how many structurally valid but impossible cells a
+	// circuit may attract before it is torn down (T5.9, PAR-28).
+	//
+	// A SENDME for a closed stream, a DATA cell for a stream that never opened,
+	// a TRUNCATED for a hop already gone: each is droppable, and a droppable
+	// event nobody counts is a signalling channel.
+	DropCellThreshold = 10
+
+	// CircuitIDQuarantine is how long a freed circuit id is withheld from reuse
+	// (section 8.4's C_DEAD state). Reusing an id immediately would let a late
+	// cell from a dead circuit land on a live one.
+	CircuitIDQuarantine = 60 * time.Second
+
+	// MaxCircuitsPerRelay is the global admission cap (P24, PAR-21). It is the
+	// bound MaxCircuitsPerLink is not: that one is per link, so an attacker
+	// opens more links.
+	MaxCircuitsPerRelay = 65536
+)
+
+// Circuit lifecycle budgets (section 8.4's state machine). Specified defaults,
+// NOT measurements.
+const (
+	LinkTimeout      = 5 * time.Second
+	CreateTimeout    = 10 * time.Second
+	ExtendTimeout    = 10 * time.Second
+	OpenIdleTimeout  = 60 * time.Second
+	ClosingTimeout   = 5 * time.Second
+	MaxExtendRedraws = 2
 )
 
 // MaxPayload is the usable cell body: everything after the fixed header.
