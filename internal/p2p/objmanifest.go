@@ -21,9 +21,14 @@ import (
 // could never cross from the bridge to a worker.
 const objectManifestNamespace = "syndichan-object-manifest"
 
-// manifestFetchTimeout budgets a DHT GetValue for a manifest. Like a shard
-// fetch it may need a cold I2P dial, so it must comfortably exceed i2pDialTimeout.
-const manifestFetchTimeout = 3 * time.Minute
+// manifestFetchTimeout budgets a DHT GetValue for a manifest.
+//
+// RE-DERIVED FOR AXON (T11.2), on the same basis as store.shardFetchTimeout: a
+// worst-case 3-hop build (§8.4, 35 s) plus a d=3 disjoint lookup (§7.3), which
+// issues up to 9 concurrent RPCs and is bounded by its slowest path rather than
+// by their sum. Same caveat: derived from the SPECIFIED budgets, not measured on
+// a real network.
+const manifestFetchTimeout = 90 * time.Second
 
 // objectManifestKey addresses a manifest by a hash of its (bucket, key), so both
 // the publisher and a fetcher that knows the object's bucket+key compute the same

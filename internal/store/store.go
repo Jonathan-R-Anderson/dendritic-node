@@ -38,11 +38,33 @@ const (
 	MaxCapacityBytes int64 = 8 << 50
 )
 
-// shardFetchTimeout budgets a single missing-shard fetch. It must exceed a cold
-// I2P dial (p2p.i2pDialTimeout, 2m): a miss triggers provider discovery and a
-// fresh dial over I2P, and the previous 20s ceiling expired mid-dial, which is
-// why cross-node object reads failed with "context deadline exceeded".
-const shardFetchTimeout = 3 * time.Minute
+// shardFetchTimeout budgets a single missing-shard fetch.
+//
+// RE-DERIVED FOR AXON (T11.2). The old figure existed to outlast a cold I2P dial
+// (p2p.i2pDialTimeout, 2m) and that dial no longer happens. The AXON budget is
+// built from §8.4's circuit state machine instead:
+//
+//	link to the guard                          5 s
+//	CREATE                                    10 s
+//	EXTEND x2                                 20 s
+//	                                     -----------
+//	worst-case 3-hop build                    35 s   (§8.4 hard ceiling)
+//	one BULK round trip for the shard        ~10 s   (§9.3: 6 relay hops)
+//	one retry on a different path             45 s
+//	                                     -----------
+//	                                          90 s
+//
+// A miss triggers DHT discovery of a StorageLocation and then a build, so the
+// budget has to cover a build it did not already have.
+//
+// NOT A MEASUREMENT. T11.2 asks for a figure re-derived from MEASURED AXON
+// circuit latency, and no AXON circuit has been built on a real network — the
+// only measurement in hand is E5.2's in-process throughput. This is derived from
+// the SPECIFIED budgets, which is weaker, and it must be re-derived again from
+// `axon-lab` before T11.2 can be called discharged. Relaxing it instead of
+// re-deriving it would hide exactly the latency regression the criterion exists
+// to catch.
+const shardFetchTimeout = 90 * time.Second
 
 type Store struct {
 	dir          string

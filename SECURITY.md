@@ -2,8 +2,17 @@
 
 ## Trust boundaries
 
-- The local S3 gateway is trusted with plaintext because it is the encryption
-  origin.
+- **Who holds plaintext, resolved (T11.5).** The COORDINATOR holds plaintext;
+  the node never does. Content arrives already encrypted
+  (`backend/services/content_keys.py`), so a storage node holds ciphertext it
+  cannot read and has no per-object key to wrap. The local S3 gateway is the
+  ingress for already-encrypted bytes, not an encryption origin.
+
+  This paragraph previously said the gateway was "trusted with plaintext because
+  it is the encryption origin", which contradicted
+  `internal/store/types.go`'s statement that "the node no longer encrypts
+  objects". The CODE was right and this file was stale; §1 of the roadmap flagged
+  the ambiguity and T11.5 required it resolved rather than left to the reader.
 - Volunteer peers are untrusted and receive only independently authenticated,
   content-addressed encrypted shards.
 - `syndichan.org` is the discovery and allocation coordinator. Its HTTPS
@@ -14,13 +23,20 @@
 
 ## Cryptography
 
-Each object receives a random 256-bit XChaCha20-Poly1305 key. Every chunk gets a
-random 192-bit nonce and associated data binding its bucket, key, and index.
-The object key is wrapped by the local 256-bit master key. Shards are generated
-from authenticated ciphertext, and each shard has a SHA-256 content ID.
+Encryption happens at the COORDINATOR, before bytes reach a node. Each object
+receives a random 256-bit XChaCha20-Poly1305 key there; every chunk gets a random
+192-bit nonce and associated data binding its bucket, key and index.
 
-Recovery verifies, in order: shard SHA-256, Reed-Solomon reconstruction,
-XChaCha20-Poly1305 authentication, and the final plaintext SHA-256.
+**The node's half of that is deliberately small.** It receives authenticated
+ciphertext, splits it into Reed-Solomon shards, and gives each shard a SHA-256
+content id. It holds no object key, wraps nothing, and cannot decrypt what it
+stores. `Manifest.PlainSHA256` is the digest of the STORED (ciphertext) bytes —
+named for the earlier design and kept as an end-to-end integrity check, not as a
+digest of anything readable.
+
+Recovery at the node verifies shard SHA-256 and Reed-Solomon reconstruction, and
+stops there. XChaCha20-Poly1305 authentication and the final plaintext digest are
+the coordinator's, because they need the key the node does not have.
 
 ## Ethereum BLS verification is an opt-in build capability (P12)
 
