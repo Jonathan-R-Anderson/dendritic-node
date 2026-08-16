@@ -83,6 +83,13 @@ func main() {
 	} else if done {
 		return
 	}
+	// Before anything sends a beacon: a node deployed on a non-default origin
+	// must not keep heartbeating the compiled-in domain, which fails silently
+	// (logged, retried) and leaves the node invisible to its own network.
+	if cfg.HeartbeatEndpoint != "" {
+		p2p.SetHeartbeatEndpoint(cfg.HeartbeatEndpoint)
+		logger.Printf("presence endpoint overridden by config: %s", cfg.HeartbeatEndpoint)
+	}
 	logger.Printf("runtime role: %s (%s)", role, role.Description())
 	logger.Print(headlessSummary(cfg, path))
 	if cfg.UIListen != "" {
@@ -752,7 +759,12 @@ func main() {
 	// frontend tells a gateway apart from a storage node.
 	if noStorage {
 		presence := &heartbeat.Client{
-			Signer: signer, Logger: logger,
+			// Endpoint, not the package default: gateway-only mode builds its
+			// own presence client here, so without this a node on a different
+			// origin keeps beaconing the compiled-in domain -- which 405s and
+			// leaves the gateway invisible on its own network's status page.
+			Endpoint: cfg.HeartbeatEndpoint,
+			Signer:   signer, Logger: logger,
 			Snapshot: func() heartbeat.State {
 				state := heartbeat.State{
 					CapacityBytes:   0,
@@ -770,7 +782,12 @@ func main() {
 				return state
 			},
 		}
-		logger.Printf("presence heartbeat every %s to %s", heartbeat.Interval, heartbeat.Endpoint)
+		logger.Printf("presence heartbeat every %s to %s", heartbeat.Interval, func() string {
+			if cfg.HeartbeatEndpoint != "" {
+				return cfg.HeartbeatEndpoint
+			}
+			return heartbeat.Endpoint
+		}())
 		go presence.Run(ctx)
 	}
 	// Status monitoring, in EVERY role including storage nodes. Checking that

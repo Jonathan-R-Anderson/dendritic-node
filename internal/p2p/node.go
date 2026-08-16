@@ -98,6 +98,14 @@ const (
 
 var heartbeatEndpoint = heartbeat.Endpoint
 
+// SetHeartbeatEndpoint points presence beacons at a non-default origin. Called
+// once at startup from the config; a no-op when the config leaves it empty.
+func SetHeartbeatEndpoint(url string) {
+	if url != "" {
+		heartbeatEndpoint = url
+	}
+}
+
 // A var, like heartbeatEndpoint above, so tests can point the lease exchange at
 // a local server instead of reaching the production coordinator.
 var leaseURL = "https://syndichan.org/api/v1/storage/leases"

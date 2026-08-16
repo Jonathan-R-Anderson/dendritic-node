@@ -198,6 +198,19 @@ type Config struct {
 	Router RouterConfig `json:"router"`
 	// NetworkDirective is how this node learns the network has moved.
 	NetworkDirective NetworkDirectiveConfig `json:"network_directive"`
+
+	// HeartbeatEndpoint overrides the compiled-in presence endpoint.
+	//
+	// It exists because the endpoint was a const in internal/heartbeat, so a
+	// deployment on a different origin could repoint every other URL in this
+	// config and still send its presence beacon to the old domain -- silently,
+	// since a heartbeat that 404s is logged and retried rather than fatal. The
+	// node then runs correctly and is invisible to its own network.
+	//
+	// Empty means "use the compiled-in default", so existing configs are
+	// unaffected. A NetworkDirective still overrides this at runtime; this is
+	// the install-time value, not a way to escape a directive.
+	HeartbeatEndpoint string `json:"heartbeat_endpoint,omitempty"`
 	// Bootstrap is how this node finds its way into the DHT, and who it
 	// believes about it. Absent means the old single-URL behaviour.
 	Bootstrap BootstrapConfig `json:"bootstrap"`
