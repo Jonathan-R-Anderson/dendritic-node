@@ -125,9 +125,32 @@ const MaxPayload = CellSize - CellHeaderSize
 // phase that is expected to change them.
 
 const (
-	PrimaryGuards      = 2
-	GuardRotation      = 45 * 24 * time.Hour
-	GuardListLifetime  = 90 * 24 * time.Hour
+	PrimaryGuards     = 2
+	GuardRotation     = 45 * 24 * time.Hour
+	GuardListLifetime = 90 * 24 * time.Hour
+
+	// SampledGuardSize bounds how much of the relay population a client will
+	// EVER have tried (PAR-05).
+	//
+	// This is the property Tor's sampled set buys and §8.5 lacked: without a
+	// bound, a long-running adversary who can make guards fail walks the client
+	// through the population one guard at a time and enumerates it by attrition.
+	// The sampled set is persisted, and a client never connects to a guard
+	// outside it.
+	SampledGuardSize = 20
+
+	// PoolMinReady is the floor below which the pool raises DEGRADED and the
+	// session layer stops opening new streams -- concentrating a destination's
+	// whole traffic onto one survivor is worse than refusing to grow.
+	PoolMinReady = 2
+
+	// TunnelProbeInterval and TunnelProbeMisses drive ACTIVE -> SUSPECT.
+	TunnelProbeInterval = 30 * time.Second
+	TunnelProbeMisses   = 3
+
+	// TunnelBuildTries and TunnelBuildTimeout bound one slot's attempts.
+	TunnelBuildTries   = 5
+	TunnelBuildTimeout = 10 * time.Second
 	VanguardLayer2Size = 4
 	VanguardLayer3Size = 8
 )
@@ -137,8 +160,13 @@ const (
 // ---------------------------------------------------------------------------
 
 const (
-	TunnelLifetime      = 10 * time.Minute
-	TunnelRebuildAt     = 0.70 // fraction of lifetime at which build-ahead starts
+	TunnelLifetime = 10 * time.Minute
+	// TunnelRebuildAt is the fraction of a tunnel's life at which its
+	// replacement is planned. The 180 s it leaves is NOT about build latency --
+	// a build is sub-second -- it absorbs FAILURES: under the 1-2-4-8-16 s
+	// backoff the window permits five attempts, so a slot is empty at expiry
+	// with probability (1-p)^5. Sized for the degraded case, not the good one.
+	TunnelRebuildAt     = 0.70
 	InboundPoolSize     = 3
 	OutboundPoolSize    = 3
 	PoolSpares          = 1
