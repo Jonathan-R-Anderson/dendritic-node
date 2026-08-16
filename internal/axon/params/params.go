@@ -78,6 +78,11 @@ const (
 	// cell from a dead circuit land on a live one.
 	CircuitIDQuarantine = 60 * time.Second
 
+	// MaxStreamsPerCircuit caps concurrent streams on one circuit (§8.6), the
+	// same for both traffic classes. A per-class cap would make the class
+	// inferable from the stream count.
+	MaxStreamsPerCircuit = 64
+
 	// MaxCircuitsPerRelay is the global admission cap (P24, PAR-21). It is the
 	// bound MaxCircuitsPerLink is not: that one is per link, so an attacker
 	// opens more links.
