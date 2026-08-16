@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"sort"
 	"sync"
+
+	"github.com/syndichan/maniwani/storage-client/internal/axon/params"
 )
 
 // Routing table, admission caps, and the sibling list (§7.2, §7.3).
@@ -24,9 +26,15 @@ const (
 // bonds are a price rather than a barrier and that a funded adversary buys
 // their share f; the caps are what stop that share from being concentrated
 // where it does the most damage.
+//
+// The FIGURES live in params, not here. They used to be literals in this file
+// and identical literals existed in three other selection points; P14 composes
+// them into one policy because four copies of a policy drift, and a cap that
+// drifts at one point out of four is no cap at all -- the adversary uses that
+// point. See sybil.CapsFor.
 const (
-	MaxPerPrefixPerBucket = 2
-	MaxPerASNPerBucket    = 8
+	MaxPerPrefixPerBucket = params.MaxPerPrefixPerBucket
+	MaxPerASNPerBucket    = params.MaxPerASNPerBucket
 )
 
 // Sibling-list caps (§7.5 diversity ladder). Tighter than the bucket caps
@@ -39,8 +47,8 @@ const (
 // well-resourced adversary that is a purchase order, not a barrier -- a large
 // cloud provider spans many ASNs, and ASN diversity is not operator diversity.
 const (
-	MaxPerPrefixInSiblings = 1
-	MaxPerASNInSiblings    = 1
+	MaxPerPrefixInSiblings = params.MaxPerPrefixPerReplicaSet
+	MaxPerASNInSiblings    = params.MaxPerASNPerReplicaSet
 )
 
 var (

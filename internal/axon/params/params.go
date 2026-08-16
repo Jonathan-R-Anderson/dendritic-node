@@ -284,6 +284,78 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// Sybil resistance (P14)
+// ---------------------------------------------------------------------------
+//
+// EVERY CONSTANT IN THIS BLOCK IS PROVISIONAL, and each one says so in its own
+// comment with the derivation it does or does not have. That is E14.3, and the
+// reason is P14's honest centre: nobody can state what bond makes 20 % of
+// relays infeasible, because the answer depends on a token price, an
+// adversary's budget and a deployed population, and §18.22 records that none of
+// those exists. A number shipped without that caveat implies a claim the number
+// does not support.
+
+const (
+	// BondFloorRelay is the minimum bonded stake, in whole tokens, for a node to
+	// be admitted as a RELAY.
+	//
+	// PROVISIONAL. Derivation: none available. It is a placeholder chosen so the
+	// mechanism has something to compare against, and §25(c)'s capital gate cuts
+	// both ways -- high enough to deter a fleet is high enough to exclude
+	// volunteers. What P14 delivers is the MECHANISM; calibration is P15's and
+	// is [UNSOLVED].
+	BondFloorRelay = 100
+
+	// BondFloorStorage, BondFloorDHT, BondFloorExit are the same, per role.
+	//
+	// PROVISIONAL. Derivation: ordered by what the role can do to somebody else,
+	// not by what it costs to run. EXIT is highest because an exit's misbehaviour
+	// is attributed to its operator by third parties; STORAGE is next because it
+	// accepts other people's data; DHT is lowest because a bad DHT node is
+	// routed around by the d=3 disjoint lookup. The ORDER is derived; the VALUES
+	// are not.
+	BondFloorStorage = 250
+	BondFloorDHT     = 50
+	BondFloorExit    = 1000
+
+	// AdmissionPoWBits is the leading-zero-bit difficulty for the cheap-role
+	// admission puzzle.
+	//
+	// PROVISIONAL. Derivation: T14.5 requires the cost be MEASURED on low-end
+	// hardware and recorded, so the exclusion it causes is a known quantity
+	// rather than an assumption. The measurement lives in the package's tests
+	// and the value is set from it; see pow.go.
+	AdmissionPoWBits = 18
+
+	// MaxPerPrefixPerBucket and MaxPerASNPerBucket restate §7.2's DHT caps here
+	// so that P14's composition test reads ONE policy rather than four
+	// independent ones.
+	//
+	// PROVISIONAL as figures; NOT provisional as a rule. E14.4 is the rule: an
+	// adversary with 100 identities in one /24 occupies at most one slot per
+	// bucket and one hop per path.
+	MaxPerPrefixPerBucket = 2
+	MaxPerASNPerBucket    = 8
+
+	// MaxPerPrefixPerPath and MaxPerASNPerPath are 1 by construction, not by
+	// choice: §8.7's diversity constraint is "no two hops share a domain", and
+	// any value above 1 would not be that constraint.
+	MaxPerPrefixPerPath = 1
+	MaxPerASNPerPath    = 1
+
+	// MaxPerPrefixPerReplicaSet and MaxPerASNPerReplicaSet are §7.2's
+	// replica-set rule, and they are also the DHT sibling-list caps -- the
+	// sibling list is what decides replica-set membership, so they are the same
+	// rule seen from two sides and must not be two constants.
+	//
+	// PROVISIONAL as figures, though barely: 1 is derived from what a replica
+	// set is for. A replica set that admits two members of one /24 has bought
+	// erasure coding and paid for it with a single failure domain.
+	MaxPerPrefixPerReplicaSet = 1
+	MaxPerASNPerReplicaSet    = 1
+)
+
+// ---------------------------------------------------------------------------
 // Traffic-analysis defences (P13, section 16.3's MVP set)
 // ---------------------------------------------------------------------------
 //
