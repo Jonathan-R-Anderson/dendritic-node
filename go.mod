@@ -3,6 +3,7 @@ module github.com/syndichan/maniwani/storage-client
 go 1.25.12
 
 require (
+	filippo.io/edwards25519 v1.2.0
 	fyne.io/systray v1.12.2
 	github.com/aws/aws-sdk-go-v2 v1.25.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.3
