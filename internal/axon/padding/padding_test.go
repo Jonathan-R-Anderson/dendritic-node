@@ -297,3 +297,49 @@ func TestM1FitsInsideM2(t *testing.T) {
 		t.Fatalf("derived link overhead %.3f does not match §16.8's 30.1%%", overhead)
 	}
 }
+
+// TestPaddingSatisfiesTheNATKeepaliveFloor is a cross-section invariant that
+// nothing checked until the outstanding-work pass surfaced it.
+//
+// §6 specifies a **15 s keepalive floor** on the client↔guard link and says the
+// link padding cell "doubles as the §16 cover schedule, so it is not extra
+// traffic". §16.3 specifies the schedule and never mentions 15 s. The two hold
+// together only because M6a's LONGEST possible interval is 9.5 s, which is
+// under the floor by construction.
+//
+// Nothing enforced that. RFC 4787 requires NAT UDP mappings to survive two
+// minutes and §6 records that deployed NATs frequently ignore it, with 30 s or
+// less being common — so if KeepaliveMax were ever raised past 15 s, NAT
+// mappings would start expiring and it would present as random connection loss
+// on client links, not as a padding bug. That is a long way from its cause.
+func TestPaddingSatisfiesTheNATKeepaliveFloor(t *testing.T) {
+	const natFloor = 15 * time.Second // §6's guard-link keepalive
+
+	if params.KeepaliveMax >= natFloor {
+		t.Fatalf("§6 violated: M6a's longest interval is %v, at or above the %v NAT "+
+			"keepalive floor -- guard-link NAT mappings will expire",
+			params.KeepaliveMax, natFloor)
+	}
+	// The floor is denser still, so a guard link is covered twice over.
+	floorGap := time.Duration(float64(time.Second) / params.FloorRateCellsPerSec)
+	if floorGap >= natFloor {
+		t.Fatalf("§6 violated: M6b's floor interval is %v, at or above %v", floorGap, natFloor)
+	}
+
+	// And empirically, over a long idle run: no gap ever reaches the floor.
+	m := New(RoleGuardLink, true, t0, nil)
+	at, last := t0, t0
+	worst := time.Duration(0)
+	for end := t0.Add(30 * time.Minute); at.Before(end); at = at.Add(100 * time.Millisecond) {
+		if n := m.Due(at); n > 0 {
+			if gap := at.Sub(last); gap > worst {
+				worst = gap
+			}
+			last = at
+		}
+	}
+	if worst >= natFloor {
+		t.Fatalf("an idle guard link went %v without a cell, at or above the %v floor", worst, natFloor)
+	}
+	t.Logf("§6 keepalive: worst observed idle gap %v over 30 min, floor %v", worst.Round(time.Millisecond), natFloor)
+}
