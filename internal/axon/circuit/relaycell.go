@@ -73,6 +73,20 @@ const (
 	RCmdLookup     RCmd = 0x0D
 	RCmdLookupRepl RCmd = 0x0E
 	RCmdError      RCmd = 0x0F
+
+	// L5 rendezvous commands (§8.1). §8 owns their codes and their circuit
+	// scope; internal/axon/rendez owns their bodies. Keeping the codes here is
+	// what stops a body being confused with stream traffic -- scope is checked
+	// by this package, not by the layer that fills them in.
+	RCmdEstablishIntro        RCmd = 0x10
+	RCmdIntroEstablished      RCmd = 0x11
+	RCmdIntroduce1            RCmd = 0x12
+	RCmdIntroduce2            RCmd = 0x13
+	RCmdIntroduceAck          RCmd = 0x14
+	RCmdEstablishRendezvous   RCmd = 0x18
+	RCmdRendezvousEstablished RCmd = 0x19
+	RCmdRendezvous1           RCmd = 0x1A
+	RCmdRendezvous2           RCmd = 0x1B
 )
 
 var rcmdNames = map[RCmd]string{
@@ -81,6 +95,12 @@ var rcmdNames = map[RCmd]string{
 	RCmdTruncate: "TRUNCATE", RCmdTruncated: "TRUNCATED", RCmdDrop: "DROP",
 	RCmdResolve: "RESOLVE", RCmdResolved: "RESOLVED", RCmdLookup: "LOOKUP",
 	RCmdLookupRepl: "LOOKUP_REPLY", RCmdError: "ERROR",
+	RCmdEstablishIntro: "ESTABLISH_INTRO", RCmdIntroEstablished: "INTRO_ESTABLISHED",
+	RCmdIntroduce1: "INTRODUCE1", RCmdIntroduce2: "INTRODUCE2",
+	RCmdIntroduceAck:          "INTRODUCE_ACK",
+	RCmdEstablishRendezvous:   "ESTABLISH_RENDEZVOUS",
+	RCmdRendezvousEstablished: "RENDEZVOUS_ESTABLISHED",
+	RCmdRendezvous1:           "RENDEZVOUS1", RCmdRendezvous2: "RENDEZVOUS2",
 }
 
 func (r RCmd) String() string {
@@ -100,7 +120,12 @@ func (r RCmd) Valid() bool { _, ok := rcmdNames[r]; return ok }
 // something to interpret generously.
 func (r RCmd) CircuitScoped() bool {
 	switch r {
-	case RCmdExtend, RCmdExtended, RCmdTruncate, RCmdTruncated, RCmdDrop:
+	case RCmdExtend, RCmdExtended, RCmdTruncate, RCmdTruncated, RCmdDrop,
+		// Every L5 command is circuit-scoped: an introduction or a rendezvous
+		// is a property of the circuit, not of a stream on it, and §8.1 says so.
+		RCmdEstablishIntro, RCmdIntroEstablished, RCmdIntroduce1, RCmdIntroduce2,
+		RCmdIntroduceAck, RCmdEstablishRendezvous, RCmdRendezvousEstablished,
+		RCmdRendezvous1, RCmdRendezvous2:
 		return true
 	default:
 		return false
