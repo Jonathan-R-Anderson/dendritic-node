@@ -142,6 +142,9 @@ func TestCircuitStreamRoundTrip(t *testing.T) {
 	}
 
 	want := []byte("cells cross intact")
+	// CmdRelay is onioned: LENGTH is zero on the wire and the receiver gets the
+	// whole 944-byte region, because only the hop holding the key knows where
+	// the real message ends. The prefix is what must survive.
 	if err := cs.WriteCell(&Cell{Circuit: 7, Command: CmdRelay, Payload: want}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -149,8 +152,11 @@ func TestCircuitStreamRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(got.Payload) != string(want) {
-		t.Fatalf("payload = %q, want %q", got.Payload, want)
+	if len(got.Payload) != MaxPayload {
+		t.Fatalf("onioned payload = %d bytes, want the full %d region", len(got.Payload), MaxPayload)
+	}
+	if string(got.Payload[:len(want)]) != string(want) {
+		t.Fatalf("payload = %q, want prefix %q", got.Payload[:len(want)], want)
 	}
 	if got.Circuit != 7 {
 		t.Fatalf("circuit = %d, want 7", got.Circuit)
@@ -432,7 +438,7 @@ func TestManyCellsAcrossALink(t *testing.T) {
 				errc <- err
 				return
 			}
-			if len(c.Payload) != 1 || c.Payload[0] != byte(i) {
+			if len(c.Payload) != MaxPayload || c.Payload[0] != byte(i) {
 				errc <- errors.New("cell content diverged")
 				return
 			}

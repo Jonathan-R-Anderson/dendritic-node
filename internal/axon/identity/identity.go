@@ -39,11 +39,11 @@ type NodeIdentity struct {
 // NodeIdentity, which is what lets a relay rotate its onion key without
 // losing the reputation and bond attached to its node identity.
 type RoutingIdentity struct {
-	Epoch      uint64
-	EdPublic   ed25519.PublicKey
-	edPrivate  ed25519.PrivateKey
-	XPublic    [32]byte
-	xPrivate   [32]byte
+	Epoch     uint64
+	EdPublic  ed25519.PublicKey
+	edPrivate ed25519.PrivateKey
+	XPublic   [32]byte
+	xPrivate  [32]byte
 }
 
 // KadID is a node's position in the DHT keyspace. It is NOT freely chosen: it

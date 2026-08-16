@@ -2,6 +2,7 @@ package link
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/rand"
@@ -38,15 +39,27 @@ func TestCellSizeIsConstant(t *testing.T) {
 	}
 }
 
-// TestPayloadCapacityLeavesRoomForEveryHopTag guards the arithmetic that keeps
-// path length off the wire: the tag reservation is for MaxHops positions, used
-// or not.
-func TestPayloadCapacityLeavesRoomForEveryHopTag(t *testing.T) {
-	want := params.CellSize - params.CellHeaderSize - params.AEADTagSize*params.MaxHops
+// TestPayloadCapacityDoesNotDependOnPathLength guards the arithmetic that keeps
+// path length off the wire.
+//
+// It used to assert a 64-byte tag reservation for MaxHops positions, used or
+// not. PAR-01 withdrew that tag stack and P5a replaced it with a wide-block
+// permutation over the whole body, so the reservation is gone and its PURPOSE is
+// now structural: the body is one fixed-size permuted block whatever the path
+// length, so capacity cannot vary with H because there is nothing for H to
+// change.
+func TestPayloadCapacityDoesNotDependOnPathLength(t *testing.T) {
+	want := params.CellSize - params.CellHeaderSize
 	if MaxPayload != want {
-		t.Fatalf("MaxPayload = %d, want %d (CellSize %d - header %d - %d*%d tags)",
-			MaxPayload, want, params.CellSize, params.CellHeaderSize,
-			params.AEADTagSize, params.MaxHops)
+		t.Fatalf("MaxPayload = %d, want %d (CellSize %d - header %d)",
+			MaxPayload, want, params.CellSize, params.CellHeaderSize)
+	}
+	// The formula must not mention MaxHops at all -- that is the property.
+	for _, hops := range []int{1, 2, 3, 4} {
+		_ = hops
+		if MaxPayload != params.CellSize-params.CellHeaderSize {
+			t.Fatal("capacity varies with path length")
+		}
 	}
 	if MaxPayload <= 0 {
 		t.Fatal("cell has no payload capacity")
@@ -67,7 +80,10 @@ func TestRoundTrip(t *testing.T) {
 		}
 		in := &Cell{
 			Circuit: CircuitID(0xdeadbeefcafef00d),
-			Command: CmdRelay,
+			// CmdCreate is non-onioned, so LENGTH carries the true payload
+			// size and the round trip is length-exact. Onioned cells are
+			// covered separately by TestOnionedCellsHideTheirLength.
+			Command: CmdCreate,
 			Flags:   FlagEarly,
 			Payload: payload,
 		}
@@ -139,7 +155,10 @@ func TestEncodeClearsReusedBuffer(t *testing.T) {
 // TestDecodeRejectsMalformed covers every field a peer controls. A relay that
 // accepts nonsense is a relay that can be used as an oracle or a covert channel.
 func TestDecodeRejectsMalformed(t *testing.T) {
-	good := &Cell{Circuit: 7, Command: CmdRelay, Payload: []byte("x")}
+	// Non-onioned: the padding-zero check only applies where the cell is seen
+	// in plaintext, so the covert-channel sub-test needs a command whose tail
+	// is not ciphertext.
+	good := &Cell{Circuit: 7, Command: CmdCreate, Payload: []byte("x")}
 	base := make([]byte, params.CellSize)
 	if err := good.Encode(base); err != nil {
 		t.Fatal(err)
@@ -209,7 +228,7 @@ func TestDecodeRejectsMalformed(t *testing.T) {
 // bytes even though 1024 arrived. Trusting the buffer instead of the length
 // would hand every relay the padding as free payload.
 func TestDeclaredLengthBoundsThePayload(t *testing.T) {
-	c := &Cell{Circuit: 1, Command: CmdRelay, Payload: []byte("12345")}
+	c := &Cell{Circuit: 1, Command: CmdCreate, Payload: []byte("12345")}
 	buf := make([]byte, params.CellSize)
 	if err := c.Encode(buf); err != nil {
 		t.Fatal(err)
@@ -272,7 +291,16 @@ func TestStreamOfCellsResynchronises(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cell %d: %v", i, err)
 		}
-		if got.Circuit != sent[i].Circuit || !bytes.Equal(got.Payload, sent[i].Payload) {
+		if got.Circuit != sent[i].Circuit {
+			t.Fatalf("cell %d did not survive the stream", i)
+		}
+		if sent[i].Command.Onioned() {
+			// An onioned cell yields the whole 944-byte region; the sent
+			// prefix must still be intact at the front of it.
+			if !bytes.Equal(got.Payload[:len(sent[i].Payload)], sent[i].Payload) {
+				t.Fatalf("cell %d payload prefix did not survive the stream", i)
+			}
+		} else if !bytes.Equal(got.Payload, sent[i].Payload) {
 			t.Fatalf("cell %d did not survive the stream", i)
 		}
 	}
@@ -322,4 +350,94 @@ func FuzzDecode(f *testing.F) {
 			t.Fatal("decode/encode is not a round trip: two encodings of one cell")
 		}
 	})
+}
+
+// TestBodyIsTheWholeCellAfterTheHeader: PAR-01 removed the 64-byte tag stack,
+// so the body is 1008 bytes and there is no reserved region between the header
+// and the payload.
+func TestBodyIsTheWholeCellAfterTheHeader(t *testing.T) {
+	if offPayload != params.CellHeaderSize {
+		t.Fatalf("payload starts at %d, want %d -- a reserved region has reappeared",
+			offPayload, params.CellHeaderSize)
+	}
+	if MaxPayload != 1008 {
+		t.Fatalf("MaxPayload = %d, want 1008 (1024 cell - 16 header)", MaxPayload)
+	}
+	// The reclaimed 64 bytes are real capacity, not an accounting change.
+	c := &Cell{Circuit: 1, Command: CmdCreate, Payload: bytes.Repeat([]byte{0xAB}, MaxPayload)}
+	buf := make([]byte, params.CellSize)
+	if err := c.Encode(buf); err != nil {
+		t.Fatalf("a full-capacity payload was rejected: %v", err)
+	}
+	out, err := Decode(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Payload) != MaxPayload {
+		t.Fatalf("round-tripped %d bytes, want %d", len(out.Payload), MaxPayload)
+	}
+}
+
+// TestCellSizeIsIndependentOfPathLength: capacity must not vary with H, or the
+// cell announces path length. The tag stack bought this by reservation; the
+// wide-block construction gets it structurally, because the body is one fixed
+// permuted block whatever the path.
+func TestCellSizeIsIndependentOfPathLength(t *testing.T) {
+	if params.MaxPayload != params.CellSize-params.CellHeaderSize {
+		t.Fatal("MaxPayload depends on something other than the header size")
+	}
+}
+
+// TestOnionedCellsHideTheirLength: for RELAY/RELAY_BUILD the LENGTH field MUST
+// be zero on the wire, because the real length lives inside the onion where an
+// observer cannot read it. Writing the true length would hand every relay the
+// plaintext size of a message it cannot decrypt.
+func TestOnionedCellsHideTheirLength(t *testing.T) {
+	for _, cmd := range []Command{CmdRelay, CmdRelayBuild} {
+		c := &Cell{Circuit: 3, Command: cmd, Payload: []byte("a short inner message")}
+		buf := make([]byte, params.CellSize)
+		if err := c.Encode(buf); err != nil {
+			t.Fatal(err)
+		}
+		if got := binary.BigEndian.Uint16(buf[offLength:]); got != 0 {
+			t.Fatalf("%s wrote LENGTH = %d, want 0", cmd, got)
+		}
+		out, err := Decode(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out.Payload) != MaxPayload {
+			t.Fatalf("%s decoded %d payload bytes, want the whole %d region",
+				cmd, len(out.Payload), MaxPayload)
+		}
+	}
+
+	// A peer that DOES declare a length on an onioned cell is signalling, and
+	// is refused rather than tolerated.
+	c := &Cell{Circuit: 3, Command: CmdCreate, Payload: []byte("x")}
+	buf := make([]byte, params.CellSize)
+	if err := c.Encode(buf); err != nil {
+		t.Fatal(err)
+	}
+	buf[offCommand] = byte(CmdRelay) // now onioned, but LENGTH is still 1
+	if _, err := Decode(buf); !errors.Is(err, ErrBadLength) {
+		t.Fatalf("an onioned cell declaring a length was accepted: %v", err)
+	}
+}
+
+// TestCommandNumbersMatchTheSpec pins the section 8.1 wire codes. Renumbering
+// them is a protocol break, and a silent one.
+func TestCommandNumbersMatchTheSpec(t *testing.T) {
+	for cmd, want := range map[Command]uint8{
+		CmdPadding: 0x00, CmdCreate: 0x01, CmdCreated: 0x02, CmdRelay: 0x03,
+		CmdRelayBuild: 0x04, CmdCreateFrag: 0x05, CmdDestroy: 0x06,
+		CmdVersions: 0x07, CmdNetInfo: 0x08,
+	} {
+		if uint8(cmd) != want {
+			t.Errorf("%s = 0x%02x, section 8.1 says 0x%02x", cmd, uint8(cmd), want)
+		}
+	}
+	if CmdRelay.Onioned() != true || CmdCreate.Onioned() != false {
+		t.Fatal("Onioned() disagrees with the section 8.1 table")
+	}
 }

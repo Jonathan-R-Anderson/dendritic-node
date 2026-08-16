@@ -55,9 +55,19 @@ const (
 	MinHops = 2
 )
 
-// MaxPayload is the usable payload once the header and a tag for every possible
-// hop position are reserved. Derived, never written as a literal.
-const MaxPayload = CellSize - CellHeaderSize - (AEADTagSize * MaxHops)
+// MaxPayload is the usable cell body: everything after the fixed header.
+//
+// It was CellSize - CellHeaderSize - (AEADTagSize * MaxHops), reserving 64 bytes
+// for a per-hop tag stack so that payload capacity could not leak path length.
+// PAR-01 found that tag stack to be a cross-hop tagging channel and section 81.1
+// withdrew it; P5a replaced it with a wide-block permutation over the whole
+// body, which needs no tags and therefore no reservation.
+//
+// The reservation's PURPOSE survives and is now structural: the body is one
+// fixed-size permuted block whatever the path length, so capacity still cannot
+// leak it. AEADTagSize and MaxHops are retained -- MaxHops still bounds path
+// length, and AEADTagSize is still the end-to-end authenticator's size.
+const MaxPayload = CellSize - CellHeaderSize
 
 // ---------------------------------------------------------------------------
 // Guards (section 8.5)
@@ -120,12 +130,12 @@ const (
 // ---------------------------------------------------------------------------
 
 const (
-	KademliaK          = 20 // bucket size
-	KademliaAlpha      = 3  // lookup concurrency
-	KademliaDisjoint   = 3  // disjoint lookup paths, S/Kademlia style
-	ReplicationFactor  = 8  // r, across distinct /24, /48 and ASN
-	IPv4DiversityBits  = 24
-	IPv6DiversityBits  = 48
+	KademliaK         = 20 // bucket size
+	KademliaAlpha     = 3  // lookup concurrency
+	KademliaDisjoint  = 3  // disjoint lookup paths, S/Kademlia style
+	ReplicationFactor = 8  // r, across distinct /24, /48 and ASN
+	IPv4DiversityBits = 24
+	IPv6DiversityBits = 48
 )
 
 // ---------------------------------------------------------------------------

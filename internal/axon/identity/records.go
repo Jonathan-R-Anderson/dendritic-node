@@ -16,9 +16,9 @@ import (
 
 // Record type bytes.
 const (
-	TypeIdentityRotation  byte = 0x02
-	TypeRevocation        byte = 0x03
-	TypeDelegationCert    byte = 0x04
+	TypeIdentityRotation byte = 0x02
+	TypeRevocation       byte = 0x03
+	TypeDelegationCert   byte = 0x04
 )
 
 // Class identifies which identity class a record concerns, so a verifier can
@@ -46,14 +46,14 @@ var (
 // signatures: the old key authorises the move, and the new key proves
 // possession, so neither key alone can perform a rotation.
 type IdentityRotation struct {
-	Class      Class
-	OldPublic  ed25519.PublicKey
-	NewPublic  ed25519.PublicKey
-	NotBefore  uint64
-	NotAfter   uint64
-	Serial     uint64
-	SigOld     []byte
-	SigNew     []byte
+	Class     Class
+	OldPublic ed25519.PublicKey
+	NewPublic ed25519.PublicKey
+	NotBefore uint64
+	NotAfter  uint64
+	Serial    uint64
+	SigOld    []byte
+	SigNew    []byte
 }
 
 func (r *IdentityRotation) body() []byte {

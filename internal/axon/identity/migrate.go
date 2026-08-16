@@ -83,10 +83,10 @@ func LoadLegacyNodeKey(path string) (LegacyNodeKey, error) {
 // MigrationPlan describes what adopting AXON identities would do to a node that
 // already has a bonded identity. It computes and reports; it changes nothing.
 type MigrationPlan struct {
-	LegacyPublic  ed25519.PublicKey
-	LegacyNodeID  PoFNodeID
-	AxonPublic    ed25519.PublicKey
-	AxonNodeID    PoFNodeID
+	LegacyPublic ed25519.PublicKey
+	LegacyNodeID PoFNodeID
+	AxonPublic   ed25519.PublicKey
+	AxonNodeID   PoFNodeID
 	// PreservesBond is true when adopting the AXON identity would keep the
 	// on-chain nodeId, and therefore the bond, unchanged.
 	PreservesBond bool

@@ -33,6 +33,24 @@ import (
 // and a cell whose size varied with hop count would leak path length -- which is
 // why params.AEADTagSize is reserved for MaxHops positions whether or not those
 // hops exist.
+// Field offsets, from section 8.1's cell diagram.
+//
+//	 0  8  CIRCID       link-local; different on every link the circuit crosses
+//	 8  1  CMD          link command, not onion-encrypted
+//	 9  1  FLAGS
+//	10  2  LENGTH       meaningful only for non-onioned cells
+//	12  4  RESERVED     must be zero and must be checked
+//	16 1008 BODY        one wide-block permuted block (P5a), or cleartext
+//	                    handshake material for non-onioned commands
+//
+// THE TAG STACK IS GONE. Section 8.1 originally placed four 16-byte Poly1305
+// slots at offset 16, rotated one slot per hop. PAR-01 found that construction
+// to be a cross-hop tagging channel -- 16 unauthenticated hop-chosen bytes per
+// cell, carried downstream unchanged -- and section 81.1 withdrew it. P5a
+// replaced it with a wide-block permutation over the whole body, which has no
+// tags, no filler and no mutable unauthenticated field of any kind.
+//
+// The 64 bytes are reclaimed: the body is 1008 bytes rather than 944.
 const (
 	offCircuitID = 0
 	offCommand   = 8
@@ -51,19 +69,32 @@ const MaxPayload = params.MaxPayload
 type Command uint8
 
 const (
-	CmdPadding  Command = 0x00 // carries nothing; used for link padding
-	CmdCreate   Command = 0x01 // begin a circuit to this hop
-	CmdCreated  Command = 0x02 // …accepted
-	CmdRelay    Command = 0x03 // carries a relay message for some hop
-	CmdDestroy  Command = 0x04 // tear the circuit down
-	CmdNetInfo  Command = 0x05 // link-level parameters, exchanged after handshake
-	CmdVersions Command = 0x06 // link protocol version negotiation
+	CmdPadding    Command = 0x00 // carries nothing; link-local filler, never forwarded
+	CmdCreate     Command = 0x01 // begin a circuit to this hop
+	CmdCreated    Command = 0x02 // …accepted
+	CmdRelay      Command = 0x03 // onion-layered relay message; EXTEND inside is refused
+	CmdRelayBuild Command = 0x04 // as RELAY, but EXTEND/EXTENDED permitted; budget-limited
+	CmdCreateFrag Command = 0x05 // continuation of an oversized CREATE (hybrid handshake)
+	CmdDestroy    Command = 0x06 // tear the circuit down; never onioned, never forwarded verbatim
+	CmdVersions   Command = 0x07 // link protocol version list; first cell, CIRCID = 0
+	CmdNetInfo    Command = 0x08 // clock and observed-address exchange, CIRCID = 0
 )
 
 var commandNames = map[Command]string{
 	CmdPadding: "PADDING", CmdCreate: "CREATE", CmdCreated: "CREATED",
-	CmdRelay: "RELAY", CmdDestroy: "DESTROY", CmdNetInfo: "NETINFO",
-	CmdVersions: "VERSIONS",
+	CmdRelay: "RELAY", CmdRelayBuild: "RELAY_BUILD", CmdCreateFrag: "CREATE_FRAG",
+	CmdDestroy: "DESTROY", CmdVersions: "VERSIONS", CmdNetInfo: "NETINFO",
+}
+
+// Onioned reports whether the payload region is onion ciphertext.
+//
+// It decides two things a decoder cannot get right by guessing: whether LENGTH
+// carries meaning (it does not for onioned cells -- the real length lives inside
+// the onion where an observer cannot read it), and whether the tail after the
+// declared payload can be checked for zeros. For ciphertext it cannot be, since
+// every byte of the 944-byte region is meaningful to whoever holds the key.
+func (c Command) Onioned() bool {
+	return c == CmdRelay || c == CmdRelayBuild
 }
 
 func (c Command) String() string {
@@ -96,9 +127,13 @@ const (
 	// Bounding these is what stops an endless extension attack (P5 enforces the
 	// count; the flag is defined here because it lives in the header).
 	FlagEarly Flags = 1 << 0
+	// FlagPriority marks INTERACTIVE traffic, served ahead of BULK by the link
+	// scheduler. It changes scheduling only -- never cell size, which is what
+	// keeps the two classes indistinguishable to a capture (E5.4).
+	FlagPriority Flags = 1 << 1
 )
 
-const flagsKnown = FlagEarly
+const flagsKnown = FlagEarly | FlagPriority
 
 // Cell is one fixed-size frame.
 //
@@ -146,7 +181,15 @@ func (c *Cell) Encode(dst []byte) error {
 	binary.BigEndian.PutUint64(cell[offCircuitID:], uint64(c.Circuit))
 	cell[offCommand] = byte(c.Command)
 	cell[offFlags] = byte(c.Flags)
-	binary.BigEndian.PutUint16(cell[offLength:], uint16(len(c.Payload)))
+	// LENGTH is meaningful only for non-onioned cells. For RELAY/RELAY_BUILD it
+	// MUST be zero: the real length lives inside the onion, where an observer
+	// cannot read it. Writing the true length here would hand every relay on the
+	// path the plaintext size of a message it is not supposed to be able to size.
+	if c.Command.Onioned() {
+		binary.BigEndian.PutUint16(cell[offLength:], 0)
+	} else {
+		binary.BigEndian.PutUint16(cell[offLength:], uint16(len(c.Payload)))
+	}
 	// Reserved bytes are zeroed explicitly rather than assumed zero.
 	cell[offReserved+0], cell[offReserved+1] = 0, 0
 	cell[offReserved+2], cell[offReserved+3] = 0, 0
@@ -189,6 +232,14 @@ func Decode(src []byte) (*Cell, error) {
 	if length > MaxPayload {
 		return nil, fmt.Errorf("%w: %d > %d", ErrBadLength, length, MaxPayload)
 	}
+	// An onioned cell must declare zero length, or the sender is leaking the
+	// inner message size into a field every relay can read.
+	if cmd.Onioned() {
+		if length != 0 {
+			return nil, fmt.Errorf("%w: onioned cell declares length %d", ErrBadLength, length)
+		}
+		length = MaxPayload
+	}
 
 	// Padding must be zero, for the same reason the reserved bytes must be:
 	// otherwise every relay on the path forwards attacker-chosen bytes in the
@@ -201,9 +252,11 @@ func Decode(src []byte) (*Cell, error) {
 	// ciphertext to intermediate hops, and only the endpoint that decrypts can
 	// apply this check. It closes the channel for link-level cells and at the
 	// endpoint, not for relays carrying encrypted layers.
-	for i := offPayload + length; i < params.CellSize; i++ {
-		if cell[i] != 0 {
-			return nil, fmt.Errorf("%w: offset %d", ErrPaddingNonZero, i)
+	if !cmd.Onioned() {
+		for i := offPayload + length; i < params.CellSize; i++ {
+			if cell[i] != 0 {
+				return nil, fmt.Errorf("%w: offset %d", ErrPaddingNonZero, i)
+			}
 		}
 	}
 
