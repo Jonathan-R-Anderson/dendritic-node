@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -260,8 +261,23 @@ func TestPAR10SparesAreBuiltAhead(t *testing.T) {
 	}
 }
 
-// TestBuildAheadFiresAt70Percent.
-func TestBuildAheadFiresAt70Percent(t *testing.T) {
+// TestBuildAheadFiresInTheJitteredWindow.
+//
+// This test used to assert a build-ahead at exactly 70 % of the lifetime, and
+// that assertion was the M5 defect written down as a requirement: a fixed
+// trigger means every client in the network emits CREATE cells on a
+// phase-locked 420 s cadence, and the phase offset is a stable per-client
+// identifier at the guard. §16.3 says an unjittered M5 ADDS a fingerprint while
+// claiming to reduce one.
+//
+// The trigger is now params.TunnelRebuildAt jittered DOWNWARD by up to
+// RotationJitter, so the assertion is a window: nothing fires before the
+// earliest possible trigger, everything has fired by the latest.
+func TestBuildAheadFiresInTheJitteredWindow(t *testing.T) {
+	life := float64(params.TunnelLifetime)
+	earliest := params.TunnelRebuildAt * (1 - params.RotationJitter)
+	latest := params.TunnelRebuildAt
+
 	now := time.Unix(1_700_000_000, 0)
 	clock := func() time.Time { return now }
 	p := NewPool(ctx(t, "alice", clock, 1, 2, 3), clock)
@@ -270,14 +286,55 @@ func TestBuildAheadFiresAt70Percent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	life := float64(params.TunnelLifetime)
-	now = now.Add(time.Duration(life * 0.69))
+	// A hair before the earliest possible trigger: nothing may fire.
+	now = now.Add(time.Duration(life * (earliest - 0.005)))
 	if todo := p.Tick(); len(todo) != 0 {
-		t.Fatalf("build-ahead fired at 69%% of lifetime: %v", todo)
+		t.Fatalf("build-ahead fired below the jitter floor %.3f: %v", earliest, todo)
 	}
-	now = now.Add(time.Duration(life * 0.02))
+	// A hair past the unjittered trigger: everything must have fired.
+	now = now.Add(time.Duration(life * (latest - earliest + 0.01)))
 	if todo := p.Tick(); len(todo) == 0 {
-		t.Fatal("build-ahead did not fire at 71% of lifetime")
+		t.Fatalf("build-ahead did not fire by %.3f of lifetime", latest)
+	}
+}
+
+// TestRotationIsNotPhaseLocked is M5 itself.
+//
+// The property is that two tunnels built at the same instant do not rotate at
+// the same instant. A fixed trigger passes every other tunnel test in this file
+// and fails only this one, which is why it exists.
+func TestRotationIsNotPhaseLocked(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	clock := func() time.Time { return now }
+
+	seenFractions := map[float64]int{}
+	for i := 0; i < 200; i++ {
+		p := NewPool(ctx(t, fmt.Sprintf("c%d", i), clock, 1, 2, 3), clock)
+		var seen []RelayID
+		if err := p.Fill(Outbound, builder(&seen)); err != nil {
+			t.Fatal(err)
+		}
+		tn, err := p.Get(Outbound)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := tn.RebuildFraction()
+		if f > params.TunnelRebuildAt || f < params.TunnelRebuildAt*(1-params.RotationJitter) {
+			t.Fatalf("rebuild fraction %.4f outside [%.4f, %.4f]", f,
+				params.TunnelRebuildAt*(1-params.RotationJitter), params.TunnelRebuildAt)
+		}
+		seenFractions[f]++
+	}
+	if len(seenFractions) < 150 {
+		t.Fatalf("M5 violated: 200 tunnels produced only %d distinct rebuild triggers -- "+
+			"the pool is phase-locked", len(seenFractions))
+	}
+	// The jitter must be DOWNWARD only: a tunnel that rotates late eats the
+	// 180 s the schedule reserves for rebuild failures.
+	for f := range seenFractions {
+		if f > params.TunnelRebuildAt {
+			t.Fatalf("rebuild fraction %.4f is later than the unjittered trigger", f)
+		}
 	}
 }
 

@@ -40,6 +40,27 @@ type Candidate struct {
 	// occupancy figure a peer publishes about itself and "unknown" must never be
 	// read as "empty". Plan itself ignores it.
 	Capacity int64
+	// Domains are this peer's failure domains as opaque keys -- /24 or /48,
+	// ASN, and on-chain operator -- from peer.DomainKeys. Plan will not place
+	// two shards of one chunk on peers that share ANY key (T12.2).
+	//
+	// THEY ARE OPAQUE STRINGS ON PURPOSE. This package is pure by design: no
+	// libp2p, no store, no I/O, because "no two shards of a chunk share a
+	// failure domain" is a property of the assignment and must be testable
+	// without standing up a network. Taking a netip.Prefix or an ASN here would
+	// drag an address library in and lose that.
+	//
+	// An UNKNOWN domain contributes NO KEY, so two peers whose ASN nobody could
+	// determine share nothing and are treated as distinct. That is the same
+	// conservative rule as peer.ASNUnknown, and inverting it -- rendering the
+	// unknown as a key like "a:0" -- would silently collapse every unannotated
+	// peer into one domain and refuse to disperse at all.
+	//
+	// Empty is legitimate and means "no domain constraint for this peer", which
+	// is what every caller supplies until P3's annotations are wired through.
+	// The guarantee then degrades to distinct-PEER, exactly as before, and
+	// §1.4's finding is that this is where the storage layer has always been.
+	Domains []string
 }
 
 // Shard is one erasure shard of one chunk, as the planner sees it.
@@ -84,6 +105,24 @@ func Plan(shards []Shard, candidates []Candidate, wantHolders int) []Assignment 
 		}
 	}
 
+	// Failure domains already spoken for by an existing holder.
+	//
+	// Existing holders are looked up in the candidate list, because that is the
+	// only place their annotations are: a Holder is a peer id and nothing more.
+	// A holder that is not among the candidates contributes no domains, and the
+	// resulting placement is then weaker than it looks -- so that case is worth
+	// knowing about, and DomainsUnavailable reports it.
+	byPeer := make(map[string][]string, len(candidates))
+	for _, c := range candidates {
+		byPeer[c.PeerID] = c.Domains
+	}
+	takenDomain := make(map[string]bool)
+	for holder := range occupied {
+		for _, k := range byPeer[holder] {
+			takenDomain[k] = true
+		}
+	}
+
 	ranked := append([]Candidate(nil), candidates...)
 	sort.SliceStable(ranked, func(i, j int) bool {
 		if ranked[i].FreeBytes != ranked[j].FreeBytes {
@@ -113,6 +152,7 @@ func Plan(shards []Shard, candidates []Candidate, wantHolders int) []Assignment 
 		need := wantHolders - len(shard.Holders)
 		for need > 0 {
 			picked := ""
+			pickedDomains := []string(nil)
 			for _, candidate := range ranked {
 				if occupied[candidate.PeerID] {
 					continue
@@ -120,7 +160,10 @@ func Plan(shards []Shard, candidates []Candidate, wantHolders int) []Assignment 
 				if candidate.FreeBytes > 0 && candidate.FreeBytes < shard.Size {
 					continue
 				}
-				picked = candidate.PeerID
+				if sharesDomain(candidate.Domains, takenDomain) {
+					continue
+				}
+				picked, pickedDomains = candidate.PeerID, candidate.Domains
 				break
 			}
 			if picked == "" {
@@ -129,11 +172,44 @@ func Plan(shards []Shard, candidates []Candidate, wantHolders int) []Assignment 
 				break
 			}
 			occupied[picked] = true
+			for _, k := range pickedDomains {
+				takenDomain[k] = true
+			}
 			out = append(out, Assignment{ShardID: shard.ID, ShardIndex: shard.Index, Peer: picked})
 			need--
 		}
 	}
 	return out
+}
+
+// sharesDomain reports whether any of this peer's domains is already taken.
+//
+// A peer with NO domain keys never shares one, so an unannotated candidate is
+// always admissible. That is the deliberate direction: the constraint tightens
+// as annotations arrive and never blocks dispersal because they have not.
+func sharesDomain(domains []string, taken map[string]bool) bool {
+	for _, k := range domains {
+		if taken[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// DomainsUnavailable counts candidates carrying no failure-domain keys.
+//
+// It is the storage layer's ConstraintReport, and it exists for §56.2's reason:
+// a placement that satisfied distinct-domain because nobody had a domain is not
+// a placement that survives a datacentre. A caller that logs only "9 shards
+// placed" cannot tell that case from a real one.
+func DomainsUnavailable(candidates []Candidate) int {
+	n := 0
+	for _, c := range candidates {
+		if len(c.Domains) == 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // DistinctHolders counts the peers holding at least one shard of the chunk.

@@ -225,6 +225,190 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// Local peer profiling (P12a, PAR-03)
+// ---------------------------------------------------------------------------
+//
+// The STRUCTURE is I2P's, which has run for two decades without a measurement
+// authority; the VALUES are ours and are not measurements. R14 forbids the
+// authority, so every figure here is a local policy choice, and none of it ever
+// leaves the node.
+
+const (
+	// ProfileHalfLife is the exponential decay applied to every metric. A relay
+	// that was fast yesterday does not coast on it.
+	ProfileHalfLife = 1 * time.Hour
+
+	// ProfileMinSamples is the floor below which a peer is UNTIERED and
+	// selection falls back to uniform. It is applied twice -- per peer, and
+	// across the whole profile store -- because a node that has barely observed
+	// anything must not act on the little it has (E12a.3).
+	//
+	// It is a floor on DECAYED samples, not on raw ones, so N observations never
+	// quite reach N: ten observations a second apart weigh 9.99, and a peer
+	// needs slightly more than ProfileMinSamples of them to tier. That is the
+	// intended reading -- the floor asks "how much do I currently know about
+	// this peer", and the answer to that decays like everything else here.
+	ProfileMinSamples = 10
+
+	// TierFastFraction and TierHighCapacityFraction are I2P's 10 % / 25 %.
+	// They are FRACTIONS, not thresholds, on purpose: an absolute threshold
+	// would put the whole network in one tier on a fast day and none of it in
+	// that tier on a slow one, and the tier population would then depend on
+	// conditions rather than on relative standing.
+	TierFastFraction         = 0.10
+	TierHighCapacityFraction = 0.25
+
+	// ProfileFailingStreak is how many CONSECUTIVE failures exclude a peer.
+	ProfileFailingStreak = 3
+
+	// ProfileRepromoteInterval is how long an excluded peer stays excluded
+	// before it is eligible again. Permanent exclusion would let an adversary
+	// who can cause three failures remove a peer from this node's view for
+	// good, which is a cheaper attack than it should be.
+	ProfileRepromoteInterval = 30 * time.Minute
+)
+
+// Selection weights by tier. The RATIO is what matters and it is deliberately
+// small: 2:1 between the best tier and the ordinary one.
+//
+// The failure mode being priced is the feedback loop P12a names -- fast peers
+// get more traffic, therefore more samples, therefore look faster still. A
+// large ratio makes that loop converge on a handful of relays and undoes P3's
+// diversity work. A ratio of 2 tilts selection without collapsing it.
+const (
+	WeightUntiered     = 1.0
+	WeightStandard     = 1.0
+	WeightHighCapacity = 1.5
+	WeightFast         = 2.0
+	WeightFailing      = 0.0
+)
+
+// ---------------------------------------------------------------------------
+// Traffic-analysis defences (P13, section 16.3's MVP set)
+// ---------------------------------------------------------------------------
+//
+// EVERY CONSTANT BELOW APPEARS EXACTLY ONCE, HERE. That is E13.4, and it is not
+// hygiene: §16.8's last row makes ONE CANONICAL WIRE PROFILE normative, so a
+// second definition anywhere is a second profile, and configuration diversity
+// is itself the node fingerprint the profile exists to remove.
+//
+// None of these figures is measured. They are §16.3's arithmetic from the §5
+// parameters, and §16's own closing note says so in as many words.
+
+const (
+	// DatagramSize is M2: every overlay QUIC packet is padded to a constant, so
+	// the cell boundary is not visible in packet lengths.
+	//
+	// 1200 B is the conservative IPv6 minimum-MTU-derived figure that avoids
+	// fragmentation on essentially every path. §16.8 prices it at +30.1 % over
+	// payload including IPv4/UDP headers.
+	DatagramSize = 1200
+
+	// KeepaliveMin and KeepaliveMax are M6a: on an idle link, one PADDING cell
+	// after U(KeepaliveMin, KeepaliveMax), reset on any real cell.
+	//
+	// The interval is RANDOM, not fixed. A fixed keepalive is a metronome, and a
+	// metronome's phase is a per-link identifier that survives for as long as
+	// the link does -- the same defect §16.3 identifies in unjittered rotation.
+	KeepaliveMin = 1500 * time.Millisecond
+	KeepaliveMax = 9500 * time.Millisecond
+
+	// FloorRateCellsPerSec is M6b's R_floor: the minimum cell rate per direction
+	// on a client<->guard link. Real cells count toward it.
+	//
+	// 0.5 costs 6.4 GB/month across two guards in both directions. §16.8 records
+	// the risk that this is simply unaffordable for some users and that a
+	// network where only the careful pad gives the careful a SMALLER anonymity
+	// set. That is unresolved, not solved by this constant.
+	FloorRateCellsPerSec = 0.5
+
+	// FloorTailMin and FloorTailMax are how long the floor continues after the
+	// last REAL cell, so the instant activity stops is not visible.
+	//
+	// The tail is extended by real cells only. A padding cell that extended it
+	// would make the floor self-sustaining and the cost unbounded.
+	FloorTailMin = 5 * time.Second
+	FloorTailMax = 30 * time.Second
+
+	// RotationJitter is M5's ± U(0, 15 %) on the rebuild trigger.
+	//
+	// Without it every client rebuilds on a phase-locked 420 s cadence and the
+	// phase offset becomes a stable per-client identifier at the guard. §16.3:
+	// unjittered, M5 ADDS a fingerprint while claiming to reduce one.
+	RotationJitter = 0.15
+)
+
+// PaddingEnabledByDefault is T13.3's single bit.
+//
+// Padding is on unless a node is explicitly, visibly built without it. It is a
+// constant and not a config key on purpose: §16.8 makes the wire profile
+// normative, and a tunable padding rate would let each operator emit a
+// distinguishable profile -- which is the attack, not the defence.
+const PaddingEnabledByDefault = true
+
+// ---------------------------------------------------------------------------
+// Path selection (P12)
+// ---------------------------------------------------------------------------
+
+const (
+	// PathPrefixBitsV4 and PathPrefixBitsV6 are the failure-domain widths for a
+	// PATH, and they are deliberately COARSER than the /24 and /48 used for
+	// shard placement.
+	//
+	// §7.5 (replication) says /24 and /48. §8.7 (path selection) says /16 and
+	// /32. Both are in the roadmap and they were read as one number for a while;
+	// they are not. The asymmetry is correct, because the two defend against
+	// different things:
+	//
+	//	placement  loses an object when several holders fail together, which is
+	//	           a correlated-outage question -- a rack, a host, a /24
+	//	path       loses ANONYMITY when one observer sees two hops, which is a
+	//	           vantage-point question -- and an ISP or a hosting provider
+	//	           routinely sees a whole /16
+	//
+	// So the path constraint is 256x coarser. It costs candidate diversity on a
+	// small network, and that is the correct cost: the alternative is a path
+	// whose first and last hop sit in one provider's address space.
+	PathPrefixBitsV4 = 16
+	PathPrefixBitsV6 = 32
+
+	// PathMinCandidates is the candidate-pool floor below which selection
+	// raises a partition warning (T12.5).
+	//
+	// DERIVED, not chosen: a 3-hop path under distinct-/24 needs 3 domains, and
+	// a pool that offers no more than the minimum offers no choice at all -- an
+	// adversary who supplies the view controls every hop. Four times the path
+	// length is the point at which a hostile view has to include real relays to
+	// stay plausible. On a network this size the warning will fire often; that
+	// is the correct output, not a reason to lower it.
+	PathMinCandidates = DefaultHops * 4
+
+	// PathMinDistinctPrefixes is the same floor expressed in failure domains,
+	// which is the number that actually matters: 40 candidates in 3 /24s is a
+	// partitioned view wearing a large pool as a disguise.
+	PathMinDistinctPrefixes = DefaultHops * 3
+
+	// BondBytesPerSecondPerToken converts bonded stake into the most bandwidth
+	// a self-report may claim (T12.3).
+	//
+	// [NEEDS RESEARCH] -- NOT A MEASUREMENT. It is a policy exchange rate and
+	// the roadmap has no basis for it yet. What the constant buys regardless of
+	// its value is the SHAPE: a claim above the cap is worth exactly the cap, so
+	// the marginal return on lying is zero and inflating a self-report costs the
+	// same bond as telling the truth about the same capacity.
+	BondBytesPerSecondPerToken = 1 << 20 // 1 MiB/s per whole token bonded
+
+	// WeightClaimSpread bounds the ratio between the largest and smallest
+	// claim-derived weight, exactly as the tier weights are bounded.
+	//
+	// Without it the bond cap alone is not a bound: a wealthy adversary bonds
+	// enough to claim a legitimate 10 Gb/s and takes a proportional share of
+	// every path. Capping the SPREAD makes bonded capacity buy a tilt rather
+	// than the network.
+	WeightClaimSpread = 2.0
+)
+
+// ---------------------------------------------------------------------------
 // Multipath (Part VI)
 // ---------------------------------------------------------------------------
 

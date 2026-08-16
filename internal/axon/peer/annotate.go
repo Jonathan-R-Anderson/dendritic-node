@@ -23,9 +23,23 @@ import (
 type Domain int
 
 const (
-	DomainPrefix Domain = iota // /24 for IPv4, /48 for IPv6
-	DomainASN                  // autonomous system
+	DomainPrefix   Domain = iota // /24 for IPv4, /48 for IPv6
+	DomainASN                    // autonomous system
+	DomainOperator               // owner address from the bonded on-chain registry (P12b)
 )
+
+func (d Domain) String() string {
+	switch d {
+	case DomainPrefix:
+		return "prefix"
+	case DomainASN:
+		return "asn"
+	case DomainOperator:
+		return "operator"
+	default:
+		return "unknown"
+	}
+}
 
 // ASNUnknown is the zero ASN, meaning "not determined".
 //
@@ -46,6 +60,12 @@ type Annotation struct {
 	// ASNSource records how the ASN was determined, so a caller can tell a
 	// looked-up answer from an absent one without inspecting the value.
 	ASNSource ASNSource
+	// Operator is the owner address from the bonded on-chain registry, or
+	// OperatorUnknown. It is the fourth rung of the ladder (P12b); see
+	// operator.go for why it is not a self-declared field.
+	Operator OperatorID
+	// OperatorSource is its provenance: chain, or none.
+	OperatorSource OperatorSource
 }
 
 // ASNSource is the provenance of an ASN annotation.
@@ -71,8 +91,13 @@ func (s ASNSource) String() string {
 	}
 }
 
-// PrefixLenV4 and PrefixLenV6 are the failure-domain widths from the roadmap's
-// section 7.5 replication rules and section 8.7 path diversity.
+// PrefixLenV4 and PrefixLenV6 are the failure-domain widths from §7.5's
+// REPLICATION rules.
+//
+// This comment used to cite §8.7 as well, and that was wrong: §8.7 specifies
+// /16 and /32 for PATH selection, not /24 and /48. Reading the two as one
+// number made every path constraint 256x weaker than the roadmap asks for.
+// Path widths are params.PathPrefixBitsV4/V6; see there for why they differ.
 const (
 	PrefixLenV4 = 24
 	PrefixLenV6 = 48
@@ -170,6 +195,18 @@ func SameDomain(a, b Annotation, d Domain) bool {
 			return false
 		}
 		return a.ASN == b.ASN
+	case DomainOperator:
+		// Identical rule to ASNUnknown, for an identical reason (T12b.4). An
+		// unverifiable owner is not evidence of a shared owner, and a chain
+		// outage that made every operator unknown at once must widen the
+		// admissible set rather than collapse it to one.
+		if a.Operator.IsUnknown() || b.Operator.IsUnknown() {
+			return false
+		}
+		if a.OperatorSource != OperatorSourceChain || b.OperatorSource != OperatorSourceChain {
+			return false
+		}
+		return a.Operator == b.Operator
 	default:
 		return false
 	}

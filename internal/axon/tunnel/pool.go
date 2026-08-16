@@ -1,6 +1,8 @@
 package tunnel
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -83,10 +85,22 @@ type Tunnel struct {
 	Misses  int
 	Tries   int
 	streams int
+	// rebuildAt is this tunnel's OWN rebuild trigger as a fraction of the
+	// lifetime: params.TunnelRebuildAt minus U(0, RotationJitter) of it (M5).
+	//
+	// It is drawn ONCE, at construction, and stored. Two mistakes it forecloses:
+	// drawing it on every Tick would make the trigger a per-tick coin flip
+	// rather than a jittered deadline, and sharing one draw across the pool
+	// would leave the whole pool phase-locked to itself, which is most of the
+	// signal M5 exists to remove.
+	rebuildAt float64
 }
 
 // Age is how long the tunnel has been built.
 func (t *Tunnel) Age(now time.Time) time.Duration { return now.Sub(t.Built) }
+
+// RebuildFraction is the jittered trigger point, exposed for tests and metrics.
+func (t *Tunnel) RebuildFraction() float64 { return t.rebuildAt }
 
 // Pool is one isolation context's inbound and outbound tunnels.
 type Pool struct {
@@ -99,6 +113,38 @@ type Pool struct {
 
 	// degraded is raised when either half falls below PoolMinReady.
 	degraded bool
+
+	// jitter returns a uniform float in [0,1) for M5's rebuild jitter. Nil
+	// means crypto/rand. Injectable only so a test can pin a schedule.
+	jitter func() float64
+}
+
+// drawRebuildAt is M5: params.TunnelRebuildAt jittered DOWNWARD by up to
+// RotationJitter of itself.
+//
+// Downward, not symmetric. Jittering upward would push some tunnels past the
+// point at which a replacement can still be built and probed before expiry --
+// the 180 s that TunnelRebuildAt leaves is sized for the FAILURE case, five
+// attempts under 1-2-4-8-16 s backoff, and eating into it converts a phase-lock
+// fix into a rebuild-failure regression.
+func (p *Pool) drawRebuildAt() float64 {
+	u := p.jitter
+	if u == nil {
+		u = cryptoUniform
+	}
+	return params.TunnelRebuildAt * (1 - params.RotationJitter*u())
+}
+
+// cryptoUniform draws from crypto/rand. A predictable rotation schedule is a
+// per-client identifier at the guard, which is the defect M5 repairs; a
+// seedable PRNG here would repair it only against an observer who cannot guess
+// the seed.
+func cryptoUniform() float64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("axon/tunnel: crypto/rand unavailable: " + err.Error())
+	}
+	return float64(binary.BigEndian.Uint64(b[:])>>11) / float64(1<<53)
 }
 
 // Builder builds a tunnel starting at a given guard. Supplied by the caller so
@@ -180,7 +226,7 @@ func (p *Pool) Fill(d Direction, b Builder) error {
 		p.mu.Lock()
 		p.setHalf(d, append(p.half(d), &Tunnel{
 			ID: nextTunnelID(), Dir: d, Guard: guard, Hops: hops,
-			State: Ready, Built: p.now(),
+			State: Ready, Built: p.now(), rebuildAt: p.drawRebuildAt(),
 		}))
 		p.recomputeLocked()
 		p.mu.Unlock()
@@ -251,7 +297,7 @@ func (p *Pool) Tick() (toBuild []Direction) {
 			case Ready, Active:
 				if age >= params.TunnelLifetime {
 					t.State = Expiring
-				} else if float64(age) >= params.TunnelRebuildAt*float64(params.TunnelLifetime) {
+				} else if float64(age) >= t.rebuildAt*float64(params.TunnelLifetime) {
 					// Build-ahead: plan a replacement, but the tunnel keeps
 					// carrying what it already has.
 					planned++
