@@ -1,0 +1,309 @@
+package dht
+
+import (
+	"errors"
+	"fmt"
+	"net/netip"
+	"sort"
+	"sync"
+)
+
+// Routing table, admission caps, and the sibling list (§7.2, §7.3).
+
+// Kademlia parameters (Constitution §5).
+const (
+	BucketSize    = 20           // k
+	Concurrency   = 3            // alpha
+	DisjointPaths = 3            // d
+	SiblingCount  = 2 * Replicas // s = 16
+)
+
+// Admission caps per k-bucket (§7.2).
+//
+// These bound identities per LOCATION, not per wallet. §7.7 is explicit that
+// bonds are a price rather than a barrier and that a funded adversary buys
+// their share f; the caps are what stop that share from being concentrated
+// where it does the most damage.
+const (
+	MaxPerPrefixPerBucket = 2
+	MaxPerASNPerBucket    = 8
+)
+
+// Sibling-list caps (§7.5 diversity ladder). Tighter than the bucket caps
+// because the sibling list is what decides replica-set membership, and a
+// replica set admits at most one member per /24 and one per ASN.
+//
+// This is the term that converts eclipse from "buy identities" to "buy presence
+// in eight independent autonomous systems, each with its own /24, and keep all
+// eight bonded across every epoch you want the eclipse to persist". For a
+// well-resourced adversary that is a purchase order, not a barrier -- a large
+// cloud provider spans many ASNs, and ASN diversity is not operator diversity.
+const (
+	MaxPerPrefixInSiblings = 1
+	MaxPerASNInSiblings    = 1
+)
+
+var (
+	ErrPrefixCapReached = errors.New("axon/dht: per-prefix admission cap reached for this bucket")
+	ErrASNCapReached    = errors.New("axon/dht: per-ASN admission cap reached for this bucket")
+	ErrBucketFull       = errors.New("axon/dht: bucket is full")
+	ErrUnverified       = errors.New("axon/dht: entry is unverified and may not be counted toward a replica set")
+)
+
+// Contact is one routing-table entry: a peer's compact RelayDescriptor
+// projection plus how we came to believe it.
+type Contact struct {
+	NodeIDPub [32]byte
+	KadID     Key
+	Addr      netip.Addr
+	Prefix    NetworkPrefix
+	ASN       uint32
+
+	// Verified means the entry was learned over a LIVE CONNECTION whose observed
+	// source prefix matched the KadID recomputation (§7.3 rule (c)).
+	//
+	// Entries learned indirectly -- returned in a FIND_NODE -- satisfy the
+	// signature and KadID checks but not this one. THAT DISTINCTION IS THE WHOLE
+	// VALUE OF THE SIGNATURE: an unverified entry may be used to make routing
+	// progress but may NEVER be counted toward a replica set, because a peer
+	// that can put itself in your replica set by being mentioned has not been
+	// checked by anybody.
+	Verified bool
+}
+
+// prefixKey is the string form used for cap accounting.
+func (c Contact) prefixKey() string { return c.Prefix.String() }
+
+// Table is a Kademlia routing table rooted at one node's KadID.
+type Table struct {
+	self Key
+
+	mu      sync.RWMutex
+	buckets map[int][]Contact
+	// siblings is the s=16 nodes closest to self, under the tighter caps.
+	siblings []Contact
+}
+
+// NewTable builds an empty table for a node at `self`.
+func NewTable(self Key) *Table {
+	return &Table{self: self, buckets: map[int][]Contact{}}
+}
+
+// Self is the table's own KadID.
+func (t *Table) Self() Key { return t.self }
+
+// bucketIndex is the shared-prefix length with self.
+func (t *Table) bucketIndex(k Key) int {
+	i := CommonPrefixLen(t.self, k)
+	if i >= 256 {
+		i = 255
+	}
+	return i
+}
+
+// Admit inserts a contact, enforcing the §7.2 caps.
+//
+// The caps are checked BEFORE the bucket-full check so a diverse-but-full
+// bucket and a concentrated one produce different errors: an operator reading
+// "per-prefix cap reached" is looking at a possible eclipse attempt, and one
+// reading "bucket full" is looking at a healthy table.
+func (t *Table) Admit(c Contact) error {
+	idx := t.bucketIndex(c.KadID)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// The sibling list is a SEPARATE structure with its own, tighter caps, and
+	// it is maintained independently of bucket admission.
+	//
+	// Coupling them was a real defect: bucket 0 covers half the keyspace and
+	// fills at k=20 in any network of moderate size, and a coupled
+	// implementation would let a full routing bucket silently block replica-set
+	// membership for a node that is genuinely among the s closest. S/Kademlia
+	// keeps the sibling list separate precisely because "who is near me" and
+	// "who do I route through" are different questions.
+	defer t.updateSiblingsLocked(c)
+
+	b := t.buckets[idx]
+	for i, existing := range b {
+		if existing.NodeIDPub == c.NodeIDPub {
+			// Re-admission upgrades unverified to verified, never the reverse:
+			// a peer cannot launder a verified entry back to unverified to
+			// escape a cap, and a live connection is strictly better evidence
+			// than a mention.
+			if c.Verified {
+				b[i] = c
+			}
+			return nil
+		}
+	}
+
+	prefixes, asns := 0, 0
+	for _, existing := range b {
+		if existing.prefixKey() == c.prefixKey() {
+			prefixes++
+		}
+		if c.ASN != 0 && existing.ASN == c.ASN {
+			asns++
+		}
+	}
+	if prefixes >= MaxPerPrefixPerBucket {
+		return fmt.Errorf("%w: %s already holds %d of %d in bucket %d",
+			ErrPrefixCapReached, c.prefixKey(), prefixes, MaxPerPrefixPerBucket, idx)
+	}
+	if c.ASN != 0 && asns >= MaxPerASNPerBucket {
+		return fmt.Errorf("%w: AS%d already holds %d of %d in bucket %d",
+			ErrASNCapReached, c.ASN, asns, MaxPerASNPerBucket, idx)
+	}
+	if len(b) >= BucketSize {
+		return ErrBucketFull
+	}
+
+	t.buckets[idx] = append(b, c)
+	return nil
+}
+
+// updateSiblingsLocked maintains the s=16 closest under the tighter caps.
+func (t *Table) updateSiblingsLocked(c Contact) {
+	// An unverified entry may make routing progress but may never enter the
+	// sibling list, because the sibling list is what decides replica sets.
+	if !c.Verified {
+		return
+	}
+	for i, s := range t.siblings {
+		if s.NodeIDPub == c.NodeIDPub {
+			// Already a sibling: refresh it in place so a re-verification does
+			// not silently keep a stale KadID.
+			t.siblings[i] = c
+			return
+		}
+	}
+	prefixes, asns := 0, 0
+	for _, s := range t.siblings {
+		if s.prefixKey() == c.prefixKey() {
+			prefixes++
+		}
+		if c.ASN != 0 && s.ASN == c.ASN {
+			asns++
+		}
+	}
+	if prefixes >= MaxPerPrefixInSiblings {
+		return
+	}
+	if c.ASN != 0 && asns >= MaxPerASNInSiblings {
+		return
+	}
+
+	t.siblings = append(t.siblings, c)
+	self := t.self
+	sort.Slice(t.siblings, func(i, j int) bool {
+		return Distance(t.siblings[i].KadID, self).Less(Distance(t.siblings[j].KadID, self))
+	})
+	if len(t.siblings) > SiblingCount {
+		t.siblings = t.siblings[:SiblingCount]
+	}
+}
+
+// Siblings returns the s closest known nodes to self.
+func (t *Table) Siblings() []Contact {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return append([]Contact(nil), t.siblings...)
+}
+
+// Bucket returns a copy of one bucket, for tests and diagnostics.
+func (t *Table) Bucket(idx int) []Contact {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return append([]Contact(nil), t.buckets[idx]...)
+}
+
+// Len is the total number of contacts.
+func (t *Table) Len() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	n := 0
+	for _, b := range t.buckets {
+		n += len(b)
+	}
+	return n
+}
+
+// Closest returns the n contacts closest to a key.
+//
+// verifiedOnly is not a convenience flag: a replica-set decision must pass
+// true, and a routing-progress decision may pass false. Getting this wrong is
+// how an unverified entry ends up counted toward a replica set.
+func (t *Table) Closest(key Key, n int, verifiedOnly bool) []Contact {
+	t.mu.RLock()
+	all := make([]Contact, 0, t.lenLocked())
+	for _, b := range t.buckets {
+		for _, c := range b {
+			if verifiedOnly && !c.Verified {
+				continue
+			}
+			all = append(all, c)
+		}
+	}
+	t.mu.RUnlock()
+
+	sort.Slice(all, func(i, j int) bool {
+		return Distance(all[i].KadID, key).Less(Distance(all[j].KadID, key))
+	})
+	if len(all) > n {
+		all = all[:n]
+	}
+	return all
+}
+
+func (t *Table) lenLocked() int {
+	n := 0
+	for _, b := range t.buckets {
+		n += len(b)
+	}
+	return n
+}
+
+// Rebuild recomputes every contact's KadID under a new SRV and re-admits them.
+//
+// THE EPOCH BOUNDARY IS THE DANGEROUS MOMENT, and this is where it is handled.
+// Every node's position moves at once, so a table that was not rebuilt would
+// route toward positions nobody occupies any more -- and a lookup crossing the
+// boundary would fail CONSISTENTLY rather than randomly, which looks like a
+// broken network rather than a transient.
+//
+// Contacts whose KadID cannot be recomputed (no address on file) are dropped
+// rather than carried over at a stale position: a contact at a position it does
+// not occupy is worse than a missing contact, because it silently absorbs
+// lookups.
+func (t *Table) Rebuild(selfPub [32]byte, srv SRV, selfPrefix NetworkPrefix) (kept, dropped int, err error) {
+	newSelf, err := DeriveKadID(selfPub, srv, selfPrefix)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	t.mu.Lock()
+	old := make([]Contact, 0, t.lenLocked())
+	for _, b := range t.buckets {
+		old = append(old, b...)
+	}
+	t.self = newSelf
+	t.buckets = map[int][]Contact{}
+	t.siblings = nil
+	t.mu.Unlock()
+
+	for _, c := range old {
+		id, err := DeriveKadID(c.NodeIDPub, srv, c.Prefix)
+		if err != nil {
+			dropped++
+			continue
+		}
+		c.KadID = id
+		if err := t.Admit(c); err != nil {
+			dropped++
+			continue
+		}
+		kept++
+	}
+	return kept, dropped, nil
+}

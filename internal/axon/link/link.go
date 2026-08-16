@@ -29,9 +29,9 @@ import (
 // Decision: keep libp2p for the link and its NAT traversal, and put AXON's
 // framing on top. Replacing it now would mean reimplementing QUIC, AutoNAT,
 // Circuit Relay v2 and DCUtR to gain a wire format nothing needs yet. The
-// native transport enters later through the same transport.Transport seam that
-// internal/i2p already occupies -- that seam is the migration path, and it is
-// proven, so this is a deferral rather than a lock-in.
+// native transport enters later through the same transport.Transport seam the
+// legacy anonymity transport already occupies -- that seam is the migration
+// path, it is proven, and this is therefore a deferral rather than a lock-in.
 //
 // The cost, stated rather than hidden: the libp2p handshake and the ALPN/
 // protocol string identify this network to an observer. That is a censorship
