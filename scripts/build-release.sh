@@ -25,8 +25,17 @@ do
   fi
   output="dist/syndichan-node-${os}-${arch}${suffix}"
   echo "building ${output}"
+  # -buildvcs=false is NOT cosmetic and must not be dropped.
+  #
+  # Without it Go stamps vcs.revision, vcs.time, vcs.modified and a
+  # commit-derived module version into every binary, so the same source built in
+  # CI from a checkout and rebuilt by a user from a tarball produces DIFFERENT
+  # bytes -- and T2.6/T13.1's "two independent builds are identical" is
+  # unprovable by construction. scripts/reproducible-build.sh verifies these
+  # exact flags; changing them here without changing them there makes that check
+  # a check of something else.
   CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM="$goarm" \
-    go build -trimpath -ldflags="-s -w" -o "$output" ./cmd/syndichan-node
+    go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$output" ./cmd/syndichan-node
 done
 
 # P16 / T16.1 — the manifest.

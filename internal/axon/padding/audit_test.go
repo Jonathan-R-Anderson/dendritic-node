@@ -180,3 +180,60 @@ func TestPaddingScheduleDoesNotDependOnTrafficClass(t *testing.T) {
 		}
 	}
 }
+
+// TestT26BuildFlagsAreIdenticalEverywhere is T2.6/T13.1's structural half.
+//
+// The reproducibility harness (scripts/reproducible-build.sh) verifies ONE set
+// of build flags. That verification means nothing about what ships unless the
+// release build and the node's own from-source build use the SAME flags — and
+// nothing connected the three before this test.
+//
+// The specific loss being prevented: dropping `-buildvcs=false` from any one of
+// them re-stamps vcs.revision and vcs.time into that binary, so the same source
+// yields different bytes depending on which script built it, and "two
+// independent builds are identical" becomes unprovable by construction. It is a
+// one-word edit that no compiler and no runtime test would notice.
+func TestT26BuildFlagsAreIdenticalEverywhere(t *testing.T) {
+	required := []string{"-trimpath", "-buildvcs=false", "-ldflags"}
+	for _, rel := range []string{
+		"scripts/build-release.sh",
+		"scripts/update-from-github.sh",
+		"scripts/reproducible-build.sh",
+	} {
+		src, err := os.ReadFile(filepath.Join("..", "..", "..", rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		// The INVOCATION, not the file. Searching the whole body passed with the
+		// flag deleted from the command, because the comment explaining why it
+		// must not be deleted still contained it -- the audit was reading its
+		// own justification back to itself. Found by removing the flag and
+		// watching the test go green.
+		var invocation string
+		for _, line := range strings.Split(string(src), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if strings.Contains(trimmed, "go build") || strings.Contains(trimmed, "FLAGS=(") {
+				invocation += trimmed + " "
+				continue
+			}
+			// Continuation of a wrapped `go build ... \` line.
+			if invocation != "" && strings.HasSuffix(invocation, "\\ ") {
+				invocation += trimmed + " "
+			}
+		}
+		if invocation == "" {
+			t.Errorf("%s: found no go build invocation to check", rel)
+			continue
+		}
+		for _, flag := range required {
+			if !strings.Contains(invocation, flag) {
+				t.Errorf("T2.6 violated: %s builds without %s, so its output cannot be "+
+					"compared byte-for-byte with the other build sites:\n\t%s",
+					rel, flag, strings.TrimSpace(invocation))
+			}
+		}
+	}
+}

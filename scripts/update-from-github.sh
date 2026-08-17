@@ -174,7 +174,15 @@ status testing "running tests for ${candidate_sha:0:12}"
 (
   cd "$tmp/source"
   timeout 15m go test ./...
-  CGO_ENABLED=0 go build -trimpath \
+  # Same flags as scripts/build-release.sh, deliberately.
+  #
+  # A node that builds from source should get BYTE-IDENTICAL output to the
+  # published release, so an operator can check that a release matches the
+  # source it claims to be built from. That held here only by accident: this
+  # builds from a `git archive` export, which has no .git, so the default
+  # -buildvcs=auto already omitted the VCS stamps. Stating it means the property
+  # survives someone changing the export to a clone.
+  CGO_ENABLED=0 go build -trimpath -buildvcs=false \
     -ldflags="-s -w" \
     -o "$tmp/syndichan-node" ./cmd/syndichan-node
 )
