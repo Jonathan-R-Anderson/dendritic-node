@@ -137,12 +137,20 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 			if n.isDraining(record.NodeID) {
 				continue
 			}
-			byID[record.NodeID] = placement.Candidate{
+			cand := placement.Candidate{
 				PeerID: record.NodeID, FreeBytes: record.FreeBytes,
 				// Carried for levelling, which needs occupancy rather than room:
 				// Capacity-FreeBytes is what the peer measured on its own disk.
 				Capacity: record.Capacity,
 			}
+			// Failure domains (T12.2). Taken from the LIVE CONNECTION the dial
+			// above just established, never from record.Destination -- that is
+			// an I2P b32, a public key deliberately unrelated to where the
+			// machine is, and §1.4's whole finding.
+			if pid, perr := peer.Decode(record.NodeID); perr == nil {
+				cand.Domains = n.domainKeysFor(pid)
+			}
+			byID[record.NodeID] = cand
 		}
 	}
 	for _, connected := range n.host.Network().Peers() {
@@ -171,7 +179,7 @@ func (n *Node) storageCandidates(ctx context.Context) []placement.Candidate {
 		if n.isDraining(id) {
 			continue
 		}
-		byID[id] = placement.Candidate{PeerID: id}
+		byID[id] = placement.Candidate{PeerID: id, Domains: n.domainKeysFor(connected)}
 	}
 
 	out := make([]placement.Candidate, 0, len(byID))
