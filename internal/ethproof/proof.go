@@ -212,7 +212,7 @@ var errInlineList = fmt.Errorf("%w: inlined list nodes are not supported", ErrPr
 //
 //	slot(mapping[k]) = keccak256(k ‖ uint256(position))
 //
-// For ChannelManagerV2, `channels` is at position 0 — from solc's storage
+// For AxonChannels, `channels` is at position 0 — from solc's storage
 // layout, not from reading the source — so a channel's first slot is
 // keccak256(id ‖ 32 zero bytes) and the struct occupies the ten slots after it.
 func StorageSlotKey(key [32]byte, position uint64) [32]byte {

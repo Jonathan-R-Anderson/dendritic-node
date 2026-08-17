@@ -61,7 +61,7 @@ type EvidenceChainReader struct {
 	ChainID  uint64
 }
 
-// The slots of ChannelManagerV2's Channel struct, in declaration order.
+// The slots of AxonChannels's Channel struct, in declaration order.
 //
 // From solc's storage layout: `channels` is at position 0, so a channel begins
 // at keccak256(id ‖ uint256(0)) and its members occupy the ten slots after.

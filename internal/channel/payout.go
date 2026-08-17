@@ -7,7 +7,7 @@ package channel
 // ----------------------------------
 // P5-1 fixed where a deposit comes from: the chain, never a peer. This applies
 // the identical rule to settlement. Whether a channel is settled, and at what
-// state, is a question for ChannelManagerV2 — never for a local record of what
+// state, is a question for AxonChannels — never for a local record of what
 // this node believes it broadcast.
 //
 // That is not tidiness. It is the only thing that makes the worst case
@@ -35,7 +35,7 @@ package channel
 //
 // LOCKS FIRST
 // -----------
-// ChannelManagerV2.settle reverts with LocksOutstanding while any lock is
+// AxonChannels.settle reverts with LocksOutstanding while any lock is
 // unresolved, and cannot simply hand them back: a lock whose expiry has not
 // arrived may still be claimed with the preimage, and refunding it early would
 // steal a payment that is legitimately in flight. So the worker resolves locks
@@ -65,7 +65,7 @@ const (
 	// PayoutOnInterval marks a channel due once its interval has elapsed.
 	//
 	// ⚠ READ settlement_notes.md — SEE ALSO the roadmap. Against the CURRENT
-	// contract, settling means CLOSING: ChannelManagerV2 has no partial
+	// contract, settling means CLOSING: AxonChannels has no partial
 	// withdrawal, so every settlement path ends at Status.Payoutd and pays out.
 	// "Settle hourly" therefore means "close hourly", which costs a close plus
 	// a fresh open and deposit each time. This mode is implemented so the
@@ -134,7 +134,7 @@ type PayoutRecord struct {
 // itself, so it can be tested without pretending to be on chain.
 type ChainWriter interface {
 	// Approve authorises a spender to move `amount` of the token on this node's
-	// behalf. Sent to the TOKEN contract, not to ChannelManagerV2 — funding a
+	// behalf. Sent to the TOKEN contract, not to AxonChannels — funding a
 	// channel is two transactions against two contracts, because openChannel
 	// calls safeTransferFrom and ERC-20 moves nothing without an allowance.
 	Approve(ctx context.Context, token, spender Address, amount *big.Int) (string, error)
@@ -421,7 +421,7 @@ func (w *PayoutWorker) ResolveLocks(ctx context.Context, id [32]byte,
 	for i, lock := range locks {
 		// KNOWING THE SECRET IS NOT ENOUGH — THE LOCK MUST STILL BE LIVE.
 		//
-		//	ChannelManagerV2.claimLock: if (block.timestamp >= lock.expiry) revert LockHasExpired();
+		//	AxonChannels.claimLock: if (block.timestamp >= lock.expiry) revert LockHasExpired();
 		//
 		// This branch used to fire on `known` alone and then `continue`, so an
 		// expired lock whose secret was known went to claimLock, REVERTED on

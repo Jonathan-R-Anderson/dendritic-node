@@ -16,6 +16,27 @@ HEALTH_URL="${SYNDICHAN_UPDATE_HEALTH_URL:-}"
 HEALTH_ATTEMPTS="${SYNDICHAN_UPDATE_HEALTH_ATTEMPTS:-36}"
 HEALTH_INTERVAL="${SYNDICHAN_UPDATE_HEALTH_INTERVAL:-5}"
 
+# Commit signature verification (§18.14).
+#
+# THE TRUST ROOT OF THIS SCRIPT IS A GIT BRANCH. It fetches $GIT_BRANCH, builds
+# whatever is there and installs it as root. Whoever can push to that branch --
+# or anyone who can answer for that hostname -- executes code on every volunteer
+# node that runs this. §18.14 names the update channel as the strongest
+# adversary against a real deployment, and until this block existed there was
+# nothing here to be an adversary against.
+#
+# Note this is NOT what internal/axon/release verifies. That package signs a
+# MANIFEST over built artifacts, which is the right mechanism for a binary
+# download and the wrong one here: this script ships no binary, it ships a
+# commit and builds it. The thing to authenticate is therefore the commit.
+#
+# SYNDICHAN_ALLOWED_SIGNERS points at an ssh allowed-signers file (git's
+# gpg.format=ssh convention). When it is set, an unsigned or wrongly-signed head
+# is REFUSED and nothing is built. When it is unset the script says so, loudly,
+# every run -- because "no key configured" and "verified" must never look alike
+# in a log somebody skims.
+ALLOWED_SIGNERS="${SYNDICHAN_ALLOWED_SIGNERS:-}"
+
 case "$INSTALL_DIR" in
   /*) ;;
   *) echo "SYNDICHAN_INSTALL_DIR must be an absolute path" >&2; exit 2 ;;
@@ -101,6 +122,37 @@ fi
 git -C "$MIRROR" fetch --quiet --prune origin \
   "+refs/heads/$GIT_BRANCH:refs/remotes/origin/$GIT_BRANCH"
 candidate_sha="$(git -C "$MIRROR" rev-parse "refs/remotes/origin/$GIT_BRANCH")"
+
+# Verify BEFORE the early "already current" exit and before any build, so a
+# candidate is never compiled -- let alone run -- on the strength of having been
+# fetched.
+if [ -n "$ALLOWED_SIGNERS" ]; then
+  if [ ! -f "$ALLOWED_SIGNERS" ]; then
+    status rejected "SYNDICHAN_ALLOWED_SIGNERS=$ALLOWED_SIGNERS does not exist"
+    echo "refusing to update: the allowed-signers file is missing" >&2
+    exit 1
+  fi
+  # gpg.format and the signers file are passed per-invocation rather than read
+  # from the mirror's config: a repository that could set its own verification
+  # policy would be verifying itself.
+  if ! git -C "$MIRROR" \
+        -c gpg.format=ssh \
+        -c gpg.ssh.allowedSignersFile="$ALLOWED_SIGNERS" \
+        verify-commit "$candidate_sha" >/dev/null 2>&1; then
+    status rejected "${candidate_sha:0:12} is not signed by an allowed signer"
+    echo "refusing to update: commit ${candidate_sha:0:12} failed signature verification" >&2
+    echo "  allowed signers: $ALLOWED_SIGNERS" >&2
+    exit 1
+  fi
+  echo "commit ${candidate_sha:0:12} verified against $ALLOWED_SIGNERS"
+else
+  # Deliberately not a silent default. An operator who has not configured this
+  # should know that the branch is the only thing standing between an attacker
+  # and root on this machine.
+  echo "WARNING: commit signatures are NOT being verified." >&2
+  echo "  Anyone who can push to $GIT_BRANCH at $GIT_URL controls what runs here." >&2
+  echo "  Set SYNDICHAN_ALLOWED_SIGNERS to an ssh allowed-signers file to enforce." >&2
+fi
 deployed_sha=""
 if [ -f "$DEPLOYED_SHA" ]; then
   deployed_sha="$(tr -d '[:space:]' <"$DEPLOYED_SHA")"

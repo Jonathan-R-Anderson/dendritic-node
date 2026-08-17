@@ -1365,7 +1365,7 @@ type ChannelsConfig struct {
 
 	// RPC is the execution endpoint used to read channel state and delegations.
 	RPC string `json:"rpc,omitempty"`
-	// Manager is the ChannelManagerV2 address.
+	// Manager is the AxonChannels address.
 	Manager string `json:"manager,omitempty"`
 	// ChainID guards against a state signed for one deployment being replayed
 	// against another; it is inside every digest.
