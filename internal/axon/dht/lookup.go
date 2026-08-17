@@ -52,7 +52,14 @@ type Response struct {
 }
 
 // RPC issues one FIND_VALUE against one contact.
-type RPC func(ctx context.Context, to Contact, key Key) (Response, error)
+// The PATH INDEX is an argument, and it is what makes R4(b) expressible.
+//
+// Without it an RPC cannot know which of the d disjoint paths it is serving, so
+// it cannot bind that path to its own circuit -- and d paths sharing one circuit
+// is d paths sharing one terminal relay. The node-disjointness this package
+// works to produce would then exist only at the DHT layer, while a single relay
+// watched every one of them. See CircuitRPC.
+type RPC func(ctx context.Context, path int, to Contact, key Key) (Response, error)
 
 // PathEvidence is what one path observed.
 //
@@ -231,7 +238,7 @@ func runPath(ctx context.Context, path int, key Key, frontier []Contact, claims 
 			wg.Add(1)
 			go func(i int, c Contact) {
 				defer wg.Done()
-				r, err := rpc(ctx, c, key)
+				r, err := rpc(ctx, path, c, key)
 				outs[i] = outcome{c: c, resp: r, err: err}
 			}(i, c)
 		}

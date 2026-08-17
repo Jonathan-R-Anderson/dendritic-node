@@ -65,7 +65,7 @@ func (s *simNet) closestTo(key Key, n int) []Contact {
 // rpc is the network's FIND_VALUE. A hostile node WITHHOLDS: it answers, it
 // returns plausible closer nodes, and it simply never mentions the record. This
 // is GO-2024-3218's shape exactly -- signatures cannot touch it.
-func (s *simNet) rpc(_ context.Context, to Contact, key Key) (Response, error) {
+func (s *simNet) rpc(_ context.Context, _ int, to Contact, key Key) (Response, error) {
 	s.mu.Lock()
 	s.queried[to.NodeIDPub]++
 	s.mu.Unlock()

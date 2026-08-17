@@ -91,7 +91,7 @@ func (s *epochSim) closest(key Key, r int) [][32]byte {
 	return out
 }
 
-func (s *epochSim) rpc(_ context.Context, to Contact, key Key) (Response, error) {
+func (s *epochSim) rpc(_ context.Context, _ int, to Contact, key Key) (Response, error) {
 	resp := Response{}
 	cs := s.contacts()
 	for i := range cs {
