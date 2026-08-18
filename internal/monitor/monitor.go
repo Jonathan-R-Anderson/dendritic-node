@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"time"
 )
 
@@ -231,7 +232,7 @@ func (c *Client) probe(ctx context.Context, target Target) Result {
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, target.URL, nil)
 	if err != nil {
-		result.Detail = "bad target url: " + err.Error()
+		result.Detail = sanitiseDetail("bad target url: " + err.Error())
 		return result
 	}
 	req.Header.Set("User-Agent", UserAgent)
@@ -242,7 +243,7 @@ func (c *Client) probe(ctx context.Context, target Target) Result {
 
 	resp, err := c.client().Do(req)
 	if err != nil {
-		result.Detail = err.Error()
+		result.Detail = sanitiseDetail(err.Error())
 		return result
 	}
 	defer resp.Body.Close()
@@ -255,7 +256,7 @@ func (c *Client) probe(ctx context.Context, target Target) Result {
 	// http client's business; a redirect that arrives is still a live server.
 	result.OK = resp.StatusCode >= 200 && resp.StatusCode < 400
 	if !result.OK {
-		result.Detail = resp.Status
+		result.Detail = sanitiseDetail(resp.Status)
 	}
 	// Latency is attached only to successes. A timeout produces a duration
 	// equal to the timeout, and reporting it as latency would make an outage
@@ -338,4 +339,38 @@ func jitter(interval time.Duration) time.Duration {
 	}
 	offset := int64(binary.BigEndian.Uint64(buf[:])%uint64(span)) - span/2
 	return interval + time.Duration(offset)
+}
+
+// maxDetail bounds the free-text field a schema audit cannot see into (T16.3).
+//
+// T16.3 forbids a per-circuit, per-name or per-peer identifier in telemetry, and
+// it is enforced by a SCHEMA audit -- which checks field NAMES. `Detail` passes
+// that check by name and can carry whatever a caller puts in it, so it is the
+// one field where the rule has to be about contents instead.
+const maxDetail = 200
+
+// ipInError matches a bare IPv4 address or a bracketed IPv6 one.
+var ipInError = regexp.MustCompile(`\b\d{1,3}(\.\d{1,3}){3}\b|\[[0-9a-fA-F:]+\]`)
+
+// sanitiseDetail bounds and redacts a probe's error text before it is reported.
+//
+// Go's HTTP errors are the specific problem. A failed request produces something
+// like
+//
+//	Get "https://example/x": dial tcp 203.0.113.9:443: connect: connection refused
+//
+// which carries the RESOLVED ADDRESS of the target. The targets are supplied by
+// the site rather than chosen by a user, so this is not somebody's browsing
+// history -- but it is still an address this node observed being sent to a
+// server, and "the useful field and the dangerous field are the same field" is
+// exactly what §23's P16 card warns about. The status code and the failure kind
+// are what make a probe useful; the IP adds nothing an operator needs.
+func sanitiseDetail(detail string) string {
+	detail = ipInError.ReplaceAllString(detail, "[redacted]")
+	if len(detail) > maxDetail {
+		// Truncated rather than dropped: "connection refused" is the whole value
+		// of the field, and it is at the end of a long Go error.
+		detail = detail[:maxDetail] + "..."
+	}
+	return detail
 }
