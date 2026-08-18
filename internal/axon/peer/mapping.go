@@ -41,15 +41,28 @@ const DefaultLease = 30 * time.Minute
 type MappingProtocol uint8
 
 const (
-	MappingUPnP   MappingProtocol = iota // UPnP-IGD
-	MappingNATPMP                        // NAT-PMP / PCP
+	MappingUPnP   MappingProtocol = iota // UPnP-IGD (no RFC; UPnP Forum)
+	MappingNATPMP                        // NAT-PMP, RFC 6886
+	// MappingPCP is declared in pcp.go, where the protocol lives.
 )
 
+// String names the protocol.
+//
+// NAT-PMP AND PCP ARE NOT THE SAME PROTOCOL and this used to say they were: one
+// constant, commented "NAT-PMP / PCP", stringified "nat-pmp". They are RFC 6886
+// and RFC 6887, sharing UDP port 5351 and a lineage and nothing else -- a
+// gateway answering one need not answer the other. The conflation meant an
+// operator reading a log could not tell which had been spoken, and it let the
+// roadmap describe PCP as covered by a constant that never implemented it.
 func (m MappingProtocol) String() string {
-	if m == MappingNATPMP {
+	switch m {
+	case MappingNATPMP:
 		return "nat-pmp"
+	case MappingPCP:
+		return "pcp"
+	default:
+		return "upnp"
 	}
-	return "upnp"
 }
 
 // Mapping is one established port mapping.
@@ -82,8 +95,12 @@ type Mapper interface {
 type MappingConfig struct {
 	// Enabled must be set explicitly. This is the opt-in.
 	Enabled bool
-	// Protocols to attempt, in order. Empty means UPnP then NAT-PMP, the §6.5
-	// order of decreasing awfulness -- but only if Enabled.
+	// Protocols to attempt, in order. Empty means UPnP, then PCP, then NAT-PMP
+	// -- §6.5's "order of decreasing awfulness", with PCP inserted AHEAD of
+	// NAT-PMP because it is NAT-PMP's successor and the two share a port: a
+	// gateway that speaks both should be spoken to in the one that can express
+	// IPv6, a requested external address, and a mapping nonce. RFC 6887 §16
+	// specifies exactly this fallback direction. Only if Enabled.
 	Protocols []MappingProtocol
 	// Lease is the requested lifetime; DefaultLease if zero.
 	Lease time.Duration
@@ -95,7 +112,7 @@ func (c MappingConfig) protocols() []MappingProtocol {
 	if len(c.Protocols) > 0 {
 		return c.Protocols
 	}
-	return []MappingProtocol{MappingUPnP, MappingNATPMP}
+	return []MappingProtocol{MappingUPnP, MappingPCP, MappingNATPMP}
 }
 
 func (c MappingConfig) lease() time.Duration {

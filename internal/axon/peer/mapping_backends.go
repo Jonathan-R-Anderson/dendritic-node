@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	natpmp "github.com/jackpal/go-nat-pmp"
@@ -159,4 +162,118 @@ func localAddrFor(ctx context.Context) (netip.Addr, error) {
 		return netip.Addr{}, err
 	}
 	return ap.Addr().Unmap(), nil
+}
+
+// NewMappersFor builds the mappers named by a config, in the config's order.
+//
+// IT EXISTS BECAUSE THE ORDER WAS DEAD CONFIG. MappingConfig.protocols() has
+// always returned a preference order and nothing turned it into mappers:
+// NewMappingManager takes them as a variadic argument and every caller passed
+// its own. So "UPnP, then PCP, then NAT-PMP" described an intention no code
+// carried out, and adding PCP to that list would otherwise have implemented a
+// protocol nothing could reach.
+//
+// SEPARATE AND STILL OPEN: nothing in cmd/ calls this, or NewMappingManager, at
+// all. Port mapping is off by default (§6.5) and this makes it constructible;
+// it does not make it wired. That gap is not F3's and is not closed here.
+//
+// A protocol whose discovery fails is SKIPPED, not fatal: a gateway speaking
+// PCP but not UPnP is the ordinary case, and refusing to map at all because the
+// first choice was absent would make the preference order a requirement list.
+func NewMappersFor(ctx context.Context, cfg MappingConfig) ([]Mapper, error) {
+	if !cfg.Enabled {
+		// The opt-in check lives here as well as in the manager, because this
+		// function performs DISCOVERY -- UPnP discovery broadcasts on the local
+		// network, and doing that unasked is the thing §6.5 forbids.
+		return nil, ErrMappingDisabled
+	}
+	var (
+		out   []Mapper
+		local netip.Addr
+		errs  []error
+	)
+	for _, proto := range cfg.protocols() {
+		switch proto {
+		case MappingUPnP:
+			m, err := NewUPnPMapper(ctx)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("upnp: %w", err))
+				continue
+			}
+			out = append(out, m)
+		case MappingPCP, MappingNATPMP:
+			// Both need the default gateway and this node's address on the
+			// route to it; found once and shared.
+			if !local.IsValid() {
+				a, err := localAddrFor(ctx)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("%s: %w", proto, err))
+					continue
+				}
+				local = a
+			}
+			gw, err := defaultGateway(ctx)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", proto, err))
+				continue
+			}
+			var m Mapper
+			if proto == MappingPCP {
+				m, err = NewPCPMapper(gw, local)
+			} else {
+				m, err = NewNATPMPMapper(gw)
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", proto, err))
+				continue
+			}
+			out = append(out, m)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: %w", ErrNoMapper, errors.Join(errs...))
+	}
+	return out, nil
+}
+
+// defaultGateway reads the default route's next hop from /proc/net/route.
+//
+// IT DOES NOT GUESS. The obvious shortcut is to assume the gateway is the .1 of
+// the local /24, and it is wrong often enough to matter -- on networks numbered
+// from .254, on point-to-point links, and on anything with more than one subnet.
+// A wrong guess does not fail cleanly: it sends PCP requests to whatever
+// unrelated host happens to hold that address, which is a mapping attempt
+// against a machine that never consented to one. An error is the correct
+// outcome when the route cannot be read.
+//
+// Linux only. On other platforms this returns an error and the PCP and NAT-PMP
+// backends are skipped, which is honest: the node still maps over UPnP if the
+// operator opted in, and reports why the others were not attempted.
+func defaultGateway(ctx context.Context) (netip.Addr, error) {
+	b, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("axon/peer: default gateway: %w", err)
+	}
+	for _, line := range strings.Split(string(b), "\n")[1:] {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		// Destination 00000000 is the default route.
+		if f[1] != "00000000" {
+			continue
+		}
+		// The next hop is little-endian hex, which is the one detail that makes
+		// this worth a comment: 0101A8C0 is 192.168.1.1, not 1.1.168.192.
+		v, err := strconv.ParseUint(f[2], 16, 32)
+		if err != nil {
+			continue
+		}
+		gw := netip.AddrFrom4([4]byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)})
+		if gw.IsUnspecified() {
+			continue
+		}
+		return gw, nil
+	}
+	return netip.Addr{}, errors.New("axon/peer: no default route with a next hop")
 }
