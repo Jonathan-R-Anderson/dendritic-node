@@ -36,6 +36,7 @@ const (
 	ClassLocation                        // StorageLocation, multi-writer
 	ClassSnapshot                        // RegistrySnapshot anchor
 	ClassIntro                           // IntroPointRecord
+	ClassReport                          // ContentReport (Part X §89, G4)
 )
 
 // label is the ASCII class label used in the key pre-image.
@@ -53,6 +54,8 @@ func (c RecordClass) label() string {
 		return "snap"
 	case ClassIntro:
 		return "intro"
+	case ClassReport:
+		return "report"
 	default:
 		return ""
 	}
