@@ -232,6 +232,14 @@ func TestBothTransportsCarryManyCells(t *testing.T) {
 // grepPackageFor counts occurrences of s in this package's non-test sources.
 // A source-level assertion because the property is "we never set this", which
 // no runtime check can establish.
+// grepPackageFor counts CODE references to an identifier in this package.
+//
+// COMMENTS ARE STRIPPED FIRST, and that is not a loosening. The audit exists to
+// catch code that SETS a field; a comment explaining why the field is
+// deliberately left alone is the documentation the audit wants to encourage, and
+// counting it made the audit fail on correct code. An audit that fails on
+// correct code gets deleted, which is strictly worse than one that reads only
+// code. Anything that actually assigns or reads the field still shows up.
 func grepPackageFor(s string) int {
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -247,7 +255,12 @@ func grepPackageFor(s string) int {
 		if err != nil {
 			continue
 		}
-		count += bytes.Count(b, []byte(s))
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "//") {
+				continue
+			}
+			count += strings.Count(line, s)
+		}
 	}
 	return count
 }
