@@ -92,6 +92,30 @@ type Assignment struct {
 // Candidates are tried emptiest-first so writes spread toward the nodes with
 // room instead of repeatedly filling whichever peer answered first.
 func Plan(shards []Shard, candidates []Candidate, wantHolders int) []Assignment {
+	ranked := append([]Candidate(nil), candidates...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].FreeBytes != ranked[j].FreeBytes {
+			return ranked[i].FreeBytes > ranked[j].FreeBytes
+		}
+		// Deterministic tie-break so two nodes planning the same chunk from the
+		// same inputs agree, and so tests are not flaky.
+		return ranked[i].PeerID < ranked[j].PeerID
+	})
+	return planOrdered(shards, ranked, wantHolders)
+}
+
+// planOrdered is the placement gate. It tries candidates IN THE ORDER GIVEN and
+// applies the domain constraint; it does not reorder them.
+//
+// The split exists so that every caller which wants a different preference order
+// -- Plan's emptiest-first, G11's reputation ranking (§95) -- shares ONE copy of
+// the constraint. The alternative, a caller that pre-sorts and then calls Plan,
+// does not work and is worth recording: Plan's own sort silently overrides the
+// caller's order whenever FreeBytes differs, so the ranking becomes a no-op that
+// every set-based test still passes. R-92.2's "reputation may reorder" is only
+// checkable if the reordering actually survives to the gate.
+func planOrdered(shards []Shard, ranked []Candidate, wantHolders int) []Assignment {
+	candidates := ranked
 	if wantHolders < 1 {
 		wantHolders = 1
 	}
@@ -122,16 +146,6 @@ func Plan(shards []Shard, candidates []Candidate, wantHolders int) []Assignment 
 			takenDomain[k] = true
 		}
 	}
-
-	ranked := append([]Candidate(nil), candidates...)
-	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].FreeBytes != ranked[j].FreeBytes {
-			return ranked[i].FreeBytes > ranked[j].FreeBytes
-		}
-		// Deterministic tie-break so two nodes planning the same chunk from the
-		// same inputs agree, and so tests are not flaky.
-		return ranked[i].PeerID < ranked[j].PeerID
-	})
 
 	// Shards furthest from the target are served first, so a chunk with one
 	// unplaced shard and eight placed ones does not lose its last slot to a
