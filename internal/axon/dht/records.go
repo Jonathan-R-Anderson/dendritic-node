@@ -526,6 +526,8 @@ func DecodeRecord(class RecordClass, wire []byte) (Record, error) {
 		r = new(RegistrySnapshot)
 	case ClassIntro:
 		r = new(IntroPointRecord)
+	case ClassReport:
+		r = new(ContentReport)
 	default:
 		return nil, ErrUnknownClass
 	}
