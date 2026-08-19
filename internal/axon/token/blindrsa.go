@@ -35,9 +35,20 @@ import (
 //     rather than PSS encoding. FDH is the classical Chaum construction and is
 //     provably secure under the RSA assumption in the random-oracle model, but
 //     RFC 9474 chose PSS and interop demands PSS.
-//   - There is no blinding-factor validity check on the issuer side, and no
-//     protection against the small set of pathological blinded values RFC 9474
-//     rejects.
+//   - The issuer does NOT check that the blinded value is modulus-length.
+//     RFC 9474 requires `len(blinded_msg) == modulus_len` and rejects anything
+//     else; SignBlinded uses SetBytes, which is length-agnostic, so a 16-byte
+//     and a 256-byte encoding of one value are both signed and produce the SAME
+//     signature. Nothing is forged and no key leaks -- what is lost is interop
+//     (a client written against the RFC passes here and fails elsewhere) and a
+//     canonical request encoding for anything above that hashes or dedupes the
+//     blinded bytes. Demonstrated in rfc9474_gap_test.go.
+//
+//     An earlier version of this list said there was "no blinding-factor
+//     validity check on the issuer side". THAT WAS WRONG: SignBlinded rejects
+//     values outside 0 < m < N and cites RFC 9474 for it. A gap list that
+//     overstates a gap sends the next reader to write a check that exists, and
+//     makes the entries that are accurate easier to disbelieve.
 //   - Key generation is Go's, which is fine, but the epoch key SCHEDULE — how
 //     long an epoch lasts and how keys are published — is not built here. It is
 //     the parameter that sets the anonymity set's denominator and §14.3 leaves
