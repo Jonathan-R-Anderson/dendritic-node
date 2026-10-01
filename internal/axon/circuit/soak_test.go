@@ -332,6 +332,33 @@ func TestE52SustainedThroughput(t *testing.T) {
 	t.Logf("E5.2 (%s): %d cells over a 3-hop circuit in %s, zero loss, "+
 		"%.1f Mbit/s of relay payload single-threaded",
 		label, cells, elapsed.Truncate(time.Millisecond), mbps)
+
+	// The throughput half of E5.2 used to be REPORTED and never asserted,
+	// because the criterion says "a stated throughput floor" and none was
+	// stated (item 4.4b). Two floors are stated now (params), and each is a
+	// regression tripwire far below the measured rate -- NOT a deployment SLA,
+	// which stays open because §5.1 shows the §8.6 window binds first at any
+	// real RTT.
+	//
+	// The smoke floor guards every run, including this default 2-second one and
+	// runs under -race; it is low enough never to flake on machine variance and
+	// trips only on catastrophic breakage.
+	if mbps < params.CircuitThroughputSmokeFloorMbps {
+		t.Fatalf("E5.2 regression: %.1f Mbit/s is below the smoke floor of "+
+			"%.1f Mbit/s. This is ~67x under the measured 135 and survives "+
+			"-race, so it means the crypto/framing path is catastrophically "+
+			"broken, not that the machine is slow.",
+			mbps, params.CircuitThroughputSmokeFloorMbps)
+	}
+	// The tighter regression floor is asserted only on the full soak, whose
+	// 10-minute average is stable and which is never run under -race.
+	if full && mbps < params.CircuitThroughputRegressionFloorMbps {
+		t.Fatalf("E5.2 regression: %.1f Mbit/s over 10 minutes is below the "+
+			"regression floor of %.1f Mbit/s (~6x under the measured 135). "+
+			"If this hardware is merely slow rather than regressed, LOWER the "+
+			"constant with a note -- do not delete the check.",
+			mbps, params.CircuitThroughputRegressionFloorMbps)
+	}
 	if !full {
 		t.Logf("E5.2 requires 10 minutes; run with -soak-minutes=10 to discharge it")
 	}

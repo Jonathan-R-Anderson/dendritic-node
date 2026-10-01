@@ -113,6 +113,10 @@ var (
 	ErrNetworksTooFew = errors.New("axon/peer: observation lacks prober network diversity")
 	ErrNoAddresses    = errors.New("axon/peer: observation carries no addresses")
 	ErrUnknownNodeID  = errors.New("axon/peer: empty node id")
+	// ErrContained is an observation refused because the operator contained this
+	// peer. Distinct from a quorum refusal on purpose: a quorum error says the
+	// EVIDENCE was too thin, this one says a person decided.
+	ErrContained = errors.New("axon/peer: peer is contained by operator decision")
 )
 
 // Peerbook records peers and samples them under diversity constraints.
@@ -127,6 +131,17 @@ type Peerbook struct {
 
 	mu      sync.RWMutex
 	entries map[string]*PeerEntry
+	// contained is the operator's containment list, or nil.
+	//
+	// The SAME list dht.Table consults. Two copies of a denial rule is one copy
+	// too many: a peer contained in the routing table and admitted to the
+	// peerbook is contained nowhere, because the peerbook is what SAMPLES.
+	contained Denier
+}
+
+// Denier answers whether a peer is contained. Satisfied by *contain.List.
+type Denier interface {
+	Denied(id string) bool
 }
 
 // NewPeerbook builds an empty peerbook. A nil annotator uses the default.
@@ -141,6 +156,54 @@ func NewPeerbook(a *Annotator, seed int64) *Peerbook {
 	}
 }
 
+// SetContainment wires the operator's containment list in.
+//
+// Existing entries are NOT swept here; SweepContained does that, and the two
+// are separate for the same reason they are in dht.Table -- wiring a list in
+// should not silently reshape a structure according to a list nobody has read.
+func (p *Peerbook) SetContainment(d Denier) {
+	p.mu.Lock()
+	p.contained = d
+	p.mu.Unlock()
+}
+
+// Forget removes a peer's entry. Reports whether there was one.
+//
+// FORGETTING WITHOUT DENYING IS THEATRE: the next probe that meets the quorum
+// re-creates the entry, so a responder who called only this would watch the
+// peer come back. Deny it in the containment list, then sweep.
+//
+// Named Forget to match profile.Forget, and it has the same limit that one has:
+// it drops what is RECORDED, not what is REACHABLE.
+func (p *Peerbook) Forget(nodeID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.entries[nodeID]
+	delete(p.entries, nodeID)
+	return ok
+}
+
+// SweepContained drops every entry the containment list currently denies.
+//
+// This is what makes a denial retroactive across a restart: a list loaded from
+// disk names peers ejected in an earlier incident, and without a sweep the
+// peerbook keeps sampling them.
+func (p *Peerbook) SweepContained() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.contained == nil {
+		return 0
+	}
+	removed := 0
+	for id := range p.entries {
+		if p.contained.Denied(id) {
+			delete(p.entries, id)
+			removed++
+		}
+	}
+	return removed
+}
+
 // Observe records a reachability observation about a peer.
 //
 // The quorum is enforced here rather than by the caller so that E3.3 holds by
@@ -148,6 +211,13 @@ func NewPeerbook(a *Annotator, seed int64) *Peerbook {
 func (p *Peerbook) Observe(nodeID string, addrs []netip.Addr, ev Evidence) error {
 	if nodeID == "" {
 		return ErrUnknownNodeID
+	}
+	// Before the quorum checks: a contained peer is refused whatever evidence
+	// arrives about it. The quorum decides whether an observation is BELIEVABLE;
+	// containment decides whether this node is willing to act on it at all, and
+	// those are different questions in that order.
+	if p.denied(nodeID) {
+		return fmt.Errorf("%w: %s", ErrContained, nodeID)
 	}
 	if len(addrs) == 0 {
 		return ErrNoAddresses
@@ -176,6 +246,12 @@ func (p *Peerbook) Observe(nodeID string, addrs []netip.Addr, ev Evidence) error
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// REPLACE the entry, never mutate one in place. Sample() builds a slice of
+	// *PeerEntry pointers under the read lock and dereferences them AFTER
+	// releasing it, which is safe only because an entry, once inserted, is
+	// immutable: a fresh struct is assigned here and the old one is never
+	// touched again. Updating a field on an existing entry in place instead
+	// would silently make Sample race -- TestPeerbookConcurrentAccess guards it.
 	p.entries[nodeID] = &PeerEntry{
 		NodeID:        nodeID,
 		Addrs:         append([]netip.Addr(nil), addrs...),
@@ -186,6 +262,13 @@ func (p *Peerbook) Observe(nodeID string, addrs []netip.Addr, ev Evidence) error
 		ProbeNetworks: networks,
 	}
 	return nil
+}
+
+func (p *Peerbook) denied(nodeID string) bool {
+	p.mu.RLock()
+	d := p.contained
+	p.mu.RUnlock()
+	return d != nil && d.Denied(nodeID)
 }
 
 // Get returns a copy of one entry.
@@ -312,4 +395,26 @@ func (p *Peerbook) SampleWithReport(k int, c DiversityConstraint) ([]PeerEntry, 
 		}
 	}
 	return out, rep
+}
+
+// Entries returns a copy of every entry.
+//
+// Added because nothing could enumerate the peerbook: Sample applies a
+// diversity constraint and Get needs a node id you already have, so a caller
+// wanting the whole membership -- which is what a path selector's candidate
+// pool is -- had no way to ask. Sampling with a large k is not the same thing:
+// it would return a diversity-filtered subset and call it the population.
+//
+// A copy, and deliberately not a cursor: the peerbook is small (bounded by what
+// probing establishes) and a caller iterating a live map under a read lock is
+// how a slow consumer becomes a stalled writer.
+func (p *Peerbook) Entries() []PeerEntry {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]PeerEntry, 0, len(p.entries))
+	for _, e := range p.entries {
+		out = append(out, *e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
 }

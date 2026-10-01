@@ -35,8 +35,9 @@ var confusableFold = map[byte]byte{
 	'b': '6', // b -> 6
 	'g': '9', // g -> 9
 	'z': '2', // z -> 2
-	// hyphen-like: only ASCII '-' survives Normalise, so there is nothing to
-	// fold here. Listed as a comment so the absence is visibly deliberate.
+	// hyphen: elided outright in Skeleton before this table runs, so it is a
+	// class member rather than a fold target. Listed so the absence is
+	// visibly deliberate.
 }
 
 // Skeleton reduces a label to its confusable representative.
@@ -46,7 +47,13 @@ var confusableFold = map[byte]byte{
 // homograph in real phishing. It has to be folded BEFORE the per-character pass,
 // or the r and n fold independently and the pair is lost.
 func Skeleton(label string) string {
-	s := strings.ReplaceAll(label, "rn", "m")
+	// Hyphen elision FIRST (§11.3.3: `s := replace(s, "-", "")`). Without it
+	// `my-bank` and `mybank` are different classes, and §11.3.3's own stated
+	// consequence 1 -- "mybank.axon blocks my-bank.axon" -- does not hold.
+	// The earlier note here read "hyphen-like" as a character-fold and
+	// concluded there was nothing to do; the rule is elision, not folding.
+	s := strings.ReplaceAll(label, "-", "")
+	s = strings.ReplaceAll(s, "rn", "m")
 	// "vv" reads as "w" for the same reason.
 	s = strings.ReplaceAll(s, "vv", "w")
 	// "cl" reads as "d" in several common faces.

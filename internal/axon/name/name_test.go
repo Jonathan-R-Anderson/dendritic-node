@@ -2,6 +2,7 @@ package name
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -354,4 +355,73 @@ func TestT85GoldenEncodings(t *testing.T) {
 		}
 	}
 	t.Logf("T8.5: %d golden encodings, all distinct and stable", len(got))
+}
+
+// TestE83SecondImplementation guards the divergences a second implementation
+// written from §11.3 found (scripts/e83, and scripts/e83/FINDINGS.md).
+//
+// The full comparison is 10⁴ inputs against a Python implementation and is not
+// runnable from `go test` — it needs the other implementation. What is pinned
+// here is every case where the two disagreed, so a regression is caught by the
+// normal suite rather than only by re-running the cross-check.
+func TestE83SecondImplementation(t *testing.T) {
+	// F2. §11.3.3 consequence 1, quoted: "mybank.axon blocks my-bank.axon,
+	// rnybank.axon and the digit-one variant." Skeleton elided no hyphens, so
+	// the first of those three was false.
+	for _, sib := range []string{"my-bank", "rnybank", "m-y-b-a-n-k"} {
+		if !Confusable("mybank", sib) {
+			t.Errorf("Confusable(mybank, %q) = false; §11.3.3 consequence 1 says it is blocked", sib)
+		}
+	}
+	if got := Skeleton("my-bank"); got != Skeleton("mybank") {
+		t.Errorf("Skeleton(my-bank) = %q, want Skeleton(mybank) = %q", got, Skeleton("mybank"))
+	}
+
+	// F1. nameHash must bind the namespace label. Read as the old two-level
+	// formula, these two collide, and they are different names with
+	// potentially different owners (§11.3.1).
+	lab, err := Normalise("alice.lab" + "." + RootSuffix)
+	if err != nil {
+		t.Fatalf("alice.lab: %v", err)
+	}
+	corp, err := Normalise("alice.corp" + "." + RootSuffix)
+	if err != nil {
+		t.Fatalf("alice.corp: %v", err)
+	}
+	hl, err := lab.NameHash()
+	if err != nil {
+		t.Fatalf("lab NameHash: %v", err)
+	}
+	hc, err := corp.NameHash()
+	if err != nil {
+		t.Fatalf("corp NameHash: %v", err)
+	}
+	if hl == hc {
+		t.Errorf("alice.lab and alice.corp share nameHash %x — the namespace label is not in the chain", hl)
+	}
+
+	// F3. Step order, which decides the reason a caller is given.
+	for _, tc := range []struct {
+		in   string
+		want error
+		why  string
+	}{
+		// Steps 1 and 2 are separate passes: non-ASCII wins even when a
+		// control byte comes first in the string.
+		{"\x01\xc3\xa9.lab." + RootSuffix, ErrNonASCII, "step 1 completes before step 2"},
+		// Step 8 is last: ungrammatical and not-ours reports ungrammatical.
+		{"ab.lab.example", ErrGrammar, "step 7 before step 8"},
+		{"a", ErrGrammar, "step 7 before step 8"},
+		// A per-label bound violation is a grammar refusal; ErrTooLong is the
+		// 253-byte whole-name cap only.
+		{"ab.lab." + RootSuffix, ErrGrammar, "registrable below the floor"},
+		{"alice.ab." + RootSuffix, ErrGrammar, "namespace below the floor"},
+		// The root label is the constant, not an instance of `label`.
+		{"alice.lab.-", ErrNotRoot, "root suffix is not subject to the LDH rules"},
+		{"alice.lab.ax--on", ErrNotRoot, "root suffix is not subject to the LDH rules"},
+	} {
+		if _, err := Normalise(tc.in); !errors.Is(err, tc.want) {
+			t.Errorf("Normalise(%q) = %v, want %v (%s)", tc.in, err, tc.want, tc.why)
+		}
+	}
 }

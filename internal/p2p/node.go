@@ -233,13 +233,28 @@ type Node struct {
 	// only source it has.
 	bootstrapMu     sync.RWMutex
 	bootstrapConfig *bootstrap.Config
-	http            *http.Client
-	directHTTP      *http.Client
-	keyMu           sync.RWMutex
-	coordKey        ed25519.PublicKey
-	peerMu          sync.RWMutex
-	bootstrapPeers  map[peer.ID]struct{}
-	i2pOnly         bool
+	// dataDir is where node state lives, and is what the bootstrap peer cache
+	// is written into. Held rather than passed down because the cache is
+	// written from the refresh path, which runs on a timer and has no caller
+	// to take it from.
+	dataDir string
+	// contained is the operator's containment list, or nil.
+	//
+	// The bootstrap path needs it for a reason the incident drill found the
+	// hard way: the peer cache is on DISK, so a host an operator contained came
+	// back on the next restart through a path that consulted nothing --
+	// containment that lapses across exactly the restart it was built to
+	// survive. See INCIDENT-RESPONSE.md step 3.
+	containMu sync.RWMutex
+	contained interface{ Denied(id string) bool }
+
+	http           *http.Client
+	directHTTP     *http.Client
+	keyMu          sync.RWMutex
+	coordKey       ed25519.PublicKey
+	peerMu         sync.RWMutex
+	bootstrapPeers map[peer.ID]struct{}
+	i2pOnly        bool
 	// candidateCache holds the storage peers the last discovery found, so one
 	// dispersal pass does not issue a DHT capacity query per chunk.
 	// refusals tracks peers that answered "no" to a shard, so the planner stops
@@ -450,7 +465,7 @@ func finishNode(
 	}
 	n := &Node{
 		host: h, dht: kad, store: storage, logger: logger, bootstrap: config.BootstrapURL,
-		bootstrapPeers: make(map[peer.ID]struct{}), http: httpClient,
+		bootstrapPeers: make(map[peer.ID]struct{}), http: httpClient, dataDir: dataDir,
 		directHTTP: directHTTP, i2pOnly: i2pOnly,
 		repairing: make(map[string]struct{}), shardMoves: newShardMoveBudget(),
 		// Empty until the first bootstrap fetch, and empty reports STALE — so a
@@ -936,6 +951,59 @@ func (n *Node) SetBootstrapConfig(cfg bootstrap.Config) {
 	n.bootstrapConfig = &cfg
 }
 
+// SetContainment wires the operator's containment list into the bootstrap path.
+//
+// Bootstrap peers are named by their LIBP2P peer id and the containment list
+// stores opaque strings, so a denial only bites here if that spelling is in the
+// list. An operator containing an AXON relay must deny BOTH spellings --
+// link.NodeIDFromPublic derives the libp2p id from the AXON identity key, and
+// the runbook gives the one-liner. Two identities for one host is a sharp edge,
+// and it closes when item 2.9 moves storage onto the AXON transport and there
+// is only one left.
+func (n *Node) SetContainment(d interface{ Denied(id string) bool }) {
+	n.containMu.Lock()
+	n.contained = d
+	n.containMu.Unlock()
+}
+
+func (n *Node) denied(id string) bool {
+	n.containMu.RLock()
+	d := n.contained
+	n.containMu.RUnlock()
+	return d != nil && d.Denied(id)
+}
+
+// admissibleBootstrapPeers drops peers the operator contained.
+//
+// Applied BEFORE the cache is written as well as before dialling, so a denied
+// host is not merely skipped this round but never persisted -- otherwise the
+// cache quietly carries it to the next restart, to be re-applied by somebody
+// who has forgotten about it.
+func (n *Node) admissibleBootstrapPeers(peers []string) []string {
+	out := make([]string, 0, len(peers))
+	for _, value := range peers {
+		address, err := multiaddr.NewMultiaddr(value)
+		if err != nil {
+			// Left in: an unparseable entry is the dial path's problem to
+			// report, and dropping it silently here would hide it.
+			out = append(out, value)
+			continue
+		}
+		info, err := peer.AddrInfoFromP2pAddr(address)
+		if err != nil {
+			out = append(out, value)
+			continue
+		}
+		if n.denied(info.ID.String()) {
+			n.logger.Printf("bootstrap: peer %s is contained by operator "+
+				"decision; not dialled and not cached", info.ID)
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
 func (n *Node) bootstrapCfg() *bootstrap.Config {
 	n.bootstrapMu.RLock()
 	defer n.bootstrapMu.RUnlock()
@@ -946,11 +1014,26 @@ func (n *Node) bootstrapCfg() *bootstrap.Config {
 // several sources, a signature checked against a pinned key, and agreement as a
 // second layer when there is no key to check against.
 func (n *Node) refreshDiscoveredBootstrap(ctx context.Context, cfg *bootstrap.Config) {
-	result, err := bootstrap.Fetch(ctx, n.http, nil, *cfg, n.logger, time.Now())
+	now := time.Now()
+	result, err := bootstrap.Fetch(ctx, n.http, nil, *cfg, n.logger, now)
 	if err != nil {
-		n.logger.Printf("bootstrap: no usable document (%v); local services "+
-			"remain active", err)
+		// T16.2. Every source is unreachable, so there is no document to
+		// verify and no coordinator key to refresh -- but joining the DHT does
+		// not need either, and a node that gives up here is a node an outage
+		// at the gateways has taken off the network entirely.
+		n.logger.Printf("bootstrap: no usable document (%v); trying cached peers",
+			err)
+		n.joinFromCache(ctx, now)
 		return
+	}
+	// Contained peers are dropped before anything else sees them, so they are
+	// neither dialled nor written to the cache.
+	result.Document.Peers = n.admissibleBootstrapPeers(result.Document.Peers)
+	// Cache BEFORE acting on it. The peers are worth keeping whether or not
+	// the coordinator key that travelled with them turns out to be usable,
+	// and the key check below returns early on failure.
+	if err := bootstrap.SaveCache(n.dataDir, result, now); err != nil {
+		n.logger.Printf("bootstrap: could not cache peers: %v", err)
 	}
 	publicKey, err := base64.RawStdEncoding.DecodeString(
 		result.Document.CoordinatorPublicKey)
@@ -965,8 +1048,86 @@ func (n *Node) refreshDiscoveredBootstrap(ctx context.Context, cfg *bootstrap.Co
 	// node learns where compute lives from something it already verified —
 	// rather than from a configured address, which names one machine and fails
 	// with it.
-	n.computePeers.Update(*result.Document, time.Now())
+	n.computePeers.Update(*result.Document, now)
 	n.connectBootstrapPeers(ctx, result.Document.Peers)
+}
+
+// joinFromCache is T16.2: the bootstrap document is unreachable, so dial the
+// peers the last reachable one named.
+//
+// THE COORDINATOR KEY IS NOT RESTORED HERE, and that asymmetry is the point.
+// Peers are a routing hint whose worst case is a dial that finds nobody -- the
+// same outcome as not trying. The coordinator key is a trust root, and reading
+// one back from a file is not the same act as verifying a signature: it would
+// convert "verified once, possibly months ago" into "trusted now", across a
+// restart, with nothing able to tell the difference afterwards. So a node
+// running on cache keeps whatever key it already holds and refreshes nothing;
+// if it holds none, storage leases stay unavailable until a real document is
+// verified. It joins the DHT either way, which is what T16.2 asks for.
+func (n *Node) joinFromCache(ctx context.Context, now time.Time) {
+	cache, err := bootstrap.LoadCache(n.dataDir, now)
+	switch {
+	case errors.Is(err, bootstrap.ErrNoCache):
+		// A first run with the network down. Ordinary, and not the cache's
+		// fault, so it is not reported as a failure.
+		n.logger.Printf("bootstrap: no cached peers yet; local services " +
+			"remain active")
+		return
+	case errors.Is(err, bootstrap.ErrCacheStale):
+		// Deliberately NOT dialled. A cache this old describes a network the
+		// node has been absent from for longer than peer churn takes, so the
+		// addresses are likelier to be wrong than right -- and dialling them
+		// would look like a partitioned view rather than an offline one.
+		n.logger.Printf("bootstrap: cached peers are too old to use (%v); "+
+			"local services remain active", err)
+		return
+	case err != nil:
+		n.logger.Printf("bootstrap: cached peers unusable (%v); local services "+
+			"remain active", err)
+		return
+	}
+	// Filtered BEFORE the log line, not after. A peer cached before the
+	// operator contained it is still in the file -- the cache must not be a way
+	// back in -- and the count reported has to be the count actually dialled.
+	//
+	// It said "joining from 2 cached peers" while joining one, which a test
+	// caught. That is the line an operator reads DURING AN INCIDENT to confirm
+	// a containment took effect, so a number that silently means something else
+	// is worse here than almost anywhere.
+	admissible := n.admissibleBootstrapPeers(cache.Peers)
+	withheld := len(cache.Peers) - len(admissible)
+
+	// Said plainly and every time, because a node running on cache is running
+	// on a view nothing has corroborated since it was written, and an operator
+	// reading a log should not have to infer that from silence.
+	n.logger.Printf("bootstrap: joining from %d of %d cached peers saved %v ago "+
+		"by %s (%s); %d withheld by containment; the coordinator key is NOT "+
+		"restored from cache and is not being refreshed",
+		len(admissible), len(cache.Peers), cache.Age(now).Round(time.Minute),
+		cacheSourceName(cache.Source), verifiedWord(cache.Verified), withheld)
+
+	if len(admissible) == 0 {
+		n.logger.Printf("bootstrap: every cached peer is contained; local " +
+			"services remain active")
+		return
+	}
+	n.connectBootstrapPeers(ctx, admissible)
+}
+
+func cacheSourceName(source string) string {
+	if source == "" {
+		return "an unrecorded source"
+	}
+	return source
+}
+
+// verifiedWord keeps the weaker provenance visible in the log line rather than
+// letting "cached" imply the stronger one.
+func verifiedWord(verified bool) string {
+	if verified {
+		return "signature was verified against the pinned key when cached"
+	}
+	return "corroborated across sources only, never signature-verified"
 }
 
 // ComputePeers returns nodes currently offering a kind of work.
@@ -1071,6 +1232,15 @@ func (n *Node) connectBootstrapPeers(ctx context.Context, peers []string) {
 		}
 		info, err := peer.AddrInfoFromP2pAddr(address)
 		if err != nil || info.ID == n.host.ID() {
+			continue
+		}
+		// Checked HERE and not only in admissibleBootstrapPeers, because this
+		// function has a third caller: the heartbeat's OnPeers, where the
+		// coordinator hands peers back directly. A containment enforced on two
+		// of three paths is one an operator cannot rely on.
+		if n.denied(info.ID.String()) {
+			n.logger.Printf("bootstrap: peer %s is contained by operator "+
+				"decision; not dialled", info.ID)
 			continue
 		}
 		// Skip peers already connected: heartbeats fire every few minutes and

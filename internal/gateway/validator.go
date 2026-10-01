@@ -150,6 +150,39 @@ func (v *Validator) round(ctx context.Context) error {
 	return nil
 }
 
+// auditReport is the body posted to /api/v1/gateway/audit.
+//
+// A TAGGED STRUCT RATHER THAN A MAP LITERAL, and the reason is not style.
+// T16.3's schema audit (internal/axon/telemetry) reads STRUCT FIELD NAMES, so a
+// payload assembled as map[string]any has no field names to read and passes the
+// audit by being invisible to it. This one was a map, and a field naming a real
+// third party could have been added to it without anything noticing.
+//
+// The field names and JSON keys are unchanged, and the signature is over
+// `message` rather than over this encoding, so the wire format the backend
+// parses is identical -- JSON object key order is not significant and no
+// signature covers it.
+//
+// WHAT THIS PAYLOAD DOES AND DOES NOT REVEAL, since it was briefly recorded as a
+// privacy cost and that was wrong. `Gateway` is an entry from the site's OWN
+// published directory and `ObjectKey` is an entry from the site's OWN
+// spot-check feed, defaulting to "/" -- the front page. Both originate at the
+// recipient, so posting them back tells it nothing it did not publish, and
+// neither is a per-user, per-circuit or per-name identifier of the kind T16.3
+// exists to keep out of metrics. It is audited rather than exempted so that
+// stays true of whatever is added later.
+type auditReport struct {
+	Gateway      string `json:"gateway"`
+	ObjectKey    string `json:"object_key"`
+	Version      int64  `json:"version"`
+	ObjectHash   string `json:"object_hash"`
+	Result       string `json:"result"`
+	LatencyMS    int    `json:"latency_ms"`
+	ObserverKind string `json:"observer_kind"`
+	ObserverKey  string `json:"observer_key"`
+	Signature    string `json:"signature"`
+}
+
 // audit fetches one object from one gateway and reports what came back.
 func (v *Validator) audit(ctx context.Context, key []byte, gateway directoryEntry,
 	object spotCheck) {
@@ -244,13 +277,16 @@ func (v *Validator) report(ctx context.Context, gateway, objectKey, version,
 	if len(publicKey) == 36 && string(publicKey[:4]) == "\x08\x01\x12\x20" {
 		publicKey = publicKey[4:]
 	}
-	payload, err := json.Marshal(map[string]any{
-		"gateway": gateway, "object_key": objectKey,
-		"version": parseVersion(version), "object_hash": bodyHash,
-		"result": result, "latency_ms": latency,
-		"observer_kind": "validator",
-		"observer_key":  base64.StdEncoding.EncodeToString(publicKey),
-		"signature":     base64.StdEncoding.EncodeToString(signature),
+	payload, err := json.Marshal(auditReport{
+		Gateway:      gateway,
+		ObjectKey:    objectKey,
+		Version:      parseVersion(version),
+		ObjectHash:   bodyHash,
+		Result:       result,
+		LatencyMS:    latency,
+		ObserverKind: "validator",
+		ObserverKey:  base64.StdEncoding.EncodeToString(publicKey),
+		Signature:    base64.StdEncoding.EncodeToString(signature),
 	})
 	if err != nil {
 		return

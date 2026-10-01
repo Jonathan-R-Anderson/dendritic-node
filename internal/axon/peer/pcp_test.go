@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,6 +18,19 @@ import (
 type fakeGateway struct {
 	conn *net.UDPConn
 	addr netip.AddrPort
+
+	// mu guards everything below it.
+	//
+	// serve() runs on its own goroutine and READS every knob on each request,
+	// while the tests WRITE them between requests -- and lastRequest goes the
+	// other way. Unsynchronised, that is a data race on eight fields, which
+	// `go test -race` reports for five tests in this file and which made the
+	// race detector unusable for the WHOLE package: any real race in the
+	// peerbook or the annotator was hidden behind this harness's noise.
+	//
+	// It went unnoticed because -race needs cgo, and cgo needs a C compiler
+	// that is not present in every environment this tree is built in.
+	mu sync.Mutex
 
 	// knobs
 	resultCode  uint8
@@ -50,6 +64,21 @@ func newFakeGateway(t *testing.T) *fakeGateway {
 	return g
 }
 
+// set changes a knob under the lock. A closure rather than eight setters: the
+// knobs are a test's vocabulary and adding one should not mean adding a method.
+func (g *fakeGateway) set(change func(*fakeGateway)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	change(g)
+}
+
+// request returns a COPY of the last request seen.
+func (g *fakeGateway) request() []byte {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]byte(nil), g.lastRequest...)
+}
+
 func (g *fakeGateway) serve() {
 	buf := make([]byte, 1500)
 	for {
@@ -58,15 +87,23 @@ func (g *fakeGateway) serve() {
 			return
 		}
 		req := append([]byte(nil), buf[:n]...)
+
+		// One snapshot per request, so a knob changed mid-response cannot
+		// produce a reply that is half one setting and half another.
+		g.mu.Lock()
 		g.lastRequest = req
+		version, resultCode := g.version, g.resultCode
+		grantedLife, epoch := g.grantedLife, g.epoch
+		forgeNonce, extPort, truncate := g.forgeNonce, g.extPort, g.truncate
+		g.mu.Unlock()
 
 		resp := make([]byte, pcpResponseLen)
-		resp[0] = g.version
+		resp[0] = version
 		resp[1] = 0x80 | pcpOpcodeMAP // R bit set
-		resp[3] = g.resultCode
-		binary.BigEndian.PutUint32(resp[4:8], g.grantedLife)
-		binary.BigEndian.PutUint32(resp[8:12], g.epoch)
-		if g.forgeNonce {
+		resp[3] = resultCode
+		binary.BigEndian.PutUint32(resp[4:8], grantedLife)
+		binary.BigEndian.PutUint32(resp[8:12], epoch)
+		if forgeNonce {
 			for i := 24; i < 36; i++ {
 				resp[i] = 0xff
 			}
@@ -76,11 +113,11 @@ func (g *fakeGateway) serve() {
 		if len(req) >= 42 {
 			copy(resp[40:42], req[40:42]) // internal port echoed
 		}
-		binary.BigEndian.PutUint16(resp[42:44], g.extPort)
+		binary.BigEndian.PutUint16(resp[42:44], extPort)
 		// External address 198.51.100.7 as IPv4-mapped IPv6, per RFC 6887 §5.
 		ext := netip.MustParseAddr("198.51.100.7").As16()
 		copy(resp[44:60], ext[:])
-		if g.truncate {
+		if truncate {
 			resp = resp[:20]
 		}
 		g.conn.WriteToUDP(resp, from)
@@ -110,7 +147,7 @@ func ctx3s(t *testing.T) context.Context {
 // TestPCPMapsAndReportsTheGrantedLease is the happy path and RFC 6887 §11.2.
 func TestPCPMapsAndReportsTheGrantedLease(t *testing.T) {
 	g := newFakeGateway(t)
-	g.grantedLife = 600 // gateway SHORTENS the lease
+	g.set(func(f *fakeGateway) { f.grantedLife = 600 }) // gateway SHORTENS the lease
 	p := g.mapper(t)
 
 	m, err := p.Map(ctx3s(t), 4001, 30*time.Minute)
@@ -191,7 +228,7 @@ func TestPCPRequestIsRFC6887Shaped(t *testing.T) {
 // reachability machine then advertises that address.
 func TestPCPRejectsAForgedNonce(t *testing.T) {
 	g := newFakeGateway(t)
-	g.forgeNonce = true
+	g.set(func(f *fakeGateway) { f.forgeNonce = true })
 	p := g.mapper(t)
 
 	if _, err := p.Map(ctx3s(t), 4001, time.Minute); !errors.Is(err, ErrPCPNonceMismatch) {
@@ -211,12 +248,12 @@ func TestPCPNonceIsStableAcrossRefreshes(t *testing.T) {
 	if _, err := p.Map(ctx3s(t), 4001, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	first := append([]byte(nil), g.lastRequest[24:36]...)
+	first := append([]byte(nil), g.request()[24:36]...)
 
 	if _, err := p.Map(ctx3s(t), 4001, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	second := g.lastRequest[24:36]
+	second := g.request()[24:36]
 
 	for i := range first {
 		if first[i] != second[i] {
@@ -241,19 +278,19 @@ func TestPCPNonceIsStableAcrossRefreshes(t *testing.T) {
 // so without this the node advertises a MAPPED address that stopped working.
 func TestPCPDetectsGatewayRestart(t *testing.T) {
 	g := newFakeGateway(t)
-	g.epoch = 5000
+	g.set(func(f *fakeGateway) { f.epoch = 5000 })
 	p := g.mapper(t)
 
 	if _, err := p.Map(ctx3s(t), 4001, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	// Epoch moving forward is normal.
-	g.epoch = 5100
+	g.set(func(f *fakeGateway) { f.epoch = 5100 })
 	if _, err := p.Map(ctx3s(t), 4001, time.Minute); err != nil {
 		t.Fatalf("a forward epoch was treated as a restart: %v", err)
 	}
 	// Epoch going backwards means the gateway restarted.
-	g.epoch = 3
+	g.set(func(f *fakeGateway) { f.epoch = 3 })
 	if _, err := p.Map(ctx3s(t), 4001, time.Minute); !errors.Is(err, ErrPCPEpochReset) {
 		t.Fatalf("a gateway restart went undetected: %v", err)
 	}
@@ -262,7 +299,7 @@ func TestPCPDetectsGatewayRestart(t *testing.T) {
 // TestPCPSurfacesAddressMismatch is result code 12, the double-NAT signature.
 func TestPCPSurfacesAddressMismatch(t *testing.T) {
 	g := newFakeGateway(t)
-	g.resultCode = 12
+	g.set(func(f *fakeGateway) { f.resultCode = 12 })
 	p := g.mapper(t)
 
 	_, err := p.Map(ctx3s(t), 4001, time.Minute)

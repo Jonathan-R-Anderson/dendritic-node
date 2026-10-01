@@ -48,11 +48,20 @@ func Normalise(input string) (Name, error) {
 	// 1. Reject any byte >= 0x80. FIRST, so that every lookalike codepoint --
 	//    including the full-stop lookalikes -- is gone before anything else
 	//    inspects structure.
+	//
+	//    A SEPARATE PASS, not a combined one: §11.3.2 numbers this step 1 and
+	//    the control-byte rule step 2, and an input carrying both must report
+	//    the non-ASCII byte whichever comes first in the string. Folding the
+	//    two rules into one loop makes the reported reason depend on byte
+	//    order, which E8.3's second implementation caught.
 	for i := 0; i < len(input); i++ {
 		if input[i] >= 0x80 {
 			return Name{}, fmt.Errorf("%w at offset %d", ErrNonASCII, i)
 		}
-		// 2. Reject control bytes.
+	}
+
+	// 2. Reject control bytes.
+	for i := 0; i < len(input); i++ {
 		if input[i] < 0x20 || input[i] == 0x7F {
 			return Name{}, fmt.Errorf("%w at offset %d", ErrControl, i)
 		}
@@ -107,10 +116,6 @@ func (n Name) validate() error {
 	if l := len(n.String()); l > MaxNameBytes {
 		return fmt.Errorf("%w: %d > %d bytes", ErrTooLong, l, MaxNameBytes)
 	}
-	// 8. Require the last label == the root suffix.
-	if n.labels[len(n.labels)-1] != RootSuffix {
-		return ErrNotRoot
-	}
 	// A bare root, or root with no registrable label, is not a name.
 	if len(n.labels) < 3 {
 		return fmt.Errorf("%w: need registrable.namespace.%s", ErrGrammar, RootSuffix)
@@ -141,6 +146,15 @@ func (n Name) validate() error {
 			return fmt.Errorf("%w: subordinate %d (%q) length %d outside [%d,%d]",
 				ErrGrammar, i, l, len(l), MinSubordinateLen, MaxSubordinateLen)
 		}
+	}
+	// 8. Require the last label == the root suffix.
+	//
+	// LAST, because §11.3.2 numbers it last: a name that is both ungrammatical
+	// and not ours is reported as ungrammatical. Checking it earlier made the
+	// root suffix mask every other refusal, which is the wrong reason to give a
+	// caller and which E8.3's second implementation caught on 1 799 inputs.
+	if n.labels[len(n.labels)-1] != RootSuffix {
+		return ErrNotRoot
 	}
 	return nil
 }
