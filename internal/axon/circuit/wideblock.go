@@ -11,7 +11,7 @@ import (
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/hkdf"
 
-	"github.com/syndichan/maniwani/storage-client/internal/axon/params"
+	"github.com/rabbiit/maniwani/storage-client/internal/axon/params"
 )
 
 // P5a: the wide-block construction that replaces the withdrawn tag stack.

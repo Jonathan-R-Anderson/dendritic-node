@@ -46,7 +46,7 @@ func TestRegistryRequestHasSignatureAndNoReusableSecret(t *testing.T) {
 	client.Now = func() time.Time { return time.Unix(1700000000, 0) }
 	client.Client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		body, _ := io.ReadAll(request.Body)
-		signature, err := base64.RawStdEncoding.DecodeString(request.Header.Get("X-Syndichan-Signature"))
+		signature, err := base64.RawStdEncoding.DecodeString(request.Header.Get("X-Rabbiit-Signature"))
 		if err != nil || !ed25519.Verify(public, body, signature) {
 			t.Fatal("request signature was invalid")
 		}
@@ -95,7 +95,7 @@ func TestReservationPrecedesACMEAndWaitsForMatchingDNS(t *testing.T) {
 		}
 		body, _ := io.ReadAll(request.Body)
 		signature, decodeErr := base64.RawStdEncoding.DecodeString(
-			request.Header.Get("X-Syndichan-Signature"),
+			request.Header.Get("X-Rabbiit-Signature"),
 		)
 		if decodeErr != nil || !ed25519.Verify(public, body, signature) {
 			t.Fatal("reservation signature was invalid")

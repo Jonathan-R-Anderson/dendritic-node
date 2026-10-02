@@ -164,7 +164,7 @@ func TestDiscoverBuildsHostnameURLs(t *testing.T) {
 		{Target: "gw-c.rabbiit.io.", Port: 8443, Priority: 10, Weight: 50},
 	}}
 	urls := Discover(context.Background(), resolver,
-		"_syndichan-bootstrap._tcp.rabbiit.io")
+		"_rabbiit-bootstrap._tcp.rabbiit.io")
 	if len(urls) != 3 {
 		t.Fatalf("got %v", urls)
 	}

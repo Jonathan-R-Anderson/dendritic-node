@@ -138,7 +138,7 @@ func TestE143EveryProvisionalParameterStatesItsDerivation(t *testing.T) {
 // dependence from being reintroduced — the failure mode is not a deliberate
 // call to a coordinator but an innocuous-looking "just check the lease first".
 func TestT144NoCoordinatorInTheAdmissionPath(t *testing.T) {
-	banned := regexp.MustCompile(`(?i)syndichan\.org|coordinator|lease|http\.|net/http`)
+	banned := regexp.MustCompile(`(?i)rabbiit\.org|coordinator|lease|http\.|net/http`)
 	fset := token.NewFileSet()
 	var files []string
 	err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {

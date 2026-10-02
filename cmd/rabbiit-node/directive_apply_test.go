@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/syndichan/maniwani/storage-client/internal/config"
-	"github.com/syndichan/maniwani/storage-client/internal/directive"
+	"github.com/rabbiit/maniwani/storage-client/internal/config"
+	"github.com/rabbiit/maniwani/storage-client/internal/directive"
 )
 
 func configPointingAtOrigin() *config.Config {
@@ -16,7 +16,7 @@ func configPointingAtOrigin() *config.Config {
 	cfg.Gateway.Validator.OriginURL = "https://rabbiit.io"
 	cfg.Gateway.Content.OriginURL = "https://rabbiit.io"
 	cfg.NetworkDirective.Sources = []string{
-		"https://rabbiit.io/.well-known/syndichan/network.json",
+		"https://rabbiit.io/.well-known/rabbiit/network.json",
 	}
 	cfg.UIListen = "127.0.0.1:9090"
 	cfg.I2PSAM = "127.0.0.1:7656"

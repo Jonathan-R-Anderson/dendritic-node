@@ -10,7 +10,7 @@ func TestRewriteOriginFollowsTheOldOrigin(t *testing.T) {
 	cases := map[string]string{
 		"https://rabbiit.io/api/v1/gateways":                    "https://rabbiit.net/api/v1/gateways",
 		"https://rabbiit.io":                                    "https://rabbiit.net",
-		"https://rabbiit.io/.well-known/syndichan/network.json": "https://rabbiit.net/.well-known/syndichan/network.json",
+		"https://rabbiit.io/.well-known/rabbiit/network.json": "https://rabbiit.net/.well-known/rabbiit/network.json",
 		"http://rabbiit.io/x?a=1&b=2":                           "http://rabbiit.net/x?a=1&b=2",
 	}
 	for input, want := range cases {

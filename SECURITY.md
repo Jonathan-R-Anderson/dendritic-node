@@ -58,7 +58,7 @@ produces the build that refuses to verify, never one that silently claims it
 did.
 
 **Released binaries do not contain BLS, and that is not a downgrade.** Nothing
-in `cmd/syndichan-node` constructs a `BLSVerifier` — the only callers of
+in `cmd/rabbiit-node` constructs a `BLSVerifier` — the only callers of
 `NewBLSVerifier` are tests, and `LightClientState` takes its verifier as a
 parameter. BLS arrived as a verified library capability with the consensus-spec
 vectors and was never wired into a runtime path.
@@ -127,7 +127,7 @@ per product requirements. It therefore exposes the node's public egress IP to
 `rabbiit.io`, although the heartbeat table itself does not persist that IP.
 The heartbeat is signed by the libp2p identity, freshness-checked, and
 replay-protected. It uses the fixed User-Agent
-`Syndichan-Storage-Client/1.0`.
+`Rabbiit-Storage-Client/1.0`.
 
 ## Volunteer gateway trust boundary
 

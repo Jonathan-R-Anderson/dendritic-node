@@ -1,7 +1,7 @@
-# Syndichan Storage Node
+# Rabbiit Storage Node
 
-`syndichan-node` is a single program that lets you donate spare disk space, or
-spare bandwidth, to Syndichan. It runs on Windows, macOS, and Linux.
+`rabbiit-node` is a single program that lets you donate spare disk space, or
+spare bandwidth, to Rabbiit. It runs on Windows, macOS, and Linux.
 
 It does two jobs, and you choose one or both:
 
@@ -40,12 +40,12 @@ go test ./...
 Build for the computer you're on:
 
 ```sh
-go build -trimpath -o syndichan-node ./cmd/syndichan-node
+go build -trimpath -o rabbiit-node ./cmd/rabbiit-node
 ```
 
-That leaves a `syndichan-node` binary in the current directory. Run it with
-`./syndichan-node`. It reads (and on first run writes) its configuration at
-`~/.config/Syndichan/storage-node/config.json` on Linux, and prints the path it
+That leaves a `rabbiit-node` binary in the current directory. Run it with
+`./rabbiit-node`. It reads (and on first run writes) its configuration at
+`~/.config/Rabbiit/storage-node/config.json` on Linux, and prints the path it
 chose on the first line of its output.
 
 **A freshly built node needs an I2P router already running**, because it dials a
@@ -66,7 +66,7 @@ ss -lnt | grep 7656        # nothing yet? wait, then look again
 
 See *Install it* for getting a router running in the first place.
 
-If startup instead fails with a bare `timeout`, another `syndichan-node` is
+If startup instead fails with a bare `timeout`, another `rabbiit-node` is
 already running against the same data directory and holding its database lock.
 Only one instance may use a data directory at a time.
 
@@ -81,12 +81,12 @@ That produces:
 
 | Target machine | Executable |
 | --- | --- |
-| Intel/AMD Linux | `syndichan-node-linux-amd64` |
-| ARM Linux (incl. Raspberry Pi 4/5) | `syndichan-node-linux-arm64` |
-| Intel Mac | `syndichan-node-darwin-amd64` |
-| Apple Silicon Mac | `syndichan-node-darwin-arm64` |
-| Intel/AMD Windows | `syndichan-node-windows-amd64.exe` |
-| Windows on ARM | `syndichan-node-windows-arm64.exe` |
+| Intel/AMD Linux | `rabbiit-node-linux-amd64` |
+| ARM Linux (incl. Raspberry Pi 4/5) | `rabbiit-node-linux-arm64` |
+| Intel Mac | `rabbiit-node-darwin-amd64` |
+| Apple Silicon Mac | `rabbiit-node-darwin-arm64` |
+| Intel/AMD Windows | `rabbiit-node-windows-amd64.exe` |
+| Windows on ARM | `rabbiit-node-windows-arm64.exe` |
 
 These are unsigned binaries. macOS Gatekeeper and Windows SmartScreen will warn
 about a build you downloaded rather than compiled yourself.
@@ -99,7 +99,7 @@ but they are easy to miss because nothing fails until a job is already running.
 **A container image, to run the node under Kubernetes or Docker:**
 
 ```sh
-docker build -t registry.local/syndichan-node:latest .
+docker build -t registry.local/rabbiit-node:latest .
 ```
 
 `registry.local` is **not a real registry** — nothing can pull from it. Under
@@ -107,7 +107,7 @@ k3s the image has to be handed to containerd directly, or the pod sits in
 `ImagePullBackOff`:
 
 ```sh
-docker save registry.local/syndichan-node:latest -o node.tar
+docker save registry.local/rabbiit-node:latest -o node.tar
 sudo k3s ctr images import node.tar
 ```
 
@@ -190,7 +190,7 @@ What it does, and does not do:
 - **Waits for SAM properly**, up to five minutes, and installs that same wait
   as the service's `ExecStartPre`. The node has no startup retry, so a service
   that starts before the bridge exists just dies.
-- **Runs the node as a dedicated `syndichan` user**, never root, and the only
+- **Runs the node as a dedicated `rabbiit` user**, never root, and the only
   path it takes ownership of is the node's own data directory.
 - **Enables the router on boot too**, otherwise the node reboots into nothing.
 - **Never downloads a guest kernel**, never installs a GPU driver, and never
@@ -228,20 +228,20 @@ The node expects I2P's SAM bridge on `127.0.0.1:7656` and its HTTP proxy on
 Now start the node as your normal user (not root):
 
 ```sh
-chmod 755 syndichan-node-linux-amd64
-./syndichan-node-linux-amd64
+chmod 755 rabbiit-node-linux-amd64
+./rabbiit-node-linux-amd64
 ```
 
 ```powershell
-.\syndichan-node-windows-amd64.exe
+.\rabbiit-node-windows-amd64.exe
 ```
 
 On first start it creates a mode-0600 config file, your S3 credentials, and
 your encryption keys in your user config directory:
 
-- Linux: `~/.config/Syndichan/storage-node`
-- macOS: `~/Library/Application Support/Syndichan/storage-node`
-- Windows: `%AppData%\Syndichan\storage-node`
+- Linux: `~/.config/Rabbiit/storage-node`
+- macOS: `~/Library/Application Support/Rabbiit/storage-node`
+- Windows: `%AppData%\Rabbiit\storage-node`
 
 Out of the box you get:
 
@@ -327,7 +327,7 @@ A flag is saved to the config and used from then on, so you pass it once rather
 than baking it into a service unit:
 
 ```sh
-./syndichan-node -payout 0xYourWalletAddress -capacity-gib 100 -ui-listen off
+./rabbiit-node -payout 0xYourWalletAddress -capacity-gib 100 -ui-listen off
 ```
 
 A bad payout address is refused rather than saved with a warning: a typo there
@@ -348,7 +348,7 @@ where the money behind it comes from.
 Nothing is earned without one, because there is nowhere to send it:
 
 ```sh
-./syndichan-node -payout 0xYourWalletAddress
+./rabbiit-node -payout 0xYourWalletAddress
 ```
 
 or set `"payout_address"` in the config file. On start the node publishes that
@@ -446,7 +446,7 @@ gateway from your house you need to do three things on your own network:
    ```
 
    ```powershell
-   New-NetFirewallRule -DisplayName "Syndichan 443" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow
+   New-NetFirewallRule -DisplayName "Rabbiit 443" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow
    ```
 
 Then check from **outside** your network — a phone on mobile data works well.
@@ -475,7 +475,7 @@ run mode to **gateway-only** on the management page (or `"run_mode":
 "gateway-only"` in the config file), then start the node:
 
 ```sh
-./syndichan-node -config gateway.json
+./rabbiit-node -config gateway.json
 ```
 
 Gateway-only runs the gateway and nothing else: no shard store, no S3, no I2P.
@@ -592,14 +592,14 @@ RHEL — anything with systemd.
 **1. Lay it out.** Keep the binary, the config and the data under one directory:
 
 ```sh
-mkdir -p ~/syndichan-node/{bin,config,data}
-cp syndichan-node ~/syndichan-node/bin/
-cp gateway.json  ~/syndichan-node/config/config.json
-chmod 600 ~/syndichan-node/config/config.json
+mkdir -p ~/rabbiit-node/{bin,config,data}
+cp rabbiit-node ~/rabbiit-node/bin/
+cp gateway.json  ~/rabbiit-node/config/config.json
+chmod 600 ~/rabbiit-node/config/config.json
 ```
 
 **2. Create the service.** Save it as
-`/etc/systemd/system/syndichan-node.service`.
+`/etc/systemd/system/rabbiit-node.service`.
 
 **Replace `EXAMPLE` with your own username everywhere it appears** — six places
 below. If your user is `alice`, every `/home/EXAMPLE/...` becomes
@@ -607,7 +607,7 @@ below. If your user is `alice`, every `/home/EXAMPLE/...` becomes
 
 ```ini
 [Unit]
-Description=Syndichan Gateway Node
+Description=Rabbiit Gateway Node
 Wants=network-online.target
 After=network-online.target
 # These two belong in [Unit], not [Service] -- systemd moved them, and it
@@ -619,12 +619,12 @@ StartLimitBurst=5
 Type=simple
 User=EXAMPLE
 Group=EXAMPLE
-WorkingDirectory=/home/EXAMPLE/syndichan-node
+WorkingDirectory=/home/EXAMPLE/rabbiit-node
 # No posture flags: run mode (gateway-only here), the data directory and
 # everything else come from the config file. Set "run_mode": "gateway-only" in
 # it, or switch it on the management page.
-ExecStart=/home/EXAMPLE/syndichan-node/bin/syndichan-node \
-    -config /home/EXAMPLE/syndichan-node/config/config.json
+ExecStart=/home/EXAMPLE/rabbiit-node/bin/rabbiit-node \
+    -config /home/EXAMPLE/rabbiit-node/config/config.json
 
 # Ports 80 and 443 are privileged. This is what lets an ordinary user bind
 # them; without it the service dies instantly with "permission denied".
@@ -653,7 +653,7 @@ ProtectHome=read-only
 # another disk, list that path here (several paths are allowed, space separated,
 # quoted if they contain spaces) or the node fails with
 # "read-only file system" on a mount that is perfectly writable.
-ReadWritePaths=/home/EXAMPLE/syndichan-node
+ReadWritePaths=/home/EXAMPLE/rabbiit-node
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -670,14 +670,14 @@ enables it at boot.
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now syndichan-node
+sudo systemctl enable --now rabbiit-node
 ```
 
 **4. Confirm, then forget about it:**
 
 ```sh
-systemctl status syndichan-node
-journalctl -u syndichan-node -f          # live log; Ctrl-C to stop watching
+systemctl status rabbiit-node
+journalctl -u rabbiit-node -f          # live log; Ctrl-C to stop watching
 ```
 
 You want to see `Active: active (running)` and a line like
@@ -695,7 +695,7 @@ Three things people get wrong here:
   hostnames and two certificates.
 - **Don't run a second copy by hand while the service is up.** Only one process
   can hold ports 80 and 443; the second exits with "address already in use".
-  Use `sudo systemctl stop syndichan-node` first.
+  Use `sudo systemctl stop rabbiit-node` first.
 - **`ProtectHome=read-only` plus `ReadWritePaths`** is what keeps the node from
   writing anywhere in your home directory except its own folder. If you move
   the installation, update `ReadWritePaths` too or it will fail to write.
@@ -703,21 +703,21 @@ Three things people get wrong here:
 Everyday commands:
 
 ```sh
-sudo systemctl restart syndichan-node     # after editing the config
-sudo systemctl stop syndichan-node        # graceful, withdraws it from DNS
-sudo systemctl disable --now syndichan-node   # stop and remove from boot
+sudo systemctl restart rabbiit-node     # after editing the config
+sudo systemctl stop rabbiit-node        # graceful, withdraws it from DNS
+sudo systemctl disable --now rabbiit-node   # stop and remove from boot
 ```
 
 To upgrade, replace the binary and restart:
 
 ```sh
-sudo systemctl stop syndichan-node
-cp /path/to/new/syndichan-node ~/syndichan-node/bin/syndichan-node
-sudo systemctl start syndichan-node
+sudo systemctl stop rabbiit-node
+cp /path/to/new/rabbiit-node ~/rabbiit-node/bin/rabbiit-node
+sudo systemctl start rabbiit-node
 ```
 
 A ready-made copy of this unit ships as
-[`packaging/systemd/syndichan-node-gateway-home.service`](packaging/systemd/syndichan-node-gateway-home.service),
+[`packaging/systemd/rabbiit-node-gateway-home.service`](packaging/systemd/rabbiit-node-gateway-home.service),
 and [`GATEWAY.md`](GATEWAY.md) covers a timer that pulls and rebuilds from git
 automatically, with rollback if the new build fails to come up.
 
@@ -773,7 +773,7 @@ and `role.worker`:
 Then start the node the normal way:
 
 ```sh
-./syndichan-node-linux-amd64
+./rabbiit-node-linux-amd64
 ```
 
 You should see, after the node comes up:
@@ -786,7 +786,7 @@ That is the whole thing. The worker now:
 
 - **publishes a capability record** to the DHT so others can find it (expires
   and refreshes on its own, like the gateway record — a crashed worker vanishes);
-- **accepts signed deployment requests** over I2P on `/syndichan/dcs/1.0.0`;
+- **accepts signed deployment requests** over I2P on `/rabbiit/dcs/1.0.0`;
 - **caps concurrent containers** at `max_containers`. Beyond that, further
   requests are **queued** and the requester is told their place in line and an
   estimated wait — nobody is bogged down past what you set;
@@ -871,7 +871,7 @@ backend calls that
 API to publish challenge images, spin instances up, poll the queue, and spin
 them down.
 
-This is exactly how Syndichan's own Attack Range page works
+This is exactly how Rabbiit's own Attack Range page works
 (`backend/services/attack_range.py` → `NodeBridgeClient`).
 
 Turn it on by adding `api_listen` to the `dcs` block. The bridge needs no
