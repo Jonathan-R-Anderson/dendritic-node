@@ -431,7 +431,7 @@ func TestCheckNamesTheOffender(t *testing.T) {
 // TestT144StorageAdmissionNeedsNoCoordinator is T14.4.
 //
 // "Storage admission works with no coordinator reachable — falsified by any
-// dependence on syndichan.org."
+// dependence on rabbiit.io."
 //
 // The structural half is an audit (audit_test.go). This is the behavioural
 // half: the decision is a pure function of the request, so there is no

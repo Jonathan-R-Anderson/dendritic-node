@@ -15,7 +15,7 @@
   the ambiguity and T11.5 required it resolved rather than left to the reader.
 - Volunteer peers are untrusted and receive only independently authenticated,
   content-addressed encrypted shards.
-- `syndichan.org` is the discovery and allocation coordinator. Its HTTPS
+- `rabbiit.io` is the discovery and allocation coordinator. Its HTTPS
   requests are forced through the configured local I2P HTTP proxy; TLS
   authenticates bootstrap documents and its Ed25519 key authenticates leases.
 - Kademlia records and peer responses are untrusted hints. Every returned shard
@@ -124,7 +124,7 @@ the outproxy rather than the node's IP.
 
 The five-minute frontend heartbeat is intentionally direct rather than I2P,
 per product requirements. It therefore exposes the node's public egress IP to
-`syndichan.org`, although the heartbeat table itself does not persist that IP.
+`rabbiit.io`, although the heartbeat table itself does not persist that IP.
 The heartbeat is signed by the libp2p identity, freshness-checked, and
 replay-protected. It uses the fixed User-Agent
 `Syndichan-Storage-Client/1.0`.

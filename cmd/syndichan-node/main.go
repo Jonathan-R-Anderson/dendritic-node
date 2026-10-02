@@ -467,7 +467,7 @@ func main() {
 	if cfg.Gateway.Validator.Enabled {
 		originURL := cfg.Gateway.Validator.OriginURL
 		if originURL == "" {
-			originURL = "https://syndichan.org"
+			originURL = "https://rabbiit.io"
 		}
 		validator := gateway.NewValidator(signer, originURL, logger,
 			time.Now().UnixNano())
@@ -658,7 +658,7 @@ func main() {
 	// gateway role is on. external_verification only decides HOW the address
 	// is proven: by a peer probe quorum, or by the controller's own
 	// independent connect-back alone.
-	// Registering puts this host's IP into the PUBLIC syndichan.org answer set.
+	// Registering puts this host's IP into the PUBLIC rabbiit.io answer set.
 	// Without the SNI frontend this process serves only its own gw-<id>
 	// hostname, so a visitor whose DNS lands here gets a completed TCP connect
 	// and then a failed TLS handshake ("host not configured in HostWhitelist").

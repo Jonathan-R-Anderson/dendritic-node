@@ -34,7 +34,7 @@ const (
 	// Interval matches the five-minute presence window the frontend documents.
 	Interval = 5 * time.Minute
 	// Endpoint is the production presence endpoint.
-	Endpoint = "https://syndichan.org/api/v1/storage/nodes/heartbeat"
+	Endpoint = "https://rabbiit.io/api/v1/storage/nodes/heartbeat"
 
 	maxResponseBytes = 64 << 10
 )

@@ -24,7 +24,7 @@ One process may be a candidate and probe, but its own probe result never counts.
 
 1. The candidate signs a short-lived hostname reservation with its persistent
    node identity. The controller deterministically derives
-   `gw-<identity-hash>.syndichan.org`, points it only at the observed request
+   `gw-<identity-hash>.rabbiit.io`, points it only at the observed request
    source IP, and returns after the DNS provider accepts the change.
 2. The candidate confirms that public DNS resolves its assigned name to that
    exact address, then starts exact-host ACME and its TLS listener.
@@ -39,7 +39,7 @@ One process may be a candidate and probe, but its own probe result never counts.
 7. The candidate requires three distinct admitted identities across two
    configured network trust domains by default.
 8. It signs a five-minute registration and submits it directly to
-   `https://syndichan.org/api/v1/gateways/register`. The server ignores claimed
+   `https://rabbiit.io/api/v1/gateways/register`. The server ignores claimed
    addresses, derives the HTTPS source IP, and independently checks TCP 443,
    TLS hostname validity, HTTP 200, and `X-Gateway-Version`.
 9. Only after server acceptance is it published under
@@ -155,7 +155,7 @@ Never run a second copy alongside the service; only one process can own 80 and
 ```sh
 systemctl show syndichan-node -p ExecStart
 ss -lnt | grep -E ':80 |:443 |:9000 |:9090 '
-curl --fail https://gw-NODE-ID.syndichan.org/readyz
+curl --fail https://gw-NODE-ID.rabbiit.io/readyz
 ```
 
 Only 80/443 may be present; 9000 and 9090 must be absent. `/readyz` must return
@@ -213,7 +213,7 @@ for the gateway plus
 and
 [`syndichan-node-update.timer`](packaging/systemd/syndichan-node-update.timer)
 for updates. Replace the example `/readyz` hostname in the update service with
-the controller-assigned `gw-...syndichan.org` name before enabling it.
+the controller-assigned `gw-...rabbiit.io` name before enabling it.
 
 The updater never installs a downloaded opaque executable. It fetches `main`
 into a bare mirror, exports the exact commit to a temporary directory, runs

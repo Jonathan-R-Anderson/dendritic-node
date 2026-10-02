@@ -19,7 +19,7 @@ import (
 // Peer discovery starts at the dedicated data-node edge. That edge exposes only
 // this well-known document over publicly trusted TLS; coordinator leases and
 // the direct five-minute presence heartbeat remain separate concerns.
-const BootstrapURL = "https://node.syndichan.org/.well-known/syndichan/storage-node.json"
+const BootstrapURL = "https://node.rabbiit.io/.well-known/syndichan/storage-node.json"
 
 // Role is the runtime role selected on the command line. It is resolved before
 // the configuration is read, so validation only ever demands settings the role
@@ -443,7 +443,7 @@ type GatewayValidatorConfig struct {
 // handling other people's reads.
 type GatewayContentConfig struct {
 	Enabled bool `json:"enabled"`
-	// OriginURL is the site being served, e.g. https://syndichan.org.
+	// OriginURL is the site being served, e.g. https://rabbiit.io.
 	OriginURL string `json:"origin_url,omitempty"`
 	// OriginAddress pins the origin to a literal host:port. DNS for the site
 	// points at gateways too, so resolving the name here could send this
@@ -588,7 +588,7 @@ func Default() (Config, error) {
 		Gateway: GatewayConfig{
 			ListenAddress: "0.0.0.0", ListenPort: 443,
 			AdvertiseIPv4: true, AdvertiseIPv6: true,
-			RegistrationAPI: "https://syndichan.org/api/v1/gateways",
+			RegistrationAPI: "https://rabbiit.io/api/v1/gateways",
 			TLS: GatewayTLSConfig{
 				Mode: "existing", ACMEHTTPAddress: "0.0.0.0:80",
 			},
@@ -609,8 +609,8 @@ func Default() (Config, error) {
 			},
 			Frontend: GatewayFrontendConfig{
 				Enabled: false, OriginAddress: "",
-				OriginServerName: "syndichan.org",
-				SNIAllowlist:     []string{"syndichan.org"},
+				OriginServerName: "rabbiit.io",
+				SNIAllowlist:     []string{"rabbiit.io"},
 				MaxConnections:   1024, MaxBytesPerSecond: 16 << 20,
 				HandshakeTimeoutSeconds: 10,
 				DialTimeoutSeconds:      10, IdleTimeoutSeconds: 300,
@@ -916,7 +916,7 @@ func (c Config) validateGateway() error {
 		}
 		origin, err := url.Parse(g.Content.OriginURL)
 		if err != nil || origin.Scheme != "https" || origin.Host == "" {
-			return errors.New("gateway.content.origin_url must be an HTTPS URL, e.g. https://syndichan.org")
+			return errors.New("gateway.content.origin_url must be an HTTPS URL, e.g. https://rabbiit.io")
 		}
 		if g.Content.OriginAddress != "" {
 			if _, _, err := net.SplitHostPort(g.Content.OriginAddress); err != nil {

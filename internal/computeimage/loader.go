@@ -80,7 +80,7 @@ var ErrNotFetchable = errors.New("computeimage: this workload's image cannot be 
 // download executable images by editing a JSON file is a node whose safety rests
 // on that file. The digest is what actually protects the load; this only decides
 // where to look.
-const DefaultBaseURL = "https://syndichan.org/dl"
+const DefaultBaseURL = "https://rabbiit.io/dl"
 
 // MaxArtifactBytes bounds a single download.
 //

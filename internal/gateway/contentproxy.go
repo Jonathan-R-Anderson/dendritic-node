@@ -15,7 +15,7 @@ import (
 //
 // WHY THIS EXISTS
 // ---------------
-// The SNI frontend forwards syndichan.org straight to the origin without
+// The SNI frontend forwards rabbiit.io straight to the origin without
 // decrypting it. That is safe, and it is also unmeasurable: the reader's TLS
 // session ends at the origin, so every response says it came from the origin no
 // matter whose machine carried it. A volunteer cannot be credited for honest
@@ -23,13 +23,13 @@ import (
 // can see distinguishes one gateway from another — or from none.
 //
 // This handler is the opposite trade. It terminates TLS under
-// gw-<hash>.syndichan.org, fetches the object from the origin, and serves it
+// gw-<hash>.rabbiit.io, fetches the object from the origin, and serves it
 // under its OWN name and its OWN certificate. That means it *can* alter the
 // bytes — which is the point. The origin signs content (X-Syndichan-Signature),
 // so a reader can check what they were handed, and an alteration is now a thing
 // that can be detected and attributed rather than a thing nobody can express.
 //
-// The volunteer never holds syndichan.org's private key. It holds a certificate
+// The volunteer never holds rabbiit.io's private key. It holds a certificate
 // for a name that is visibly its own, which is what lets a reader tell which
 // party is answering.
 //
@@ -60,7 +60,7 @@ type ContentProxy struct {
 	Origin *url.URL
 	// ServerName is the TLS name to validate the origin against. The origin is
 	// reached by address, so the certificate check is what makes this a
-	// connection to syndichan.org rather than to whoever holds that address.
+	// connection to rabbiit.io rather than to whoever holds that address.
 	ServerName string
 	// NodeID is this gateway's peer ID, announced on every response it serves.
 	NodeID     string
@@ -108,7 +108,7 @@ func NewContentProxy(origin *url.URL, serverName, nodeID string, originAddress s
 	}
 	if originAddress != "" {
 		// Pin the origin to a literal address while still validating its
-		// certificate by name. DNS for syndichan.org points at gateways as well
+		// certificate by name. DNS for rabbiit.io points at gateways as well
 		// as at the origin, so resolving it here could send a gateway's fetch to
 		// another gateway — a loop, and a way for one volunteer's answer to be
 		// laundered through another's identity.
@@ -243,7 +243,7 @@ func (p *ContentProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Syndichan-Gateway", p.NodeID)
 	w.Header().Set("X-Gateway-Version", "1")
 
-	// Readable cross-origin, so a reader on syndichan.org can fetch the same
+	// Readable cross-origin, so a reader on rabbiit.io can fetch the same
 	// object here and compare it against the origin's signature. Without this
 	// the browser hides the response and a gateway becomes un-auditable by the
 	// only party positioned to audit it.

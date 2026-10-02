@@ -26,11 +26,11 @@ func TestLiveOriginContentSurvivesTheProxy(t *testing.T) {
 	if address == "" {
 		t.Skip("set SYNDICHAN_LIVE_ORIGIN=host:port to run")
 	}
-	origin, err := url.Parse("https://syndichan.org")
+	origin, err := url.Parse("https://rabbiit.io")
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy := NewContentProxy(origin, "syndichan.org", "12D3KooWLiveTest", address)
+	proxy := NewContentProxy(origin, "rabbiit.io", "12D3KooWLiveTest", address)
 
 	recorder := httptest.NewRecorder()
 	proxy.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))

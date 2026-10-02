@@ -522,7 +522,7 @@ detect_ca_certs() {
     fi
   done
   # Nastier than it looks: the presence heartbeat is a real clearnet HTTPS POST
-  # to syndichan.org (Proxy is nil on purpose). With no root certs every
+  # to rabbiit.io (Proxy is nil on purpose). With no root certs every
   # peer-to-peer thing works and the node is invisible to the site -- a split
   # brain with no error anywhere the operator is looking.
   REQUIRED_MISSING=1

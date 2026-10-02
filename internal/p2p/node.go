@@ -108,7 +108,7 @@ func SetHeartbeatEndpoint(url string) {
 
 // A var, like heartbeatEndpoint above, so tests can point the lease exchange at
 // a local server instead of reaching the production coordinator.
-var leaseURL = "https://syndichan.org/api/v1/storage/leases"
+var leaseURL = "https://rabbiit.io/api/v1/storage/leases"
 
 type BootstrapDocument struct {
 	Version              int       `json:"version"`
@@ -1167,7 +1167,7 @@ func (n *Node) refreshBootstrap(ctx context.Context) {
 		// peers at all, so this one failure kept the whole network unformed.
 		//
 		// Falling back leaks nothing new: the heartbeat at
-		// internal/heartbeat already POSTs to syndichan.org over clearnet by
+		// internal/heartbeat already POSTs to rabbiit.io over clearnet by
 		// deliberate design, so the site knows this node's address regardless.
 		// NOT gated on i2pOnly, and that is deliberate rather than an oversight.
 		// Open() passes i2pOnly=true for every storage node, so gating on it
@@ -1692,7 +1692,7 @@ func (n *Node) requestLease(ctx context.Context, target peer.ID, objectID, shard
 		// n.http goes through the I2P HTTP proxy, which is absent in the
 		// container deployment and reaches clearnet only via an outproxy
 		// elsewhere. Falling back direct leaks nothing new: this is a SIGNED
-		// request to syndichan.org naming this node, sent to the same host the
+		// request to rabbiit.io naming this node, sent to the same host the
 		// heartbeat already contacts directly.
 		directReq, rerr := http.NewRequestWithContext(ctx, http.MethodPost, leaseURL, bytes.NewReader(body))
 		if rerr == nil {

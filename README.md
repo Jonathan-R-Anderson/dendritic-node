@@ -11,10 +11,10 @@ It does two jobs, and you choose one or both:
   never see your IP address or what any file is. It also gives you a local S3
   endpoint your own applications can use.
 - **HTTPS gateway.** Your machine acts as one of the public front doors for
-  `syndichan.org`. This one needs a public port and is off by default.
+  `rabbiit.io`. This one needs a public port and is off by default.
 
 Donated storage **earns credits** you can spend in the store on
-`syndichan.org` — see [Getting paid](#getting-paid-proof-of-facilitation).
+`rabbiit.io` — see [Getting paid](#getting-paid-proof-of-facilitation).
 
 That's the whole idea. The rest of this page is how to build it, how to run it,
 and what to open on your router if you want to run a gateway from home.
@@ -139,7 +139,7 @@ This prints the image's SHA-256, which is its address on the network. Needs
 **One line, on Linux:**
 
 ```sh
-curl -fsSL https://syndichan.org/install.sh | sh
+curl -fsSL https://rabbiit.io/install.sh | sh
 ```
 
 That fetches a prebuilt binary for this machine's architecture, verifies its
@@ -147,7 +147,7 @@ published SHA-256 before running anything, installs an I2P router if SAM is not
 already answering, and leaves the node running as a non-root systemd service
 that comes back after a reboot. It prints the plan and asks before it changes
 anything; `| sh -s -- --check` prints the plan and stops. The script is served
-as plain text — open <https://syndichan.org/install.sh> and read it first.
+as plain text — open <https://rabbiit.io/install.sh> and read it first.
 
 Its source is `backend/static/install.sh` in the site repository, because the
 file the site serves and the file that was reviewed have to be the same file.
@@ -340,7 +340,7 @@ which is the point.
 ## Getting paid: Proof of Facilitation
 
 Donating disk earns **CREDIT**, the network's token on ZKsync Era. You spend it
-in the store on `syndichan.org`, and other people buy it with a card — which is
+in the store on `rabbiit.io`, and other people buy it with a card — which is
 where the money behind it comes from.
 
 ### Set a payout address
@@ -392,7 +392,7 @@ Two consequences worth stating plainly:
 
 Every node carries a score derived from what it actually did — proofs accepted,
 audits performed, proofs failed — published at
-[syndichan.org/reputation](https://syndichan.org/reputation). It is recomputed
+[rabbiit.io/reputation](https://rabbiit.io/reputation). It is recomputed
 from the evidence on every view rather than stored, so there is no number anyone
 can edit, and you can recompute it yourself from the same public receipts.
 
@@ -518,12 +518,12 @@ The real error is one line earlier in the log:
 The address is used only for Let's Encrypt expiry warnings. It is not published
 in DNS, not sent to the controller, and never appears in your certificate.
 
-### Wait — how can several gateways have certificates for `syndichan.org`?
+### Wait — how can several gateways have certificates for `rabbiit.io`?
 
 They don't, and this is the part worth understanding.
 
-**Your gateway never holds a certificate for `syndichan.org`.** It gets one for
-a hostname of its own, `gw-<your-node-id>.syndichan.org`, which the controller
+**Your gateway never holds a certificate for `rabbiit.io`.** It gets one for
+a hostname of its own, `gw-<your-node-id>.rabbiit.io`, which the controller
 assigns from your node's identity. No two gateways ever request the same name,
 so there is nothing to collide.
 
@@ -531,7 +531,7 @@ so there is nothing to collide.
 *not* terminate TLS. It reads only the unencrypted SNI field from the opening
 ClientHello, decides where the connection belongs, and then splices raw bytes
 between the visitor and the origin. The TLS session is end-to-end between the
-visitor's browser and the origin server, which holds the real `syndichan.org`
+visitor's browser and the origin server, which holds the real `rabbiit.io`
 certificate. Your gateway carries ciphertext it cannot read. That is also why
 the origin listener is declared `listen 9443 ssl proxy_protocol` — the origin,
 not the gateway, does the SSL.
@@ -687,7 +687,7 @@ survives reboots and restarts itself if it ever exits.
 Three things people get wrong here:
 
 - **Keep the data directory stable.** It holds `p2p.key`, your node's permanent
-  identity, which determines your `gw-….syndichan.org` hostname and your
+  identity, which determines your `gw-….rabbiit.io` hostname and your
   certificate. It defaults to the config file's own directory and can be moved on
   the management page (`data_dir` in the config). What matters is that it does not
   *change* between runs — running once by hand with `sudo` and once as a service
@@ -726,7 +726,7 @@ your init's supervisor. The only requirements are that the process runs as a
 consistent user, uses the same data directory every time, and can bind ports 80
 and 443.
 
-Full setup — TLS modes, probe quorum, serving `syndichan.org` through your box,
+Full setup — TLS modes, probe quorum, serving `rabbiit.io` through your box,
 systemd units, and automatic updates — is in [`GATEWAY.md`](GATEWAY.md).
 
 ## Run a container worker (Distributed Container Service)
@@ -981,7 +981,7 @@ failure recovery, the security model, and the roadmap — is in [`DCS.md`](DCS.m
   server side that owns DNS
 
 Two things worth knowing up front. The node sends a signed heartbeat directly
-over HTTPS to `syndichan.org` every five minutes, so the site operator sees your
+over HTTPS to `rabbiit.io` every five minutes, so the site operator sees your
 IP address — exactly as they would if you simply visited the site. The privacy
 guarantee is between *volunteers*: other peers only ever see an I2P destination,
 never your address. And the local S3 credentials are yours alone; they are never

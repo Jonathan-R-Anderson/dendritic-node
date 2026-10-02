@@ -188,11 +188,11 @@ func loadNodeSigningKey(node *p2p.Node) (ed25519.PublicKey, ed25519.PrivateKey, 
 func siteBaseURL(cfg config.Config) string {
 	raw := strings.TrimSpace(cfg.Gateway.RegistrationAPI)
 	if raw == "" {
-		return "https://syndichan.org"
+		return "https://rabbiit.io"
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "https://syndichan.org"
+		return "https://rabbiit.io"
 	}
 	return parsed.Scheme + "://" + parsed.Host
 }

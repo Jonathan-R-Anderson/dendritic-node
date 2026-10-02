@@ -116,7 +116,7 @@ import (
 
 // revocationURL is the coordinator endpoint that mints delete tokens. A var, so
 // tests can point it at an httptest server, exactly like leaseURL.
-var revocationURL = "https://syndichan.org/api/v1/storage/revocations"
+var revocationURL = "https://rabbiit.io/api/v1/storage/revocations"
 
 const (
 	// maxRevocationBatch bounds one coordinator request. A 40 MB object is 39

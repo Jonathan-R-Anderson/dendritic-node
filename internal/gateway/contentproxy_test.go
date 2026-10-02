@@ -184,7 +184,7 @@ func TestServiceRoutesControlPlaneBeforeContent(t *testing.T) {
 }
 
 func TestContentProxyIsReadableCrossOriginButNeverWithCredentials(t *testing.T) {
-	// A reader on syndichan.org must be able to fetch the same object here and
+	// A reader on rabbiit.io must be able to fetch the same object here and
 	// compare it. Without CORS the browser hides the response and the only
 	// party positioned to audit a gateway cannot.
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

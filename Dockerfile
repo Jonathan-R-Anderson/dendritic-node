@@ -34,7 +34,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
 # -----------------------------------------------------------------------------
 FROM alpine:3.20
 
-# ca-certificates: the presence heartbeat is a real HTTPS POST to syndichan.org
+# ca-certificates: the presence heartbeat is a real HTTPS POST to rabbiit.io
 # and is the ONE deliberate exception to I2P-only networking. Without root certs
 # it fails TLS verification while peer traffic looks perfectly healthy -- the
 # exact split-brain the upstream troubleshooting section warns about.

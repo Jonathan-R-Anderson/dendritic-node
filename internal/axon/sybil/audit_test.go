@@ -131,7 +131,7 @@ func TestE143EveryProvisionalParameterStatesItsDerivation(t *testing.T) {
 // TestT144NoCoordinatorInTheAdmissionPath is T14.4's structural half.
 //
 // "Storage admission works with no coordinator reachable — falsified by any
-// dependence on syndichan.org."
+// dependence on rabbiit.io."
 //
 // The behavioural half is in sybil_test.go: AdmitStore is a pure function of
 // its request, so there is nothing for it to reach. This half forbids the
