@@ -24,6 +24,11 @@ in the sibling `dendritic` checkout; file references are given so they can be ch
 - **The naming/blockchain layer is public by construction**: registering a name is a
   public Ethereum transaction, and the name→key binding is world-readable. Names trade
   some of Layer 1's privacy for human usability — use them with that in mind.
+- **Decentralisation**: there is no directory authority and no hardcoded backbone —
+  relays are found by gossip, service records live in a DHT, every reachable node routes
+  by default, and seeds are only reseed entry points. It is I2P-shaped, not Tor-shaped,
+  on this axis (see "Decentralisation: how this compares to I2P"). The remaining
+  centralisation is operational: run relays on many independent reachable hosts.
 
 ---
 
@@ -60,6 +65,66 @@ A short tour of the mechanisms that do the work (and where they live):
 - **Sybil / abuse resistance.** Guards, a reputation layer, and blind-token machinery
   (`reputation`, `token`, `sybil` in the sibling) raise the cost of flooding the relay
   set with adversary nodes — the attack that most directly erodes an onion network.
+
+## Decentralisation: how this compares to I2P
+
+A fair question is whether the overlay depends on a designated, globally-known relay
+backbone (the Tor model, with directory authorities) or whether it is decentralised the
+way I2P is, where every participant routes and discovery is a distributed database. AXON
+is much closer to I2P than to Tor on this axis, with two honest gaps.
+
+| | Tor | **AXON** | I2P |
+|---|---|---|---|
+| Discovery | directory authorities | **gossip (RouterInfo) + DHT (ServiceDescriptors)** | distributed NetDB (Kademlia) |
+| Who routes | a vetted relay set | **any node with a reachable address, by default** | every router |
+| Public exit | fundamental | **none — `.key.axon` only, no clearnet exit** | optional (outproxy) |
+| Central authority | yes | **none** | much less |
+| Service records | — | **in the DHT on the relays closest to a blinded key** | NetDB floodfills |
+| Tunnels | bidirectional circuits | **bidirectional circuits + a rendezvous splice** | unidirectional in/out |
+
+What that means concretely in this code:
+
+- **No directory authority, no hardcoded backbone.** Relays learn each other by *gossip*:
+  `Directory.exchange` pushes a relay's own descriptor to a peer and pulls that peer's
+  whole relay list, and `Refresh` does this with every relay it already knows
+  (`runtime/directory.go`). So the relay set self-propagates. A node's `axon.seeds` are
+  only **reseed entry points** (like I2P's reseed), not a backbone: a node seeded to *one*
+  relay learns the entire set from it — verified over the open internet, a home node
+  seeded to a single VPS relay came up knowing all six.
+- **Service records live in a DHT, floodfill-style.** A hidden service publishes its
+  descriptor, under a per-period *blinded* key, onto the relays **closest to that key**
+  (`service.go` `publish` → `dir.Closest(key, hsdirReplicas)`), and clients look it up the
+  same way. That is I2P's NetDB idea — a distributed, self-organising database of
+  destinations, held by the nodes nearest each key, with the holders unable to enumerate
+  what they store.
+- **Every reachable node is a router, by default.** `AxonConfig.EffectiveRelay()` makes any
+  node that has declared a reachable address (`axon.listen` + `axon.announce`) relay
+  automatically (opt out with `relay_off`). There is no separate class of "backbone"
+  nodes — contributing a reachable address contributes routing, I2P-style.
+- **No clearnet exit.** The proxy forwards only `.key.axon` and refuses everything else
+  (`proxy.go` `ErrNotAxon`) — the network is for anonymous communication *inside* it, like
+  I2P, not a gateway to the open web. An exit would be a separate opt-in (there is none here).
+
+The two honest gaps to full I2P parity:
+
+1. **Relay discovery is gossip-replicated, not Kademlia-partitioned.** Every node currently
+   learns the *whole* relay list, which is fine for a small/medium network but is O(n) per
+   node and will not scale to I2P size. The DHT machinery that would partition it
+   (`internal/axon/dht`, `dhtcircuit`) exists and already backs *service* discovery; using
+   it for *relay* discovery too is the scale upgrade (`DENDRITIC_NETWORK_GAPS.md` §1).
+2. **A node behind NAT cannot be a relay.** Relaying needs an address the internet can
+   reach (`axon.announce`); a NATed home node stays a pure client. I2P lets NATed routers
+   participate through introducers/hole-punching. AXON has PCP NAT traversal but does not
+   yet make a NATed node a routing participant, so today the routing capacity comes from
+   nodes with reachable addresses (a VPS, a port-forwarded box). Running relays on several
+   independent such hosts is what turns "decentralised in software" into "decentralised in
+   fact" — and is also what restores the path diversity that `allow_same_network` suspends.
+
+So: the backbone is **not** a fixed, privileged set — it is "whoever is reachable and
+routing," discovered without any authority, with service records in a distributed DHT and
+no exit to the clearnet. To make it decentralised *in practice* rather than only in design,
+run relays on many independent, reachable hosts; the software already lets any of them join
+and be found, and any one of them bootstrap a newcomer into the whole network.
 
 ## Threat model — what it protects against
 
