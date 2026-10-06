@@ -1,11 +1,11 @@
 # A self-contained AXON dendritic network (relays + expert service nodes) on one
 # host, for development and testing. See packaging/dev-cluster/README.md.
 #
-#   sudo cp rabbiit-node /usr/local/bin/ && sudo cp dev-cluster.sh /usr/local/bin/
-#   sudo cp rabbiit-dev-cluster.service /etc/systemd/system/
-#   sudo systemctl enable --now rabbiit-dev-cluster
+#   sudo cp dendritic-node /usr/local/bin/ && sudo cp dev-cluster.sh /usr/local/bin/
+#   sudo cp dendritic-dev-cluster.service /etc/systemd/system/
+#   sudo systemctl enable --now dendritic-dev-cluster
 #
-# This is NOT a production node unit (that is packaging/systemd/rabbiit-node.service);
+# This is NOT a production node unit (that is packaging/systemd/dendritic-node.service);
 # it exists so a dev box or VM can host the whole overlay with one command.
 [Unit]
 Description=Rabbiit dendritic dev cluster (AXON relays + expert service nodes)
@@ -17,7 +17,7 @@ Type=simple
 # Run as an unprivileged user; relays use non-privileged ports only.
 DynamicUser=yes
 StateDirectory=rabbiit-dev
-Environment=RABBIIT_NODE_BIN=/usr/local/bin/rabbiit-node
+Environment=RABBIIT_NODE_BIN=/usr/local/bin/dendritic-node
 Environment=DEV_DIR=/var/lib/rabbiit-dev
 Environment=NRELAY=6
 Environment=HOST=127.0.0.1

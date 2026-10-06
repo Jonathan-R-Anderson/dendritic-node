@@ -11,7 +11,7 @@ set -euo pipefail
 INSTALL_DIR="${RABBIIT_INSTALL_DIR:-}"
 GIT_URL="${RABBIIT_GIT_URL:-https://github.com/Jonathan-R-Anderson/dendritic-node.git}"
 GIT_BRANCH="${RABBIIT_GIT_BRANCH:-main}"
-SERVICE="${RABBIIT_SERVICE:-rabbiit-node.service}"
+SERVICE="${RABBIIT_SERVICE:-dendritic-node.service}"
 HEALTH_URL="${RABBIIT_UPDATE_HEALTH_URL:-}"
 HEALTH_ATTEMPTS="${RABBIIT_UPDATE_HEALTH_ATTEMPTS:-36}"
 HEALTH_INTERVAL="${RABBIIT_UPDATE_HEALTH_INTERVAL:-5}"
@@ -58,8 +58,8 @@ BIN_DIR="$INSTALL_DIR/bin"
 DATA_DIR="$INSTALL_DIR/data"
 CONFIG_FILE="$INSTALL_DIR/config/config.json"
 MIRROR="$INSTALL_DIR/source.git"
-PROGRAM="$BIN_DIR/rabbiit-node"
-PREVIOUS="$BIN_DIR/rabbiit-node.previous"
+PROGRAM="$BIN_DIR/dendritic-node"
+PREVIOUS="$BIN_DIR/dendritic-node.previous"
 DEPLOYED_SHA="$INSTALL_DIR/deployed.sha"
 STATUS_FILE="$INSTALL_DIR/update-status"
 LOCK_FILE="$INSTALL_DIR/update.lock"
@@ -163,7 +163,7 @@ fi
 
 mkdir -p "$tmp/source"
 git -C "$MIRROR" archive "$candidate_sha" | tar -x -C "$tmp/source"
-if [ ! -f "$tmp/source/go.mod" ] || [ ! -d "$tmp/source/cmd/rabbiit-node" ]; then
+if [ ! -f "$tmp/source/go.mod" ] || [ ! -d "$tmp/source/cmd/dendritic-node" ]; then
   status rejected "$candidate_sha does not contain the storage-client source tree"
   exit 1
 fi
@@ -182,9 +182,9 @@ status testing "running tests for ${candidate_sha:0:12}"
   # survives someone changing the export to a clone.
   CGO_ENABLED=0 go build -trimpath -buildvcs=false \
     -ldflags="-s -w" \
-    -o "$tmp/rabbiit-node" ./cmd/rabbiit-node
+    -o "$tmp/dendritic-node" ./cmd/dendritic-node
 )
-chmod 0755 "$tmp/rabbiit-node"
+chmod 0755 "$tmp/dendritic-node"
 
 # Loading the real configuration catches schema or validation incompatibility
 # without binding a listener or touching the durable identity/store.
@@ -195,7 +195,7 @@ chmod 0755 "$tmp/rabbiit-node"
 # install step. -show-config is the flag that does what the comment above
 # describes: ConfigPath -> LoadOrCreate -> ValidateForRole, print, exit. There is
 # no -data-dir either; the data directory comes from the config file.
-"$tmp/rabbiit-node" -show-config -config "$CONFIG_FILE" >/dev/null
+"$tmp/dendritic-node" -show-config -config "$CONFIG_FILE" >/dev/null
 if [ -f "$tmp/source/scripts/update-from-github.sh" ]; then
   bash -n "$tmp/source/scripts/update-from-github.sh"
 fi
@@ -204,7 +204,7 @@ status activating "installing ${candidate_sha:0:12}"
 if [ -x "$PROGRAM" ]; then
   install -m 0755 "$PROGRAM" "$PREVIOUS"
 fi
-install -m 0755 "$tmp/rabbiit-node" "$PROGRAM.next"
+install -m 0755 "$tmp/dendritic-node" "$PROGRAM.next"
 mv -f "$PROGRAM.next" "$PROGRAM"
 
 if ! systemctl restart "$SERVICE"; then

@@ -20,7 +20,7 @@
 //	every catalogue image present  ->  advertise compute
 //	any one of them unobtainable   ->  advertise nothing
 //
-// This package answers the first half. cmd/rabbiit-node/computeimages.go
+// This package answers the first half. cmd/dendritic-node/computeimages.go
 // wires the answer to the heartbeat, which is where the second half happens.
 //
 // WHY AN IMAGE IS DOWNLOADED WHEN A MICROVM KERNEL IS NOT

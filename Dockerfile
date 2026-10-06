@@ -1,8 +1,8 @@
 # =============================================================================
-# registry.local/rabbiit-node — the storage node, run ON THE SERVER.
+# registry.local/dendritic-node — the storage node, run ON THE SERVER.
 # =============================================================================
-#   docker build -t registry.local/rabbiit-node:latest ./storage-client
-#   docker save   registry.local/rabbiit-node:latest | sudo k3s ctr -n k8s.io images import -
+#   docker build -t registry.local/dendritic-node:latest ./storage-client
+#   docker save   registry.local/dendritic-node:latest | sudo k3s ctr -n k8s.io images import -
 #
 # The same binary volunteers run, deployed as a cluster workload. It does two
 # jobs the network currently has nobody to do:
@@ -29,7 +29,7 @@ COPY . .
 # -trimpath keeps build paths out of the binary; the release script uses the
 # same flags, so a cluster build and a volunteer build are byte-comparable.
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
-        -o /out/rabbiit-node ./cmd/rabbiit-node
+        -o /out/dendritic-node ./cmd/dendritic-node
 
 # -----------------------------------------------------------------------------
 FROM alpine:3.20
@@ -46,7 +46,7 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates \
  && adduser -D -H -u 10001 rabbiit
 
-COPY --from=build /out/rabbiit-node /usr/local/bin/rabbiit-node
+COPY --from=build /out/dendritic-node /usr/local/bin/dendritic-node
 
 # Not root. The upstream README is explicit that the node must not run as root,
 # and nothing here needs privilege: it binds loopback-ish ports above 1024 and
@@ -59,4 +59,4 @@ VOLUME ["/data"]
 
 EXPOSE 9000 9090
 
-ENTRYPOINT ["/usr/local/bin/rabbiit-node"]
+ENTRYPOINT ["/usr/local/bin/dendritic-node"]

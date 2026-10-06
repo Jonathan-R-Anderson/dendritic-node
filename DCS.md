@@ -1,6 +1,6 @@
 # Distributed Container Service (DCS)
 
-An optional capability of `rabbiit-node` that lets peers run Docker
+An optional capability of `dendritic-node` that lets peers run Docker
 containers for one another over AXON. No coordinator, no registry server, no
 Swarm, no Kubernetes.
 

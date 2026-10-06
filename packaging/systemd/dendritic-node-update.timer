@@ -6,7 +6,7 @@ OnBootSec=5min
 OnUnitActiveSec=5min
 RandomizedDelaySec=30s
 Persistent=true
-Unit=rabbiit-node-update.service
+Unit=dendritic-node-update.service
 
 [Install]
 WantedBy=timers.target

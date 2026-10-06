@@ -1,5 +1,5 @@
 #!/bin/sh
-# rabbiit-node installer -- entry point.
+# dendritic-node installer -- entry point.
 #
 # THIS FILE IS STRICTLY POSIX sh, and deliberately tiny, because on Alpine it is
 # the only part that can run: Alpine ships busybox ash and no bash at all, so
@@ -62,7 +62,7 @@ elif command -v yum >/dev/null 2>&1; then
   PKG="yum"; CMD="yum install -y bash"
 fi
 
-printf 'rabbiit-node installer\n\n'
+printf 'dendritic-node installer\n\n'
 printf '  %-8s %-22s %s\n' "STATUS" "DEPENDENCY" "DETAIL"
 printf '  %-8s %-22s %s\n' "------" "----------" "------"
 if [ -n "$CMD" ]; then

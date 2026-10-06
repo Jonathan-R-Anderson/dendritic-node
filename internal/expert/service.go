@@ -6,7 +6,7 @@
 // local praxis expert backend (the praxis Node sidecar, default 127.0.0.1:7777, which serves that
 // exact protocol: POST /expert/<uid>/forward {"ids":[...]} -> {"logits":[...]}).
 //
-// The node serves this handler in two places (see cmd/rabbiit-node):
+// The node serves this handler in two places (see cmd/dendritic-node):
 //   - on its AXON hidden service (reachable by peers as <addr>.key.axon/expert/...), and
 //   - on a loopback listener for same-host praxis + local testing.
 //

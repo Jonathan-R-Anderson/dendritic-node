@@ -1,6 +1,6 @@
 # Rabbiit Storage Node
 
-`rabbiit-node` is a single program that lets you donate spare disk space, or
+`dendritic-node` is a single program that lets you donate spare disk space, or
 spare bandwidth, to Rabbiit. It runs on Windows, macOS, and Linux.
 
 It does two jobs, and you choose one or both:
@@ -41,11 +41,11 @@ go test ./...
 Build for the computer you're on:
 
 ```sh
-go build -trimpath -o rabbiit-node ./cmd/rabbiit-node
+go build -trimpath -o dendritic-node ./cmd/dendritic-node
 ```
 
-That leaves a `rabbiit-node` binary in the current directory. Run it with
-`./rabbiit-node`. It reads (and on first run writes) its configuration at
+That leaves a `dendritic-node` binary in the current directory. Run it with
+`./dendritic-node`. It reads (and on first run writes) its configuration at
 `~/.config/Rabbiit/storage-node/config.json` on Linux, and prints the path it
 chose on the first line of its output.
 
@@ -63,7 +63,7 @@ and keeps retrying with backoff. That means the network is unreachable *yet*,
 not that the build is broken. `joined the AXON overlay as a client through N
 seed relay(s)` is the line that says it is in.
 
-If startup instead fails with a bare `timeout`, another `rabbiit-node` is
+If startup instead fails with a bare `timeout`, another `dendritic-node` is
 already running against the same data directory and holding its database lock.
 Only one instance may use a data directory at a time.
 
@@ -78,12 +78,12 @@ That produces:
 
 | Target machine | Executable |
 | --- | --- |
-| Intel/AMD Linux | `rabbiit-node-linux-amd64` |
-| ARM Linux (incl. Raspberry Pi 4/5) | `rabbiit-node-linux-arm64` |
-| Intel Mac | `rabbiit-node-darwin-amd64` |
-| Apple Silicon Mac | `rabbiit-node-darwin-arm64` |
-| Intel/AMD Windows | `rabbiit-node-windows-amd64.exe` |
-| Windows on ARM | `rabbiit-node-windows-arm64.exe` |
+| Intel/AMD Linux | `dendritic-node-linux-amd64` |
+| ARM Linux (incl. Raspberry Pi 4/5) | `dendritic-node-linux-arm64` |
+| Intel Mac | `dendritic-node-darwin-amd64` |
+| Apple Silicon Mac | `dendritic-node-darwin-arm64` |
+| Intel/AMD Windows | `dendritic-node-windows-amd64.exe` |
+| Windows on ARM | `dendritic-node-windows-arm64.exe` |
 
 These are unsigned binaries. macOS Gatekeeper and Windows SmartScreen will warn
 about a build you downloaded rather than compiled yourself.
@@ -96,7 +96,7 @@ but they are easy to miss because nothing fails until a job is already running.
 **A container image, to run the node under Kubernetes or Docker:**
 
 ```sh
-docker build -t registry.local/rabbiit-node:latest .
+docker build -t registry.local/dendritic-node:latest .
 ```
 
 `registry.local` is **not a real registry** — nothing can pull from it. Under
@@ -104,7 +104,7 @@ k3s the image has to be handed to containerd directly, or the pod sits in
 `ImagePullBackOff`:
 
 ```sh
-docker save registry.local/rabbiit-node:latest -o node.tar
+docker save registry.local/dendritic-node:latest -o node.tar
 sudo k3s ctr images import node.tar
 ```
 
@@ -205,12 +205,12 @@ traffic over the open Internet.
 Start the node as your normal user (not root):
 
 ```sh
-chmod 755 rabbiit-node-linux-amd64
-./rabbiit-node-linux-amd64
+chmod 755 dendritic-node-linux-amd64
+./dendritic-node-linux-amd64
 ```
 
 ```powershell
-.\rabbiit-node-windows-amd64.exe
+.\dendritic-node-windows-amd64.exe
 ```
 
 On first start it creates a mode-0600 config file, your S3 credentials, and
@@ -304,7 +304,7 @@ A flag is saved to the config and used from then on, so you pass it once rather
 than baking it into a service unit:
 
 ```sh
-./rabbiit-node -payout 0xYourWalletAddress -capacity-gib 100 -ui-listen off
+./dendritic-node -payout 0xYourWalletAddress -capacity-gib 100 -ui-listen off
 ```
 
 A bad payout address is refused rather than saved with a warning: a typo there
@@ -325,7 +325,7 @@ where the money behind it comes from.
 Nothing is earned without one, because there is nowhere to send it:
 
 ```sh
-./rabbiit-node -payout 0xYourWalletAddress
+./dendritic-node -payout 0xYourWalletAddress
 ```
 
 or set `"payout_address"` in the config file. On start the node publishes that
@@ -476,7 +476,7 @@ run mode to **gateway-only** on the management page (or `"run_mode":
 "gateway-only"` in the config file), then start the node:
 
 ```sh
-./rabbiit-node -config gateway.json
+./dendritic-node -config gateway.json
 ```
 
 Gateway-only runs the gateway and nothing else: no shard store, no S3, no
@@ -594,14 +594,14 @@ RHEL — anything with systemd.
 **1. Lay it out.** Keep the binary, the config and the data under one directory:
 
 ```sh
-mkdir -p ~/rabbiit-node/{bin,config,data}
-cp rabbiit-node ~/rabbiit-node/bin/
-cp gateway.json  ~/rabbiit-node/config/config.json
-chmod 600 ~/rabbiit-node/config/config.json
+mkdir -p ~/dendritic-node/{bin,config,data}
+cp dendritic-node ~/dendritic-node/bin/
+cp gateway.json  ~/dendritic-node/config/config.json
+chmod 600 ~/dendritic-node/config/config.json
 ```
 
 **2. Create the service.** Save it as
-`/etc/systemd/system/rabbiit-node.service`.
+`/etc/systemd/system/dendritic-node.service`.
 
 **Replace `EXAMPLE` with your own username everywhere it appears** — six places
 below. If your user is `alice`, every `/home/EXAMPLE/...` becomes
@@ -621,12 +621,12 @@ StartLimitBurst=5
 Type=simple
 User=EXAMPLE
 Group=EXAMPLE
-WorkingDirectory=/home/EXAMPLE/rabbiit-node
+WorkingDirectory=/home/EXAMPLE/dendritic-node
 # No posture flags: run mode (gateway-only here), the data directory and
 # everything else come from the config file. Set "run_mode": "gateway-only" in
 # it, or switch it on the management page.
-ExecStart=/home/EXAMPLE/rabbiit-node/bin/rabbiit-node \
-    -config /home/EXAMPLE/rabbiit-node/config/config.json
+ExecStart=/home/EXAMPLE/dendritic-node/bin/dendritic-node \
+    -config /home/EXAMPLE/dendritic-node/config/config.json
 
 # Ports 80 and 443 are privileged. This is what lets an ordinary user bind
 # them; without it the service dies instantly with "permission denied".
@@ -655,7 +655,7 @@ ProtectHome=read-only
 # another disk, list that path here (several paths are allowed, space separated,
 # quoted if they contain spaces) or the node fails with
 # "read-only file system" on a mount that is perfectly writable.
-ReadWritePaths=/home/EXAMPLE/rabbiit-node
+ReadWritePaths=/home/EXAMPLE/dendritic-node
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -672,14 +672,14 @@ enables it at boot.
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now rabbiit-node
+sudo systemctl enable --now dendritic-node
 ```
 
 **4. Confirm, then forget about it:**
 
 ```sh
-systemctl status rabbiit-node
-journalctl -u rabbiit-node -f          # live log; Ctrl-C to stop watching
+systemctl status dendritic-node
+journalctl -u dendritic-node -f          # live log; Ctrl-C to stop watching
 ```
 
 You want to see `Active: active (running)` and a line like
@@ -697,7 +697,7 @@ Three things people get wrong here:
   hostnames and two certificates.
 - **Don't run a second copy by hand while the service is up.** Only one process
   can hold ports 80 and 443; the second exits with "address already in use".
-  Use `sudo systemctl stop rabbiit-node` first.
+  Use `sudo systemctl stop dendritic-node` first.
 - **`ProtectHome=read-only` plus `ReadWritePaths`** is what keeps the node from
   writing anywhere in your home directory except its own folder. If you move
   the installation, update `ReadWritePaths` too or it will fail to write.
@@ -705,21 +705,21 @@ Three things people get wrong here:
 Everyday commands:
 
 ```sh
-sudo systemctl restart rabbiit-node     # after editing the config
-sudo systemctl stop rabbiit-node        # graceful, withdraws it from DNS
-sudo systemctl disable --now rabbiit-node   # stop and remove from boot
+sudo systemctl restart dendritic-node     # after editing the config
+sudo systemctl stop dendritic-node        # graceful, withdraws it from DNS
+sudo systemctl disable --now dendritic-node   # stop and remove from boot
 ```
 
 To upgrade, replace the binary and restart:
 
 ```sh
-sudo systemctl stop rabbiit-node
-cp /path/to/new/rabbiit-node ~/rabbiit-node/bin/rabbiit-node
-sudo systemctl start rabbiit-node
+sudo systemctl stop dendritic-node
+cp /path/to/new/dendritic-node ~/dendritic-node/bin/dendritic-node
+sudo systemctl start dendritic-node
 ```
 
 A ready-made copy of this unit ships as
-[`packaging/systemd/rabbiit-node-gateway-home.service`](packaging/systemd/rabbiit-node-gateway-home.service),
+[`packaging/systemd/dendritic-node-gateway-home.service`](packaging/systemd/dendritic-node-gateway-home.service),
 and [`GATEWAY.md`](GATEWAY.md) covers a timer that pulls and rebuilds from git
 automatically, with rollback if the new build fails to come up.
 
@@ -775,7 +775,7 @@ and `role.worker`:
 Then start the node the normal way:
 
 ```sh
-./rabbiit-node-linux-amd64
+./dendritic-node-linux-amd64
 ```
 
 You should see, after the node comes up:
@@ -1024,7 +1024,7 @@ quick-start here is a *development* network and is deliberately NOT anonymous.
                                                         your service / AI expert
 ```
 
-Three kinds of process, all the same `rabbiit-node` binary, told apart by config:
+Three kinds of process, all the same `dendritic-node` binary, told apart by config:
 
 - **Relays** — the backbone. They carry other nodes' circuits and host no service of
   their own. A hidden service keeps **3 intro points on distinct relays** and a client
@@ -1041,7 +1041,7 @@ Three kinds of process, all the same `rabbiit-node` binary, told apart by config
 ### 1. Build
 
 ```sh
-make rabbiit-node          # from the anonymOS root → build/rabbiit-node (static linux/amd64)
+make dendritic-node          # from the anonymOS root → build/dendritic-node (static linux/amd64)
 ```
 
 ### 2. The fast path — one host, one command
@@ -1050,16 +1050,16 @@ make rabbiit-node          # from the anonymOS root → build/rabbiit-node (stat
 (one VM is plenty) and is the quickest way to see it work:
 
 ```sh
-cp build/rabbiit-node deps/dendritic-node/packaging/dev-cluster/rabbiit-node
+cp build/dendritic-node deps/dendritic-node/packaging/dev-cluster/dendritic-node
 cd deps/dendritic-node/packaging/dev-cluster
-RABBIIT_NODE_BIN=./rabbiit-node ./dev-cluster.sh start   # 6 relays + 2 service nodes
-RABBIIT_NODE_BIN=./rabbiit-node ./dev-cluster.sh test    # svcB → svcA /expert over AXON → {"ok":true}
+RABBIIT_NODE_BIN=./dendritic-node ./dev-cluster.sh start   # 6 relays + 2 service nodes
+RABBIIT_NODE_BIN=./dendritic-node ./dev-cluster.sh test    # svcB → svcA /expert over AXON → {"ok":true}
 ```
 
 Knobs (env): `NRELAY` (default 6), `HOST` (bind/announce address; `127.0.0.1` for one
 host, a LAN IP to span machines), `PROXY` (the loopback proxy, default `127.0.0.1:4480`),
 `HOPS` (`3` = anonymous default, `2` = faster but **not** anonymous), `DEV_DIR`.
-For reboot persistence install `rabbiit-dev-cluster.service` (see the file's header).
+For reboot persistence install `dendritic-dev-cluster.service` (see the file's header).
 
 Because a single-host cluster's relays all share one network prefix, the script turns
 on `axon.allow_same_network` — the one setting that makes a one-LAN cluster form at all,
@@ -1177,7 +1177,7 @@ relays on each, and seed the service nodes with the full relay list. Keep
 `allow_same_network` on only while every machine is still inside one subnet. For
 reboot-persistence, run each host's nodes under systemd (a `Type=simple` unit whose
 `ExecStart` launches the relays + service node and `wait`s; see
-`packaging/dev-cluster/rabbiit-dev-cluster.service` for the shape).
+`packaging/dev-cluster/dendritic-dev-cluster.service` for the shape).
 
 ### 9. The storage DHT
 

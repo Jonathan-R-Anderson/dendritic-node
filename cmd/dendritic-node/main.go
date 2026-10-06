@@ -55,7 +55,7 @@ func main() {
 	headless := registerHeadlessFlags()
 	flag.Parse()
 
-	logger := log.New(os.Stderr, "rabbiit-node ", log.LstdFlags|log.LUTC)
+	logger := log.New(os.Stderr, "dendritic-node ", log.LstdFlags|log.LUTC)
 
 	// One meter for the whole process. Everything that serves bytes to somebody
 	// else adds to it; exactly ONE place drains it (the heartbeat), because

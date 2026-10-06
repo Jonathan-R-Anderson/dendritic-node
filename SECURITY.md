@@ -60,7 +60,7 @@ produces the build that refuses to verify, never one that silently claims it
 did.
 
 **Released binaries do not contain BLS, and that is not a downgrade.** Nothing
-in `cmd/rabbiit-node` constructs a `BLSVerifier` — the only callers of
+in `cmd/dendritic-node` constructs a `BLSVerifier` — the only callers of
 `NewBLSVerifier` are tests, and `LightClientState` takes its verifier as a
 parameter. BLS arrived as a verified library capability with the consensus-spec
 vectors and was never wired into a runtime path.

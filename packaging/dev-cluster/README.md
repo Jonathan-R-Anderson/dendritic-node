@@ -12,11 +12,11 @@ development.
 ## Quick start
 
 ```sh
-make rabbiit-node                         # from the repo root -> build/rabbiit-node
-cp build/rabbiit-node packaging/dev-cluster/rabbiit-node
+make dendritic-node                         # from the repo root -> build/dendritic-node
+cp build/dendritic-node packaging/dev-cluster/dendritic-node
 cd packaging/dev-cluster
-RABBIIT_NODE_BIN=./rabbiit-node ./dev-cluster.sh start
-RABBIIT_NODE_BIN=./rabbiit-node ./dev-cluster.sh test     # expect: {"ok":true,...}
+RABBIIT_NODE_BIN=./dendritic-node ./dev-cluster.sh start
+RABBIIT_NODE_BIN=./dendritic-node ./dev-cluster.sh test     # expect: {"ok":true,...}
 ```
 
 `test` drives `svcB -> svcA /expert/health` through the loopback AXON proxy — a
@@ -26,8 +26,8 @@ the overlay. Point `EXPERT_A`/`EXPERT_B` at a running praxis expert backend
 (default `http://127.0.0.1:7777`) to carry real inference instead of health.
 
 For systemd (one VM hosts the overlay): install the binary and script into
-`/usr/local/bin`, drop `rabbiit-dev-cluster.service` into
-`/etc/systemd/system`, and `systemctl enable --now rabbiit-dev-cluster`.
+`/usr/local/bin`, drop `dendritic-dev-cluster.service` into
+`/etc/systemd/system`, and `systemctl enable --now dendritic-dev-cluster`.
 
 ## Why it is built this way (the non-obvious constraints)
 

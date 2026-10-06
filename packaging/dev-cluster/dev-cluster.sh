@@ -26,14 +26,14 @@
 #   dev-cluster.sh test      # svcB -> svcA /expert/health over AXON (proves the overlay)
 #
 # ENV
-#   RABBIIT_NODE_BIN   path to the rabbiit-node binary          (default: ./rabbiit-node)
+#   RABBIIT_NODE_BIN   path to the dendritic-node binary          (default: ./dendritic-node)
 #   DEV_DIR            data/root directory for the cluster      (default: ~/.rabbiit-dev)
 #   NRELAY             number of relays                         (default: 6)
 #   HOST               address the nodes bind/announce          (default: 127.0.0.1)
 #   PROXY              svcB loopback AXON proxy                  (default: 127.0.0.1:4480)
 #   HOPS               circuit length: 3 = anonymous (default), 2 = faster, NOT anonymous
 set -u
-BIN="${RABBIIT_NODE_BIN:-./rabbiit-node}"
+BIN="${RABBIIT_NODE_BIN:-./dendritic-node}"
 DEV_DIR="${DEV_DIR:-$HOME/.rabbiit-dev}"
 NRELAY="${NRELAY:-6}"
 HOST="${HOST:-127.0.0.1}"
@@ -92,13 +92,13 @@ axon_addr(){ grep -oE '[a-z2-7]{56}\.key\.axon' "$1/run.log" 2>/dev/null | head 
 
 do_stop(){
   [ -f "$PIDS" ] && while read -r p; do kill "$p" 2>/dev/null; done <"$PIDS"
-  pkill -x rabbiit-node 2>/dev/null
+  pkill -x dendritic-node 2>/dev/null
   rm -f "$PIDS"
   echo "dev-cluster: stopped"
 }
 do_start(){
   have_py
-  [ -x "$BIN" ] || die "rabbiit-node binary not found/executable at $BIN (set RABBIIT_NODE_BIN)"
+  [ -x "$BIN" ] || die "dendritic-node binary not found/executable at $BIN (set RABBIIT_NODE_BIN)"
   do_stop >/dev/null 2>&1; sleep 1
   mkdir -p "$DEV_DIR"; : >"$PIDS"
   echo "dev-cluster: $NRELAY relays + 2 service nodes under $DEV_DIR (host $HOST, hops=$HOPS)"
@@ -130,7 +130,7 @@ wait_published(){
   done; return 1
 }
 do_status(){
-  echo "processes: $(pgrep -c -x rabbiit-node 2>/dev/null) alive"
+  echo "processes: $(pgrep -c -x dendritic-node 2>/dev/null) alive"
   for s in svcA svcB; do printf "  %-5s %s\n" "$s" "$(axon_addr "$DEV_DIR/$s")"; done
 }
 do_test(){

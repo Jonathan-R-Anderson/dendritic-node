@@ -8,13 +8,13 @@ After=network-online.target
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/home/ubuntu/rabbiit-node
+WorkingDirectory=/home/ubuntu/dendritic-node
 # Neither -gateway-only nor -data-dir exists on the binary; both exit 2 with
 # "flag provided but not defined". The gateway role is selected IN THE CONFIG:
 #   "run_mode": "gateway-only"
-# in /home/ubuntu/rabbiit-node/config/config.json (see GATEWAY.md). The data
+# in /home/ubuntu/dendritic-node/config/config.json (see GATEWAY.md). The data
 # directory is that config file's own directory, or its data_dir key.
-ExecStart=/home/ubuntu/rabbiit-node/bin/rabbiit-node -config /home/ubuntu/rabbiit-node/config/config.json
+ExecStart=/home/ubuntu/dendritic-node/bin/dendritic-node -config /home/ubuntu/dendritic-node/config/config.json
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=75s
@@ -26,7 +26,7 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/rabbiit-node
+ReadWritePaths=/home/ubuntu/dendritic-node
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

@@ -28,7 +28,7 @@ package p2p
 // to whatever this node installed as its ComputeHandler and the answer is
 // handed back. That keeps the wire honest when the catalogue grows, and it is
 // what lets the receiving node serve a peer's frame through the very handlers
-// its loopback API serves — see cmd/rabbiit-node/computepeer.go.
+// its loopback API serves — see cmd/dendritic-node/computepeer.go.
 //
 // REFUSAL IS NOT UNREACHABILITY
 // -----------------------------

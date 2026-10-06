@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install rabbiit-node, its runtime dependencies, and a boot service.
+# Install dendritic-node, its runtime dependencies, and a boot service.
 #
 # LINUX ONLY -- refused at the top rather than half-supported.
 #
@@ -35,7 +35,7 @@
 #   PKGS[]              -> package rows          -> install_packages
 #   DO_ENABLE_DOCKER    -> Docker Engine         -> start_docker
 #   DO_BOOTSTRAP_GO     -> Go toolchain          -> bootstrap_go
-#   DO_BUILD_BINARY     -> rabbiit-node binary -> build_binary
+#   DO_BUILD_BINARY     -> dendritic-node binary -> build_binary
 #   DO_CREATE_USER      -> service account       -> create_user_and_dirs
 #   DO_ADD_DOCKER_GROUP -> docker group          -> add_docker_group,
 #                                                    install_compute_dropin
@@ -62,7 +62,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 if [ "$(uname -s)" != "Linux" ]; then
   echo "$PROGRAM: this installer supports Linux only (found $(uname -s))." >&2
-  echo "Elsewhere: 'go build ./cmd/rabbiit-node' and run it by hand." >&2
+  echo "Elsewhere: 'go build ./cmd/dendritic-node' and run it by hand." >&2
   exit 2
 fi
 
@@ -111,10 +111,10 @@ UI_LISTEN=""
 NODE_USER="rabbiit"
 NODE_GROUP="rabbiit"
 PREFIX="/usr/local"
-BIN_DEST="$PREFIX/bin/rabbiit-node"
-UNIT_PATH="/etc/systemd/system/rabbiit-node.service"
-UNIT_DROPIN="/etc/systemd/system/rabbiit-node.service.d/10-compute.conf"
-OPENRC_PATH="/etc/init.d/rabbiit-node"
+BIN_DEST="$PREFIX/bin/dendritic-node"
+UNIT_PATH="/etc/systemd/system/dendritic-node.service"
+UNIT_DROPIN="/etc/systemd/system/dendritic-node.service.d/10-compute.conf"
+OPENRC_PATH="/etc/init.d/dendritic-node"
 
 GO_ROOT_DEST="/usr/local/go"
 GO_BIN_LINK="/usr/local/bin/go"
@@ -126,7 +126,7 @@ GO_MIN_MINOR=21
 
 usage() {
   cat <<'EOF'
-rabbiit-node installer (Linux)
+dendritic-node installer (Linux)
 
 Start here, and come back here when something breaks:
 
@@ -501,30 +501,30 @@ detect_binary() {
   local candidate
   if [ -n "$BINARY_SRC" ]; then
     if [ ! -f "$BINARY_SRC" ] || [ ! -x "$BINARY_SRC" ]; then
-      blocker "rabbiit-node binary" "all" "--binary $BINARY_SRC is not an executable file"
+      blocker "dendritic-node binary" "all" "--binary $BINARY_SRC is not an executable file"
       return 0
     fi
     BINARY_RESOLVED="$BINARY_SRC"
-    plan ok "rabbiit-node binary" "all" "$BINARY_RESOLVED (given with --binary)"
+    plan ok "dendritic-node binary" "all" "$BINARY_RESOLVED (given with --binary)"
     plan skip "Go toolchain" "building" "not needed; --binary was given"
     return 0
   fi
-  for candidate in "$REPO_ROOT/rabbiit-node" "$REPO_ROOT/dist/rabbiit-node-linux-$GOARCH"; do
+  for candidate in "$REPO_ROOT/dendritic-node" "$REPO_ROOT/dist/dendritic-node-linux-$GOARCH"; do
     if [ -x "$candidate" ]; then
       BINARY_RESOLVED="$candidate"
-      plan ok "rabbiit-node binary" "all" "$BINARY_RESOLVED"
+      plan ok "dendritic-node binary" "all" "$BINARY_RESOLVED"
       plan skip "Go toolchain" "building" "not needed; a built binary is already here"
       return 0
     fi
   done
   if [ ! -f "$REPO_ROOT/go.mod" ]; then
     REQUIRED_MISSING=1
-    plan manual "rabbiit-node binary" "all" "no binary and no source tree ($REPO_ROOT/go.mod missing); build elsewhere and pass --binary PATH"
+    plan manual "dendritic-node binary" "all" "no binary and no source tree ($REPO_ROOT/go.mod missing); build elsewhere and pass --binary PATH"
     return 0
   fi
   detect_go || return 0
   DO_BUILD_BINARY=1
-  plan fix "rabbiit-node binary" "all" "will run 'go build ./cmd/rabbiit-node' in $REPO_ROOT (as ${SUDO_USER:-the invoking user}, never root)"
+  plan fix "dendritic-node binary" "all" "will run 'go build ./cmd/dendritic-node' in $REPO_ROOT (as ${SUDO_USER:-the invoking user}, never root)"
   return 0
 }
 
@@ -548,7 +548,7 @@ detect_go() {
     fi
     REQUIRED_MISSING=1
     plan manual "Go toolchain" "building" "$cmd is go${ver:-?}, older than $GO_MIN_MAJOR.$GO_MIN_MINOR and unable to fetch the pinned toolchain; upgrade it or pass --binary PATH"
-    plan manual "rabbiit-node binary" "all" "cannot be built with the Go on this machine"
+    plan manual "dendritic-node binary" "all" "cannot be built with the Go on this machine"
     return 1
   fi
 
@@ -572,7 +572,7 @@ detect_go() {
   if [ -n "$blocked" ]; then
     REQUIRED_MISSING=1
     plan manual "Go toolchain" "building" "no usable Go: $blocked. Install Go $GO_MIN_MAJOR.$GO_MIN_MINOR+ yourself, or build elsewhere and pass --binary PATH"
-    plan manual "rabbiit-node binary" "all" "no binary and no way to build one here"
+    plan manual "dendritic-node binary" "all" "no binary and no way to build one here"
     return 1
   fi
   DO_BOOTSTRAP_GO=1
@@ -940,7 +940,7 @@ detect_state_conflicts() {
   # Two instances on one data_dir collide on the bbolt flock in
   # <data_dir>/storage/metadata.db.
   if have pgrep && pgrep -f '[s]yndichan-node' >/dev/null 2>&1; then
-    plan manual "running node" "all" "a rabbiit-node process is already running; make sure it is not using $RUNTIME_DATA_DIR"
+    plan manual "running node" "all" "a dendritic-node process is already running; make sure it is not using $RUNTIME_DATA_DIR"
   fi
   # serve() calls logger.Fatalf, so a taken port takes down the WHOLE node.
   local port
@@ -1406,11 +1406,11 @@ build_binary() {
   case "$REPO_ROOT" in
     *"'"*) die "the checkout path contains a single quote and cannot be built from safely: $REPO_ROOT" ;;
   esac
-  step "Building rabbiit-node from $REPO_ROOT"
+  step "Building dendritic-node from $REPO_ROOT"
   # GOTOOLCHAIN=auto explicitly, so `go env -w GOTOOLCHAIN=local` on this
   # machine cannot break the build: go.mod pins go 1.25.12 and any Go from 1.21
   # up fetches exactly that on demand.
-  local build="cd '$REPO_ROOT' && CGO_ENABLED=0 GOTOOLCHAIN=auto '$GO_CMD' build -trimpath -ldflags='-s -w' -o '$REPO_ROOT/rabbiit-node' ./cmd/rabbiit-node"
+  local build="cd '$REPO_ROOT' && CGO_ENABLED=0 GOTOOLCHAIN=auto '$GO_CMD' build -trimpath -ldflags='-s -w' -o '$REPO_ROOT/dendritic-node' ./cmd/dendritic-node"
   # As the human who invoked the script, never root: a root-owned GOCACHE and
   # root-owned objects inside somebody's checkout outlive the install and show
   # up later as a build that fails for the account owning the source.
@@ -1420,7 +1420,7 @@ build_binary() {
     warn "building as root; the build cache and output will be root-owned"
     run sh -c "$build"
   fi
-  BINARY_RESOLVED="$REPO_ROOT/rabbiit-node"
+  BINARY_RESOLVED="$REPO_ROOT/dendritic-node"
   return 0
 }
 
@@ -1514,9 +1514,9 @@ install_binary() {
   # Replacing a running binary in place gives ETXTBSY. The enable/restart at the
   # end brings it back; the "boot service" plan row says so.
   case "$SERVICE_MGR" in
-    systemd) systemctl is-active --quiet rabbiit-node.service 2>/dev/null &&
-               { run systemctl stop rabbiit-node.service || true; } ;;
-    openrc)  [ -f "$OPENRC_PATH" ] && { run rc-service rabbiit-node stop || true; } ;;
+    systemd) systemctl is-active --quiet dendritic-node.service 2>/dev/null &&
+               { run systemctl stop dendritic-node.service || true; } ;;
+    openrc)  [ -f "$OPENRC_PATH" ] && { run rc-service dendritic-node stop || true; } ;;
   esac
   run install -d -m 0755 "$PREFIX/bin"
   run install -m 0755 "$BINARY_RESOLVED" "$BIN_DEST"
@@ -1559,7 +1559,7 @@ generate_unit() {
 # the node will fail to write with a \"read-only file system\" error that names
 # the filesystem and never mentions this sandbox. Fix it with a drop-in rather
 # than by editing this file (which the installer would then refuse to refresh):
-#   systemctl edit rabbiit-node   ->   [Service]
+#   systemctl edit dendritic-node   ->   [Service]
 #                                        ReadWritePaths=<the data_dir>
 "
   fi
@@ -1573,7 +1573,7 @@ Documentation=https://github.com/Jonathan-R-Anderson/rabbiit/tree/main/storage-c
 Wants=network-online.target
 After=network-online.target
 # A node that dies 20 times in 10 minutes is broken in a way restarting will
-# not fix; systemd stops trying (systemctl reset-failed rabbiit-node to retry).
+# not fix; systemd stops trying (systemctl reset-failed dendritic-node to retry).
 StartLimitIntervalSec=600
 StartLimitBurst=20
 
@@ -1639,7 +1639,7 @@ generate_compute_dropin() {
   done
   groups="${groups# }"
   cat <<EOF
-# Compute/DCS access for rabbiit-node.
+# Compute/DCS access for dendritic-node.
 #
 # HARDENING GIVEN UP HERE, out loud:
 #   - the docker group is root-equivalent by design. A node that lends compute
@@ -1690,7 +1690,7 @@ generate_openrc() {
   # Stated rather than faked -- an OpenRC node runs with less isolation.
   cat <<EOF
 #!/sbin/openrc-run
-name="rabbiit-node"
+name="dendritic-node"
 description="Rabbiit encrypted volunteer storage and edge node"
 
 command="$BIN_DEST"
@@ -1700,7 +1700,7 @@ command_background=false
 supervisor=supervise-daemon
 respawn_delay=15
 respawn_max=0
-pidfile="/run/rabbiit-node.pid"
+pidfile="/run/dendritic-node.pid"
 # config.Default() calls os.UserConfigDir() unconditionally, so a missing HOME
 # makes the node exit before it reads the -config file it was handed.
 export HOME="$DATA_DIR"
@@ -1765,10 +1765,10 @@ install_openrc_service() {
   # started: the operator asked for a node that comes back after a reboot, and
   # refusing to overwrite their script is not a reason to leave it disabled.
   install_managed "$OPENRC_PATH" 0755 generate_openrc || true
-  step "Enabling rabbiit-node on boot (OpenRC)"
-  run rc-update add rabbiit-node default || warn "could not 'rc-update add rabbiit-node default'"
-  run rc-service rabbiit-node restart ||
-    warn "the service did not start; see /var/log/rc.log and 'rc-service rabbiit-node status'"
+  step "Enabling dendritic-node on boot (OpenRC)"
+  run rc-update add dendritic-node default || warn "could not 'rc-update add dendritic-node default'"
+  run rc-service dendritic-node restart ||
+    warn "the service did not start; see /var/log/rc.log and 'rc-service dendritic-node status'"
   return 0
 }
 
@@ -1782,10 +1782,10 @@ install_systemd_unit() {
   # runs as $NODE_USER and still needs the socket, and skipping the drop-in
   # because the unit was not ours is how compute ends up half-configured.
   install_compute_dropin
-  step "Enabling rabbiit-node on boot"
-  run systemctl enable rabbiit-node.service
-  run systemctl restart rabbiit-node.service ||
-    warn "the service did not start; see: journalctl -u rabbiit-node -n 50"
+  step "Enabling dendritic-node on boot"
+  run systemctl enable dendritic-node.service
+  run systemctl restart dendritic-node.service ||
+    warn "the service did not start; see: journalctl -u dendritic-node -n 50"
   return 0
 }
 
@@ -1837,7 +1837,7 @@ add_docker_group() {
 # main
 # ---------------------------------------------------------------------------
 
-printf '%srabbiit-node installer%s\n' "$C_BOLD" "$C_RESET"
+printf '%sdendritic-node installer%s\n' "$C_BOLD" "$C_RESET"
 if [ "$DRY_RUN" = "1" ]; then
   printf '%s--check: detecting only. Nothing on this machine will be changed.%s\n' "$C_DIM" "$C_RESET"
 fi
@@ -1896,10 +1896,10 @@ printf '\n%sDone.%s\n' "$C_BOLD" "$C_RESET"
 if [ "$INSTALL_SERVICE" = "1" ]; then
   case "$SERVICE_MGR" in
     systemd)
-      say "  systemctl status rabbiit-node       # is it up"
-      say "  journalctl -u rabbiit-node -f       # what is it doing" ;;
+      say "  systemctl status dendritic-node       # is it up"
+      say "  journalctl -u dendritic-node -f       # what is it doing" ;;
     openrc)
-      say "  rc-service rabbiit-node status      # is it up"
+      say "  rc-service dendritic-node status      # is it up"
       say "  tail -f /var/log/rc.log               # what is it doing" ;;
   esac
 fi

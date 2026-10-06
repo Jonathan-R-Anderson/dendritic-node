@@ -68,9 +68,9 @@ the admitted probe node IDs/public keys, and either:
 Then:
 
 ```sh
-rabbiit-node -gateway-enable
-rabbiit-node -gateway-status
-rabbiit-node
+dendritic-node -gateway-enable
+dendritic-node -gateway-status
+dendritic-node
 ```
 
 Forward TCP 443 at the router and permit it through host, IPv6, and cloud
@@ -123,7 +123,7 @@ Public TCP 443 is required; public TCP 80 is required as well when
 `gateway.tls.mode` is `acme`.
 
 ```sh
-/usr/local/bin/rabbiit-node \
+/usr/local/bin/dendritic-node \
   -gateway-only \
   -config /var/lib/rabbiit/config.json \
   -data-dir /var/lib/rabbiit/data
@@ -136,25 +136,25 @@ For the packaged systemd unit, use a drop-in so package updates cannot erase
 the role selection:
 
 ```sh
-sudo systemctl edit rabbiit-node
+sudo systemctl edit dendritic-node
 ```
 
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/local/bin/rabbiit-node -gateway-only -config /var/lib/rabbiit/config.json -data-dir /var/lib/rabbiit/data
+ExecStart=/usr/local/bin/dendritic-node -gateway-only -config /var/lib/rabbiit/config.json -data-dir /var/lib/rabbiit/data
 ```
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now rabbiit-node
+sudo systemctl enable --now dendritic-node
 ```
 
 Never run a second copy alongside the service; only one process can own 80 and
 443. Confirm the role took effect:
 
 ```sh
-systemctl show rabbiit-node -p ExecStart
+systemctl show dendritic-node -p ExecStart
 ss -lnt | grep -E ':80 |:443 |:9000 |:9090 '
 curl --fail https://gw-NODE-ID.rabbiit.io/readyz
 ```
@@ -198,8 +198,8 @@ A five-minute systemd updater is included for a dedicated gateway whose whole
 installation lives under one normal user's home directory:
 
 ```text
-/home/ubuntu/rabbiit-node/
-├── bin/{rabbiit-node, rabbiit-node.previous, update-from-github}
+/home/ubuntu/dendritic-node/
+├── bin/{dendritic-node, dendritic-node.previous, update-from-github}
 ├── config/config.json
 ├── data/
 ├── source.git
@@ -208,42 +208,42 @@ installation lives under one normal user's home directory:
 ```
 
 Use
-[`rabbiit-node-gateway-home.service`](packaging/systemd/rabbiit-node-gateway-home.service)
+[`dendritic-node-gateway-home.service`](packaging/systemd/dendritic-node-gateway-home.service)
 for the gateway plus
-[`rabbiit-node-update.service`](packaging/systemd/rabbiit-node-update.service)
+[`dendritic-node-update.service`](packaging/systemd/dendritic-node-update.service)
 and
-[`rabbiit-node-update.timer`](packaging/systemd/rabbiit-node-update.timer)
+[`dendritic-node-update.timer`](packaging/systemd/dendritic-node-update.timer)
 for updates. Replace the example `/readyz` hostname in the update service with
 the controller-assigned `gw-...rabbiit.io` name before enabling it.
 
 The updater never installs a downloaded opaque executable. It fetches `main`
 into a bare mirror, exports the exact commit to a temporary directory, runs
 `go test ./...`, builds with `CGO_ENABLED=0`, loads the real configuration in a
-non-listening preflight, keeps the current binary as `rabbiit-node.previous`,
+non-listening preflight, keeps the current binary as `dendritic-node.previous`,
 atomically installs the candidate and restarts the service, accepts the commit
 only once public `https://gw-.../readyz` succeeds, and otherwise restores and
 restarts the previous binary automatically.
 
 ```sh
 sudo install -m 0755 scripts/update-from-github.sh \
-  /home/ubuntu/rabbiit-node/bin/update-from-github
-sudo install -m 0644 packaging/systemd/rabbiit-node-gateway-home.service \
-  /etc/systemd/system/rabbiit-node.service
-sudo install -m 0644 packaging/systemd/rabbiit-node-update.service \
+  /home/ubuntu/dendritic-node/bin/update-from-github
+sudo install -m 0644 packaging/systemd/dendritic-node-gateway-home.service \
+  /etc/systemd/system/dendritic-node.service
+sudo install -m 0644 packaging/systemd/dendritic-node-update.service \
   /etc/systemd/system/
-sudo install -m 0644 packaging/systemd/rabbiit-node-update.timer \
+sudo install -m 0644 packaging/systemd/dendritic-node-update.timer \
   /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now rabbiit-node rabbiit-node-update.timer
+sudo systemctl enable --now dendritic-node dendritic-node-update.timer
 ```
 
 Inspect state, or force one check:
 
 ```sh
-cat /home/ubuntu/rabbiit-node/update-status
-systemctl list-timers rabbiit-node-update.timer
-sudo systemctl start rabbiit-node-update.service
-sudo journalctl -u rabbiit-node-update.service -n 100 --no-pager
+cat /home/ubuntu/dendritic-node/update-status
+systemctl list-timers dendritic-node-update.timer
+sudo systemctl start dendritic-node-update.service
+sudo journalctl -u dendritic-node-update.service -n 100 --no-pager
 ```
 
 Requires `git`, `go`, `curl`, `tar`, `flock`, and GNU `timeout`. No GitHub
@@ -255,7 +255,7 @@ the updater script itself but never rewrites its systemd privilege boundary.
 ## Diagnostics
 
 ```sh
-rabbiit-node -gateway-status
+dendritic-node -gateway-status
 curl --fail https://gateway.example.com/healthz
 curl --fail https://gateway.example.com/readyz
 openssl s_client -connect PUBLIC_IP:443 -servername gateway.example.com

@@ -1,5 +1,5 @@
 # REFERENCE COPY. scripts/install.sh generates a better unit than this one and
-# writes it to /etc/systemd/system/rabbiit-node.service: it follows the
+# writes it to /etc/systemd/system/dendritic-node.service: it follows the
 # data_dir an existing config names in ReadWritePaths= and sets HOME for the
 # service account. Prefer the installer; this file is for people who want to
 # see the shape, or who are packaging by hand.
@@ -21,7 +21,7 @@ Group=rabbiit
 # exits 2 with "flag provided but not defined" before anything starts. The data
 # directory is the config file's own directory (config.LoadOrCreate), or the
 # data_dir key inside it.
-ExecStart=/usr/local/bin/rabbiit-node -config /var/lib/rabbiit/config.json
+ExecStart=/usr/local/bin/dendritic-node -config /var/lib/rabbiit/config.json
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=75s

@@ -23,7 +23,7 @@ do
   if [ "$arch" = "arm" ]; then
     goarm="6"
   fi
-  output="dist/rabbiit-node-${os}-${arch}${suffix}"
+  output="dist/dendritic-node-${os}-${arch}${suffix}"
   echo "building ${output}"
   # -buildvcs=false is NOT cosmetic and must not be dropped.
   #
@@ -35,7 +35,7 @@ do
   # exact flags; changing them here without changing them there makes that check
   # a check of something else.
   CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM="$goarm" \
-    go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$output" ./cmd/rabbiit-node
+    go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$output" ./cmd/dendritic-node
 done
 
 # Checksums: scripts/check-release.sh builds, verifies and writes a .sha256

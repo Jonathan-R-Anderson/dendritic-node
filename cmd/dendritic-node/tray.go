@@ -6,7 +6,7 @@
 // needs CGO on Linux and macOS. The release build is deliberately CGO_ENABLED=0
 // and cross-compiles to six targets from one machine; linking this in
 // unconditionally would break every one of those. Servers also have no tray at
-// all -- rabbiit-node runs headless in Kubernetes -- so the daemon must stay
+// all -- dendritic-node runs headless in Kubernetes -- so the daemon must stay
 // buildable and runnable without any of this.
 //
 // Closing the window has never stopped the node: it is a background service
