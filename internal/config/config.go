@@ -704,7 +704,7 @@ func (c Config) ValidateForRole(role Role) error {
 		if err := c.validateStorage(); err != nil {
 			return err
 		}
-	} else if c.Axon.Relay && role != RoleManagement {
+	} else if c.Axon.EffectiveRelay() && role != RoleManagement {
 		// A gateway or probe box with a public address can relay for the
 		// overlay without storing anything.
 		if err := c.Axon.Validate(); err != nil {

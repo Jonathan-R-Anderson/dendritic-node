@@ -87,19 +87,17 @@ func (rt *Runtime) Listen(seed [32]byte) (*Service, error) {
 	s := &Service{rt: rt, id: id, lis: session.NewListener(), ctx: ctx, cancel: cancel,
 		sessions: map[session.ID]*session.Session{}, seen: map[[64]byte]time.Time{},
 		rev: uint64(time.Now().Unix()), dirty: make(chan struct{}, 1)}
-	// A first attempt, best-effort: a service created before the overlay has
-	// enough relays to carry a circuit is NOT an error. The node stays up and
-	// maintain() keeps trying at serviceRetryInterval, so the service becomes
-	// reachable on its own as relays appear -- a storage node must never die
-	// just because it booted into a network that is not up yet.
-	if err := s.establishAll(); err != nil {
-		rt.log.Printf("axon: service %s: no intro point yet (%v); retrying as relays join", s.Addr(), err)
-	} else if err := s.publish(); err != nil {
-		rt.log.Printf("axon: service %s: first publication incomplete: %v", s.Addr(), err)
-	}
 	rt.mu.Lock()
 	rt.services = append(rt.services, s)
 	rt.mu.Unlock()
+	// Publishing is ASYNCHRONOUS and best-effort: establishing intro points means
+	// building circuits, which over a real (WAN) network takes seconds and can fail
+	// while the overlay is still coming up. Listen() must not block on that, or a
+	// node spends its first minute unable to serve anything else (its proxy, other
+	// services). maintain() establishes and publishes in the background -- firing
+	// at once, then retrying at serviceRetryInterval until it holds an intro point,
+	// then republishing on the hour. A service created before the overlay can carry
+	// a circuit is never an error; it becomes reachable on its own as relays appear.
 	go s.maintain()
 	return s, nil
 }
@@ -239,14 +237,10 @@ func (s *Service) introLost(ip *introPoint) {
 // every intro was lost -- it retries at serviceRetryInterval instead of waiting
 // for the hourly tick, so a node that booted ahead of its relays still comes up.
 func (s *Service) maintain() {
-	s.mu.Lock()
-	have := len(s.intros)
-	s.mu.Unlock()
-	next := params.DescriptorRepublish
-	if have == 0 {
-		next = serviceRetryInterval
-	}
-	t := time.NewTimer(next)
+	// Fire at once: Listen() no longer publishes synchronously, so the first
+	// establish+publish happens here, immediately, off the caller's path.
+	next := serviceRetryInterval
+	t := time.NewTimer(0)
 	defer t.Stop()
 	for {
 		select {
@@ -257,7 +251,7 @@ func (s *Service) maintain() {
 		}
 		s.establishAll()
 		s.mu.Lock()
-		have = len(s.intros)
+		have := len(s.intros)
 		s.mu.Unlock()
 		if have > 0 {
 			if err := s.publish(); err != nil {

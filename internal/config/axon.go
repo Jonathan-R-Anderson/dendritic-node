@@ -27,7 +27,17 @@ type AxonConfig struct {
 	Listen []string `json:"listen,omitempty"`
 	// Relay carries other nodes' circuits and publishes this node in the relay
 	// directory. It needs Listen and a port the internet can reach.
+	//
+	// A node does not have to set this explicitly: a node that has declared a
+	// reachable address (both Listen and Announce) relays BY DEFAULT, so every
+	// participant that CAN route does -- there is no separate, designated backbone,
+	// the way I2P makes every router a participant. RelayOff opts such a node back
+	// out. EffectiveRelay() is the value the runtime actually uses.
 	Relay bool `json:"relay"`
+	// RelayOff declines relaying even though this node has a reachable address.
+	// It only matters when Listen+Announce are set (otherwise the node cannot
+	// relay anyway); use it for a public box that should stay a pure client.
+	RelayOff bool `json:"relay_off,omitempty"`
 	// Announce are the "ip:port" addresses a relay publishes, for when Listen
 	// binds a wildcard. Empty derives them from Listen.
 	Announce []string `json:"announce,omitempty"`
@@ -65,6 +75,18 @@ type AxonConfig struct {
 
 // DefaultProxyListen is where the AXON proxy listens unless configured.
 const DefaultProxyListen = "127.0.0.1:4480"
+
+// EffectiveRelay is whether this node relays for the overlay. A node relays if it
+// asked to (Relay), OR -- the decentralising default -- if it has declared a
+// reachable address (both Listen and Announce), so every node that can route does,
+// without a designated backbone. RelayOff overrides the default for a public node
+// that wants to stay a pure client. A node with no reachable address never relays.
+func (a AxonConfig) EffectiveRelay() bool {
+	if a.RelayOff {
+		return false
+	}
+	return a.Relay || (len(a.Listen) > 0 && len(a.Announce) > 0)
+}
 
 // Validate checks the AXON settings a running node consumes.
 func (a AxonConfig) Validate() error {

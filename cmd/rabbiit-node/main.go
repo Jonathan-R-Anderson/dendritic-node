@@ -168,7 +168,7 @@ func main() {
 		signer, err = gateway.LoadOrCreateFileIdentity(cfg.DataDir)
 		// A gateway or probe box with a public address can relay for the
 		// overlay without storing anything.
-		if err == nil && cfg.Axon.Relay {
+		if err == nil && cfg.Axon.EffectiveRelay() {
 			overlay, _, oerr := startOverlay(ctx, cfg, true, logger)
 			if oerr != nil {
 				logger.Fatal(oerr)
@@ -177,7 +177,7 @@ func main() {
 		}
 	} else {
 		logger.Printf("joining the AXON overlay for the storage DHT")
-		overlay, origin, oerr := startOverlay(ctx, cfg, cfg.Axon.Relay, logger)
+		overlay, origin, oerr := startOverlay(ctx, cfg, cfg.Axon.EffectiveRelay(), logger)
 		if oerr != nil {
 			logger.Fatal(oerr)
 		}
