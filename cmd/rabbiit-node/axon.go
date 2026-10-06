@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rabbiit/maniwani/storage-client/internal/axon/proxy"
@@ -195,8 +196,12 @@ func fetchOverlaySeeds(ctx context.Context, client *http.Client, url, pinnedKey 
 // startAxonProxy serves the loopback proxy onto the overlay until ctx ends. A
 // port already in use is logged, not fatal: the proxy is a convenience for the
 // person at this machine, and the node's own work does not depend on it.
-func startAxonProxy(ctx context.Context, listen string, rt *runtime.Runtime, logger *log.Logger) {
-	server := &http.Server{Addr: listen, Handler: proxy.New(rt.DialContext), ReadHeaderTimeout: 30 * time.Second}
+func startAxonProxy(ctx context.Context, listen string, rt *runtime.Runtime, selfExpert string, logger *log.Logger) {
+	p := proxy.New(rt.DialContext)
+	// Back the /v1/axon/peers directory praxis uses for discovery: this node's own expert service
+	// (if up) plus any RABBIIT_EXPERT_PEERS the operator configured.
+	p.Peers = func() []string { return expertPeers(selfExpert) }
+	server := &http.Server{Addr: listen, Handler: p, ReadHeaderTimeout: 30 * time.Second}
 	go func() {
 		<-ctx.Done()
 		server.Close()
@@ -207,6 +212,21 @@ func startAxonProxy(ctx context.Context, listen string, rt *runtime.Runtime, log
 			logger.Printf("AXON proxy not started: %v", err)
 		}
 	}()
+}
+
+// expertPeers is the .key.axon peers praxis can reach for /expert, for the proxy's /v1/axon/peers
+// directory: this node's own expert service first, then RABBIIT_EXPERT_PEERS (comma-separated).
+func expertPeers(self string) []string {
+	var out []string
+	if self != "" {
+		out = append(out, self)
+	}
+	for _, p := range strings.Split(os.Getenv("RABBIIT_EXPERT_PEERS"), ",") {
+		if p = strings.TrimSpace(p); strings.HasSuffix(p, ".key.axon") {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func readOverlaySeeds(path string) (overlaySeeds, error) {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -25,6 +26,7 @@ import (
 	"github.com/rabbiit/maniwani/storage-client/internal/bootstrap"
 	"github.com/rabbiit/maniwani/storage-client/internal/config"
 	"github.com/rabbiit/maniwani/storage-client/internal/directive"
+	"github.com/rabbiit/maniwani/storage-client/internal/expert"
 	"github.com/rabbiit/maniwani/storage-client/internal/gateway"
 	gatewayfrontend "github.com/rabbiit/maniwani/storage-client/internal/gateway/frontend"
 	"github.com/rabbiit/maniwani/storage-client/internal/heartbeat"
@@ -138,6 +140,26 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// DENDRITIC: a loopback expert API for same-host praxis + local testing. Started here, BEFORE the
+	// overlay join (which blocks/retries until a relay is reachable), so the expert bridge is usable
+	// even on a node with no relay yet. Remote peers reach the same handler over the AXON hidden
+	// service set up once the overlay is live (below). Non-fatal: a port clash must not kill the node.
+	{
+		exListen := os.Getenv("RABBIIT_EXPERT_LISTEN")
+		if exListen == "" {
+			exListen = "127.0.0.1:4481"
+		}
+		exSrv := &http.Server{Addr: exListen, Handler: expert.Handler(os.Getenv("RABBIIT_EXPERT_BACKEND")), ReadHeaderTimeout: 10 * time.Second}
+		go func() { <-ctx.Done(); exSrv.Close() }()
+		go func() {
+			logger.Printf("expert: loopback API on http://%s (-> praxis expert backend)", exListen)
+			if err := exSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Printf("expert: loopback API not started: %v", err)
+			}
+		}()
+	}
+
 	var node *p2p.Node
 	var signer gateway.Signer
 	if noStorage {
@@ -159,8 +181,19 @@ func main() {
 			logger.Fatal(oerr)
 		}
 		defer overlay.Close()
+		// DENDRITIC: serve this node's local praxis experts on an AXON hidden service, so remote
+		// praxis nodes reach them as <addr>.key.axon/expert/<uid>/forward (deps/praxis-shim/
+		// dendritic_expert.py). Its address is advertised via the proxy's /v1/axon/peers directory.
+		expertAddr := ""
+		if exSvc, exErr := overlay.Listen(expertSeed(cfg.DataDir)); exErr == nil {
+			expertAddr = exSvc.Addr()
+			go func() { _ = http.Serve(exSvc.Listener(), expert.Handler(os.Getenv("RABBIIT_EXPERT_BACKEND"))) }()
+			logger.Printf("expert: serving /expert for praxis at %s (AXON)", expertAddr)
+		} else {
+			logger.Printf("expert: AXON hidden service unavailable (%v); loopback expert API still up", exErr)
+		}
 		if cfg.Axon.ProxyListen != "" {
-			startAxonProxy(ctx, cfg.Axon.ProxyListen, overlay, logger)
+			startAxonProxy(ctx, cfg.Axon.ProxyListen, overlay, expertAddr, logger)
 		}
 		node, err = p2p.Open(ctx, cfg.DataDir, p2p.Overlay{Runtime: overlay, Origin: origin}, storageNode, logger)
 		if err == nil {
@@ -938,6 +971,10 @@ func main() {
 	}
 	logger.Printf("shutdown complete")
 }
+
+// expertSeed derives a stable 32-byte AXON service seed for this node's /expert hidden service, so its
+// <addr>.key.axon address is stable across restarts (tied to the node's data dir).
+func expertSeed(dataDir string) [32]byte { return sha256.Sum256([]byte(dataDir + "\x00axon-expert-v1")) }
 
 func serve(server *http.Server, cfg config.Config, logger *log.Logger, label string) {
 	var err error

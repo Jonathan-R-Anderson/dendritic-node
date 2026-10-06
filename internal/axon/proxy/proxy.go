@@ -11,6 +11,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -32,6 +33,11 @@ type Handler struct {
 	// DialTimeout bounds reaching a service. Zero means two minutes, which
 	// covers a cold rendezvous.
 	DialTimeout time.Duration
+
+	// Peers, if set, backs the local GET /v1/axon/peers directory: the
+	// <addr>.key.axon peers a local client (e.g. praxis's dendritic_expert)
+	// can reach for services like /expert. Nil means an empty directory.
+	Peers func() []string
 
 	transport *http.Transport
 }
@@ -70,6 +76,20 @@ func (h *Handler) dial(ctx context.Context, hostport string) (net.Conn, error) {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
 		h.connect(w, r)
+		return
+	}
+	// Local management endpoint (origin-form request to the proxy itself, not an AXON address): the
+	// peer directory praxis's dendritic_expert.discover_peers() reads to find expert-serving nodes.
+	if !r.URL.IsAbs() && r.URL.Path == "/v1/axon/peers" {
+		var peers []string
+		if h.Peers != nil {
+			peers = h.Peers()
+		}
+		if peers == nil {
+			peers = []string{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"peers": peers})
 		return
 	}
 	if !r.URL.IsAbs() || r.URL.Scheme != "http" {
