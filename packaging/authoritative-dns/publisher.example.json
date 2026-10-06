@@ -1,0 +1,18 @@
+{
+  "rpc": "http://YOUR_CHAIN_RPC:8545",
+  "contract": "0xYOUR_VERSION_3_REGISTRY",
+  "chain_id": 0,
+  "max_names": 10000,
+  "interval_seconds": 30,
+  "timeout_seconds": 120,
+  "check_command": ["named-checkzone"],
+  "reload_command": ["rndc", "-s", "127.0.0.1", "-p", "9953", "-k", "/var/lib/axon-dns/rndc.key", "reload"],
+  "zones": [
+    {
+      "origin": "example.com",
+      "file": "/var/lib/axon-dns/example.com.zone",
+      "nameservers": ["ns1.example.net."],
+      "mailbox": "hostmaster.example.com."
+    }
+  ]
+}

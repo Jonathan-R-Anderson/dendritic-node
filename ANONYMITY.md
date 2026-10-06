@@ -195,10 +195,12 @@ Names buy human usability with on-chain publicity. Be deliberate about the trade
   address" property that keeps unnamed Layer-1 services obscure. The operator's *IP* is
   still hidden by the hidden-service mechanism; the service's *identity key* is not.
 - **Resolution leaks the query.** A plain `eth_call` to an RPC provider tells that
-  provider which name you are resolving, and when. Reading the same state *trustlessly*
-  through `internal/ethproof` (an `eth_getProof` against a BLS-verified header) removes the
-  need to *trust* the RPC's answer, but the RPC still sees the request. True query privacy
-  needs a local chain, a private-information-retrieval scheme, or a trusted local resolver.
+  provider which name you are resolving, and when. This resolver trusts that provider's
+  answer: `internal/ethproof` is not wired into alias resolution, and no state proof or
+  verified-header check occurs here. A lying RPC can substitute destinations or claim
+  a configured alias is unregistered; explicit missing-name exit fallback therefore
+  trusts the RPC's absence claims too. A local chain can avoid a remote query observer;
+  proof verification alone would not hide the query.
 - **Names are guessable.** The registry keys on `keccak256(name)`; short or dictionary
   names are enumerable. Obscurity of a name is not a security property.
 

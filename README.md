@@ -1113,58 +1113,62 @@ AXON proxy — the request is answered by the model with the requester's IP neve
 A node behind a firewall still works: hidden services are reached by *outbound*
 rendezvous circuits, so no inbound port needs opening.
 
-### 5. Put names on it — deploy the registry
+### 5. Blockchain aliases and typed records
 
-`contracts/tld/` is a self-contained Foundry project (`AxonTLD.sol`) — the minimal,
-working form of the `.axon` name system (see `contracts/tld/README.md` and `ANONYMITY.md`
-§ "The naming layer leaks"). Locally:
+[`contracts/tld/README.md`](contracts/tld/README.md) describes the registry, deployment,
+fees, administration and complete `cast` commands. The new constructor requires
+three explicit fee amounts in wei. Its deployment script verifies the deploying
+keystore address: that wallet permanently receives accrued protocol fees, even
+if the two-step policy administrator role later transfers.
 
-```sh
-export PATH=~/.foundry/bin:$PATH
-anvil --silent &                                  # local chain, chainId 31337, :8545
-cd deps/dendritic-node/contracts/tld && forge build
-forge create src/AxonTLD.sol:AxonTLD --rpc-url http://127.0.0.1:8545 \
-    --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 --broadcast
-# → note the "Deployed to: 0x..." address
-```
+Owners register `.axon` names or administrator-enabled TLDs such as `.com`, maintain
+up to 32 AXON/A/AAAA/MX records, and transfer names through recipient acceptance.
+These are network-local aliases; they confer no rights in public DNS.
 
-For a shared network deploy to a public testnet (or mainnet) with your own funded
-wallet instead of the anvil dev key; the resolver reads any EVM chain.
+The registry also supports parent-controlled subdomains and a separate
+[BIND authoritative DNS service](packaging/authoritative-dns/README.md), including
+common DNS records, wildcards, DNSSEC and authenticated secondary transfers. Its
+`axon-dns` publisher reads finalized registry snapshots and validates zones before
+reloading BIND. Existing deployments need protocol-v3 redeployment for these features.
 
-### 6. Register a name → a node's key
+### 6. Configure name resolution
 
-A name binds to the **32-byte Ed25519 key** that is the node's Layer-1 identity — the
-key inside its `<56-base32>.key.axon` address. Derive it from the address (base32-decode
-the 56-char label, take the first 32 bytes) and register:
-
-```sh
-cast send <contract> "register(string,bytes32)" "ai.epin.axon" 0x<32-byte-key> \
-    --rpc-url http://127.0.0.1:8545 --private-key 0xac09...ff80
-cast call <contract> "resolveName(string)(bytes32,address,uint64)" "ai.epin.axon" \
-    --rpc-url http://127.0.0.1:8545      # → the key, owner, timestamp
-```
-
-### 7. Turn on resolution and use the name
-
-Add the registry to the proxy node's config and restart it:
+The defaults still require no registry for self-certifying addresses. To enable
+aliases, configure a deployed registry on the matching RPC chain, then restart:
 
 ```json
-"axon": { "proxy_listen": "127.0.0.1:4480",
-          "name_rpc": "http://127.0.0.1:8545",
-          "name_contract": "0x<contract>" }
+"axon": {
+  "proxy_listen": "127.0.0.1:4480",
+  "name_rpc": "http://127.0.0.1:8545",
+  "name_contract": "0x<deployed-registry-address>",
+  "name_suffixes": ["com"],
+  "name_missing_fallback": false,
+  "name_legacy_contract": false
+}
 ```
 
-It logs `AXON names: resolving .axon names via ...`, and now:
+`.axon` is implicit; additional suffixes also need enabling on chain. The proxy
+uses AXON records only, tries the primary first, and attempts at most four
+identities. A/AAAA/MX storage does not enable DNS routing or mail delivery.
+
+### 7. Use aliases and understand fallback
 
 ```sh
-curl -x http://127.0.0.1:4480 http://ai.epin.axon/expert/health
-# proxy: name → keccak256 → AxonTLD.resolve → key → <56>.key.axon → dial over AXON
+curl -x http://127.0.0.1:4480 http://example.com/expert/health
+# configured alias -> trusted RPC lookup -> AXON identity -> overlay connection
 ```
 
-Names off by default; both `name_rpc` and `name_contract` empty means only
-self-certifying `<56>.key.axon` addresses resolve — which never need a chain at all.
-Only nodes that can reach the RPC resolve names; a node with no registry configured
-still reaches everything by its self-certifying address.
+Exit fallback is disabled for configured aliases by default. If explicitly enabled,
+only an unregistered additional-suffix name may use `exit_via`. Owned names without
+AXON records, RPC errors, unsupported contracts and failed overlay connections never
+trigger exit fallback. `.axon` never uses an exit. Direct `.key.axon` addresses
+bypass the registry.
+
+The resolver trusts RPC responses; no blockchain proof verification is wired into
+this path. An older contract requires `name_legacy_contract: true` with no additional
+suffixes. New features require redeployment and voluntary owner migration; there
+is no administrative ownership import or seizure. See the registry documentation
+for legacy noncanonical names and migration risks.
 
 ### 8. Spanning several machines, and persistence
 

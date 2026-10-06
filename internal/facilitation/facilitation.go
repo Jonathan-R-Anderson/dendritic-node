@@ -27,7 +27,7 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
-// Capability bits — MUST match NodeRegistry.sol.
+// Capability bits — MUST match NodeRegistry.sol (roadmap §17.2: never renumber a bit).
 const (
 	CapDHT              uint64 = 1 << 0
 	CapGateway          uint64 = 1 << 1
@@ -36,6 +36,16 @@ const (
 	CapDockerWorker     uint64 = 1 << 4
 	CapDockerController uint64 = 1 << 5
 	CapWitness          uint64 = 1 << 6
+	// Overlay-role bits (NodeRegistry.sol CAP_RELAY..CAP_EXIT). Advertised so the
+	// network can discover who relays and who exits; CapExit is the opt-in clearnet
+	// exit. (The aggregator reward policy does not yet define a receipt slot for
+	// these, so advertising is informational until it does — see receipt.go.)
+	CapRelay      uint64 = 1 << 7
+	CapGuard      uint64 = 1 << 8
+	CapRendezvous uint64 = 1 << 9
+	CapIntro      uint64 = 1 << 10
+	CapBootstrap  uint64 = 1 << 11
+	CapExit       uint64 = 1 << 12
 )
 
 // registerTypehash mirrors NodeRegistry.REGISTER_TYPEHASH.

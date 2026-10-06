@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rabbiit/maniwani/storage-client/internal/axon/exitproxy"
 	"github.com/rabbiit/maniwani/storage-client/internal/axon/names"
 	"github.com/rabbiit/maniwani/storage-client/internal/bootstrap"
 	"github.com/rabbiit/maniwani/storage-client/internal/config"
@@ -193,9 +194,21 @@ func main() {
 		} else {
 			logger.Printf("expert: AXON hidden service unavailable (%v); loopback expert API still up", exErr)
 		}
+		// Opt-in clearnet EXIT: publish a hidden service that forwards to the open
+		// internet on a client's behalf. Off unless axon.exit is set; it carries
+		// other people's traffic under this node's IP, so it is never a default.
+		if cfg.Axon.Exit {
+			if exitSvc, exErr := overlay.Listen(exitSeed(cfg.DataDir)); exErr == nil {
+				logger.Printf("exit: clearnet EXIT (outproxy) serving at %s (AXON) — this node forwards to the open internet%s",
+					exitSvc.Addr(), map[bool]string{true: " (private ranges ALLOWED)", false: ""}[cfg.Axon.ExitAllowPrivate])
+				go func() { _ = http.Serve(exitSvc.Listener(), exitproxy.New(cfg.Axon.ExitAllowPrivate)) }()
+			} else {
+				logger.Printf("exit: AXON hidden service unavailable: %v", exErr)
+			}
+		}
 		if cfg.Axon.ProxyListen != "" {
 			startAxonProxy(ctx, cfg.Axon.ProxyListen, overlay, expertAddr,
-				names.New(cfg.Axon.NameRPC, cfg.Axon.NameContract), logger)
+				names.NewWithPolicy(cfg.Axon.NameRPC, cfg.Axon.NameContract, cfg.Axon.NameSuffixes, cfg.Axon.NameMissingFallback, cfg.Axon.NameLegacyContract), cfg.Axon.ExitVia, logger)
 		}
 		node, err = p2p.Open(ctx, cfg.DataDir, p2p.Overlay{Runtime: overlay, Origin: origin}, storageNode, logger)
 		if err == nil {
@@ -976,7 +989,13 @@ func main() {
 
 // expertSeed derives a stable 32-byte AXON service seed for this node's /expert hidden service, so its
 // <addr>.key.axon address is stable across restarts (tied to the node's data dir).
-func expertSeed(dataDir string) [32]byte { return sha256.Sum256([]byte(dataDir + "\x00axon-expert-v1")) }
+func expertSeed(dataDir string) [32]byte {
+	return sha256.Sum256([]byte(dataDir + "\x00axon-expert-v1"))
+}
+
+// exitSeed derives the stable AXON service seed for this node's clearnet-exit hidden
+// service, so its <addr>.key.axon address is stable across restarts.
+func exitSeed(dataDir string) [32]byte { return sha256.Sum256([]byte(dataDir + "\x00axon-exit-v1")) }
 
 func serve(server *http.Server, cfg config.Config, logger *log.Logger, label string) {
 	var err error

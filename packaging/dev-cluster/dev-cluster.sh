@@ -54,8 +54,11 @@ c={"data_dir":out.rsplit("/",1)[0],"run_mode":"probe-only","ui_listen":"",
    "gateway":{"enabled":False,"probe_enabled":True,"public_hostname":f"relay{port}.axon.local",
               "listen_port":gwport,"tls":{"mode":"reverse_proxy"},"probe_network":"dev-lan",
               "external_verification":{"enabled":False},"probe_urls":[]},
+   # Bind all interfaces but ANNOUNCE the reachable address: external peers dial the
+   # announced host, while same-host nodes can still reach the relay via loopback
+   # (a cloud public IP often does not hairpin from inside the box).
    "axon":{"relay":True,
-           "listen":[f"/ip4/{host}/tcp/{port}",f"/ip4/{host}/udp/{port}/quic-v1"],
+           "listen":["/ip4/0.0.0.0/tcp/%d"%port,"/ip4/0.0.0.0/udp/%d/quic-v1"%port],
            "announce":[f"{host}:{port}"],"allow_same_network":True,"proxy_listen":""}}
 if seeds: c["axon"]["seeds"]=seeds
 json.dump(c,open(out,"w"),indent=2)

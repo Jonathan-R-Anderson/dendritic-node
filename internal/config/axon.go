@@ -9,6 +9,7 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 
 	"github.com/rabbiit/maniwani/storage-client/internal/axon/identity"
+	"github.com/rabbiit/maniwani/storage-client/internal/axon/names"
 )
 
 // AxonConfig places the node on AXON, the network's own anonymous overlay. It
@@ -71,6 +72,25 @@ type AxonConfig struct {
 	// are reachable (the default).
 	NameRPC      string `json:"name_rpc,omitempty"`
 	NameContract string `json:"name_contract,omitempty"`
+	// NameSuffixes adds single TLD labels (e.g. com); axon is always implicit.
+	NameSuffixes []string `json:"name_suffixes,omitempty"`
+	// NameMissingFallback permits exit routing only for definitively unregistered additional-suffix names.
+	NameMissingFallback bool `json:"name_missing_fallback,omitempty"`
+	// NameLegacyContract enables the old single-key ABI for .axon only.
+	NameLegacyContract bool `json:"name_legacy_contract,omitempty"`
+	// Exit makes this node a clearnet EXIT (outproxy): it publishes a hidden
+	// service that forwards requests out to the ordinary internet on a client's
+	// behalf. OFF by default and emphatically opt-in -- an exit carries other
+	// people's traffic under its own IP, the role Tor exits take the heat for.
+	// ExitAllowPrivate additionally permits destinations on private/loopback/
+	// link-local ranges (default false: an exit refuses them, so it cannot be
+	// used to reach its operator's own LAN -- basic SSRF protection).
+	Exit             bool `json:"exit,omitempty"`
+	ExitAllowPrivate bool `json:"exit_allow_private,omitempty"`
+	// ExitVia routes this node's clearnet requests (any non-.axon host asked of
+	// the loopback proxy) THROUGH the exit at this address, as <56 base32>.key.axon
+	// or <addr>:port. Empty keeps the default: clearnet is refused, there is no exit.
+	ExitVia string `json:"exit_via,omitempty"`
 }
 
 // DefaultProxyListen is where the AXON proxy listens unless configured.
@@ -90,6 +110,21 @@ func (a AxonConfig) EffectiveRelay() bool {
 
 // Validate checks the AXON settings a running node consumes.
 func (a AxonConfig) Validate() error {
+	if (a.NameRPC == "") != (a.NameContract == "") {
+		return errors.New("name_rpc and name_contract must be configured together")
+	}
+	for _, s := range a.NameSuffixes {
+		if err := names.ValidateSuffix(s); err != nil {
+			return fmt.Errorf("name_suffixes: %w", err)
+		}
+	}
+	if len(a.NameSuffixes) > 0 && (a.NameRPC == "" || a.NameLegacyContract) {
+		return errors.New("additional name suffixes require a modern registry")
+	}
+	if a.NameMissingFallback && len(a.NameSuffixes) == 0 {
+		return errors.New("name_missing_fallback requires additional suffixes")
+	}
+
 	if a.Relay && len(a.Listen) == 0 {
 		return errors.New("axon.relay needs axon.listen: a relay nobody can reach is a hole in every path through it")
 	}

@@ -1,0 +1,26 @@
+options {
+    directory "/var/lib/axon-dns";
+    pid-file "/var/lib/axon-dns/named.pid";
+    session-keyfile "/var/lib/axon-dns/session.key";
+    listen-on port 1053 { any; };
+    listen-on-v6 { none; };
+    recursion no;
+    dnssec-validation no; // Authoritative signing is enabled per zone below.
+    allow-query { any; };
+    allow-transfer { none; };
+};
+include "/var/lib/axon-dns/rndc.key";
+controls {
+    inet 127.0.0.1 port 9953 allow { 127.0.0.1; } keys { "rndc-key"; };
+};
+zone "example.com" {
+    type primary;
+    file "/var/lib/axon-dns/example.com.zone";
+    key-directory "/var/lib/axon-dns/keys";
+    dnssec-policy default;
+    inline-signing yes;
+    allow-update { none; }; // Mutations must pass the blockchain ownership/fee rules.
+    allow-transfer { none; }; // Add explicitly authorized TSIG secondary keys here.
+    ixfr-from-differences yes;
+    notify yes;
+};

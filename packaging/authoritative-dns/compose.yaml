@@ -1,0 +1,17 @@
+services:
+  authoritative:
+    build:
+      context: ../..
+      dockerfile: packaging/authoritative-dns/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1053:1053/udp"
+      - "127.0.0.1:1053:1053/tcp"
+    volumes:
+      - ./publisher.json:/etc/axon-dns/publisher.json:ro
+      - ./named.conf:/etc/axon-dns/named.conf:ro
+      - authoritative-state:/var/lib/axon-dns
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  authoritative-state:

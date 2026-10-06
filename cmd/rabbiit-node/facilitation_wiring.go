@@ -215,6 +215,12 @@ func nodeCapabilities(cfg config.Config) uint64 {
 	if cfg.DCS.Enabled && cfg.DCS.Role.Worker {
 		caps |= facilitation.CapDockerWorker
 	}
+	if cfg.Axon.EffectiveRelay() {
+		caps |= facilitation.CapRelay
+	}
+	if cfg.Axon.Exit {
+		caps |= facilitation.CapExit
+	}
 	return caps
 }
 

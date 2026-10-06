@@ -45,7 +45,9 @@
       "enabled": false,
       "origin_address": "51.79.71.153:9443",
       "origin_server_name": "rabbiit.io",
-      "sni_allowlist": ["rabbiit.io"],
+      "sni_allowlist": [
+        "rabbiit.io"
+      ],
       "max_connections": 1024,
       "max_bytes_per_second": 16777216,
       "handshake_timeout_seconds": 10,
@@ -54,5 +56,13 @@
       "drain_seconds": 60,
       "proxy_protocol": true
     }
+  },
+  "axon": {
+    "proxy_listen": "127.0.0.1:4480",
+    "name_rpc": "",
+    "name_contract": "",
+    "name_suffixes": [],
+    "name_missing_fallback": false,
+    "name_legacy_contract": false
   }
 }
