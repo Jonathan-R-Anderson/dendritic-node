@@ -44,6 +44,16 @@ type AxonConfig struct {
 	// (and nothing else), so a browser or port scanner on this machine can
 	// reach a DCS container or any other AXON service. Empty disables it.
 	ProxyListen string `json:"proxy_listen,omitempty"`
+	// Hops is the circuit length. Zero means the anonymity-preserving default
+	// (params.DefaultHops, 3). Set it to 2 only for an explicitly non-anonymous
+	// performance or test deployment; the runtime refuses anything below MinHops.
+	Hops int `json:"hops,omitempty"`
+	// AllowSameNetwork lets a circuit use relays that share one network prefix.
+	// A real deployment MUST leave this false -- path diversity across networks
+	// is what the anonymity rests on. Set it true ONLY for a development or test
+	// cluster whose relays all sit on one LAN (e.g. a single /24), where the
+	// diversity rule would otherwise reject every path. Off by default.
+	AllowSameNetwork bool `json:"allow_same_network,omitempty"`
 }
 
 // DefaultProxyListen is where the AXON proxy listens unless configured.
@@ -84,6 +94,11 @@ func (a AxonConfig) Validate() error {
 		if _, err := identity.ParseAddress(a.Origin); err != nil {
 			return fmt.Errorf("axon.origin %q is not an AXON address (<56 base32>.key.axon)", a.Origin)
 		}
+	}
+	// 0 means the default; otherwise bound it to params' [MinHops, MaxHops] = [2, 4]
+	// (kept in sync with internal/axon/params; stated literally to avoid importing it here).
+	if a.Hops != 0 && (a.Hops < 2 || a.Hops > 4) {
+		return fmt.Errorf("axon.hops %d out of range: 0 (default) or 2..4", a.Hops)
 	}
 	return nil
 }

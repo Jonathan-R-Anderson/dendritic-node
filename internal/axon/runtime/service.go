@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -30,6 +31,24 @@ import (
 // one secret-free value both ends hold, the client from the address it dialled.
 
 const serviceIntroPoints = 3
+
+// axonDebug gates the service's rendezvous tracing. Off unless RABBIIT_AXON_DEBUG
+// is set, since it narrates every introduction -- useful when a small or new
+// network is failing to complete rendezvous, noise otherwise.
+var axonDebug = os.Getenv("RABBIIT_AXON_DEBUG") != ""
+
+func (s *Service) dbg(format string, args ...any) {
+	if axonDebug {
+		s.rt.log.Printf("axon-dbg service: "+format, args...)
+	}
+}
+
+// serviceRetryInterval is how often a service with no intro points yet tries
+// again to establish one. A node whose overlay is still too small to carry a
+// circuit (it has just booted, or the relays have not come up yet) must not
+// give up until the next hourly republish -- it keeps trying at this cadence
+// until it has an intro point, then falls back to DescriptorRepublish.
+const serviceRetryInterval = 5 * time.Second
 
 // Service is one hidden service on this node.
 type Service struct {
@@ -68,11 +87,14 @@ func (rt *Runtime) Listen(seed [32]byte) (*Service, error) {
 	s := &Service{rt: rt, id: id, lis: session.NewListener(), ctx: ctx, cancel: cancel,
 		sessions: map[session.ID]*session.Session{}, seen: map[[64]byte]time.Time{},
 		rev: uint64(time.Now().Unix()), dirty: make(chan struct{}, 1)}
+	// A first attempt, best-effort: a service created before the overlay has
+	// enough relays to carry a circuit is NOT an error. The node stays up and
+	// maintain() keeps trying at serviceRetryInterval, so the service becomes
+	// reachable on its own as relays appear -- a storage node must never die
+	// just because it booted into a network that is not up yet.
 	if err := s.establishAll(); err != nil {
-		cancel()
-		return nil, err
-	}
-	if err := s.publish(); err != nil {
+		rt.log.Printf("axon: service %s: no intro point yet (%v); retrying as relays join", s.Addr(), err)
+	} else if err := s.publish(); err != nil {
 		rt.log.Printf("axon: service %s: first publication incomplete: %v", s.Addr(), err)
 	}
 	rt.mu.Lock()
@@ -212,22 +234,46 @@ func (s *Service) introLost(ip *introPoint) {
 }
 
 // maintain replaces lost intro points (and republishes at once, since the old
-// descriptor names a dead one) and republishes on the hour.
+// descriptor names a dead one) and republishes on the hour. While the service
+// has no intro point at all -- the overlay was too small when it started, or
+// every intro was lost -- it retries at serviceRetryInterval instead of waiting
+// for the hourly tick, so a node that booted ahead of its relays still comes up.
 func (s *Service) maintain() {
-	t := time.NewTicker(params.DescriptorRepublish)
+	s.mu.Lock()
+	have := len(s.intros)
+	s.mu.Unlock()
+	next := params.DescriptorRepublish
+	if have == 0 {
+		next = serviceRetryInterval
+	}
+	t := time.NewTimer(next)
 	defer t.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.dirty:
-			s.establishAll()
 		case <-t.C:
-			s.establishAll()
 		}
-		if err := s.publish(); err != nil {
-			s.rt.log.Printf("axon: service %s: republish: %v", s.Addr(), err)
+		s.establishAll()
+		s.mu.Lock()
+		have = len(s.intros)
+		s.mu.Unlock()
+		if have > 0 {
+			if err := s.publish(); err != nil {
+				s.rt.log.Printf("axon: service %s: republish: %v", s.Addr(), err)
+			}
+			next = params.DescriptorRepublish
+		} else {
+			next = serviceRetryInterval
 		}
+		if !t.Stop() {
+			select {
+			case <-t.C:
+			default:
+			}
+		}
+		t.Reset(next)
 	}
 }
 
@@ -315,8 +361,10 @@ func (s *Service) storeAt(h *RelayInfo, items [][2][]byte) error {
 
 // introduced answers one INTRODUCE2.
 func (s *Service) introduced(ip *introPoint, data []byte) {
+	s.dbg("introduced: received INTRODUCE2 (%d bytes)", len(data))
 	m, verdict, err := decodeIntroduce2(data)
 	if err != nil || verdict != rendez.AckOK {
+		s.dbg("introduced: decode/verdict bail err=%v verdict=%v", err, verdict)
 		return
 	}
 	var rk [64]byte
@@ -351,14 +399,18 @@ func (s *Service) introduced(ip *introPoint, data []byte) {
 		}
 	}
 	if pt == nil {
+		s.dbg("introduced: OpenIntro failed for all periods (pt==nil)")
 		return
 	}
 	rp := s.rt.dir.ByStaticID(pt.RPRoutingID)
 	if rp == nil {
+		s.dbg("introduced: ByStaticID(RP) == nil -- rendezvous relay not in my directory")
 		return // a rendezvous point this node cannot reach
 	}
+	s.dbg("introduced: RP found = %s", rp.Peer)
 	seed, hs, err := rendez.ServiceRendezvous(rand.Reader, ip.encPriv, ip.encPub, s.kSvc(), m.X)
 	if err != nil {
+		s.dbg("introduced: ServiceRendezvous err=%v", err)
 		return
 	}
 	id := session.ID(pt.SessionID)
@@ -400,6 +452,7 @@ func (s *Service) introduced(ip *introPoint, data []byte) {
 	defer cancel()
 	cc, err := s.rt.circuitTo(ctx, rp, nil)
 	if err != nil {
+		s.dbg("introduced: circuitTo(RP %s) FAILED err=%v", rp.Peer, err)
 		return
 	}
 	// Listen first, announce second: the client's first packets may arrive the
@@ -407,8 +460,10 @@ func (s *Service) introduced(ip *introPoint, data []byte) {
 	// RENDEZVOUS1 that makes it a splice rather than a control session.
 	k := cc.receiveInto(sess)
 	if err := cc.send(circuit.RCmdRendezvous1, (&rendez.Rendezvous1{Cookie: pt.Cookie, HS: hs}).Encode()); err != nil {
+		s.dbg("introduced: RENDEZVOUS1 send FAILED err=%v", err)
 		cc.close()
 		return
 	}
+	s.dbg("introduced: RENDEZVOUS1 sent to RP %s -- rendezvous complete", rp.Peer)
 	sess.Attach(k)
 }

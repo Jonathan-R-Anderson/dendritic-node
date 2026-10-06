@@ -57,7 +57,11 @@ func startOverlay(ctx context.Context, cfg config.Config, relay bool, logger *lo
 			Relay:    relay,
 			Announce: cfg.Axon.Announce,
 			Seeds:    seeds.Relays,
-			Logger:   log.New(logger.Writer(), logger.Prefix()+"axon: ", logger.Flags()),
+			// Hops and AllowSameNetwork are the anonymity-preserving defaults unless the
+			// operator opts a development/test cluster out of them (see AxonConfig).
+			Hops:             cfg.Axon.Hops,
+			AllowSameNetwork: cfg.Axon.AllowSameNetwork,
+			Logger:           log.New(logger.Writer(), logger.Prefix()+"axon: ", logger.Flags()),
 		}
 		rt, err := runtime.Start(ctx, rc)
 		if err == nil {
