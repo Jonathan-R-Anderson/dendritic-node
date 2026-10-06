@@ -1004,3 +1004,191 @@ sent anywhere and the server neither holds nor needs them.
 Supported S3 operations cover ordinary AWS SDK use including multipart upload.
 Versioning, server-side copy, and presigned-query auth return `NotImplemented`
 rather than silently doing something different.
+
+## Stand up your own `.axon` TLD network
+
+Everything above runs a single node that joins *an existing* overlay. This section
+is the other direction: bring up a **whole dendritic network of your own** — relays,
+service nodes, an optional AI expert — and put a **working `.axon` name system** on
+top of it, backed by a smart contract you deploy. No `node.rabbiit.io`, no public
+relay, no internet required. Read `ANONYMITY.md` before you expose any of it: the
+quick-start here is a *development* network and is deliberately NOT anonymous.
+
+### 0. What you are building
+
+```
+        a human name                 Ethereum                 the overlay
+   curl http://ai.epin.axon/...  ──►  AxonTLD.resolve  ──►  <56-base32>.key.axon
+                                      (name → key)           (onion-routed circuit)
+                                                                      │
+                                                        your service / AI expert
+```
+
+Three kinds of process, all the same `rabbiit-node` binary, told apart by config:
+
+- **Relays** — the backbone. They carry other nodes' circuits and host no service of
+  their own. A hidden service keeps **3 intro points on distinct relays** and a client
+  excludes them when it picks a rendezvous point, so the overlay needs **at least 4
+  relays, and 6 is the comfortable floor** (fewer gives `the directory has too few
+  relays for a circuit`). Relays must be a *different* set of nodes from the services
+  they carry, or a client can pick a service's own node as its rendezvous point and the
+  service then tries to build a circuit ending at itself.
+- **Service nodes** — ordinary storage nodes (non-relay) that publish a hidden service
+  (`/expert`, the S3 storage DHT, …) and make requests. These are what names point at.
+- **A loopback proxy** on at least one node (`axon.proxy_listen`), so you can reach
+  `.key.axon` and `.axon` names with curl/a browser.
+
+### 1. Build
+
+```sh
+make rabbiit-node          # from the anonymOS root → build/rabbiit-node (static linux/amd64)
+```
+
+### 2. The fast path — one host, one command
+
+`packaging/dev-cluster/dev-cluster.sh` brings the whole overlay up on a single machine
+(one VM is plenty) and is the quickest way to see it work:
+
+```sh
+cp build/rabbiit-node deps/dendritic-node/packaging/dev-cluster/rabbiit-node
+cd deps/dendritic-node/packaging/dev-cluster
+RABBIIT_NODE_BIN=./rabbiit-node ./dev-cluster.sh start   # 6 relays + 2 service nodes
+RABBIIT_NODE_BIN=./rabbiit-node ./dev-cluster.sh test    # svcB → svcA /expert over AXON → {"ok":true}
+```
+
+Knobs (env): `NRELAY` (default 6), `HOST` (bind/announce address; `127.0.0.1` for one
+host, a LAN IP to span machines), `PROXY` (the loopback proxy, default `127.0.0.1:4480`),
+`HOPS` (`3` = anonymous default, `2` = faster but **not** anonymous), `DEV_DIR`.
+For reboot persistence install `rabbiit-dev-cluster.service` (see the file's header).
+
+Because a single-host cluster's relays all share one network prefix, the script turns
+on `axon.allow_same_network` — the one setting that makes a one-LAN cluster form at all,
+and the one you must **never** set on a real anonymity network (see `ANONYMITY.md`).
+
+### 3. The manual path — the config that matters
+
+A **relay** (probe-only so it relays but hosts no service; a non-privileged gateway port
+so it needs no root):
+
+```json
+{ "run_mode": "probe-only", "ui_listen": "",
+  "gateway": { "enabled": false, "probe_enabled": true, "public_hostname": "r1.example",
+               "listen_port": 8443, "tls": { "mode": "reverse_proxy" },
+               "probe_network": "dev", "external_verification": { "enabled": false } },
+  "axon": { "relay": true,
+            "listen":  ["/ip4/0.0.0.0/tcp/4001", "/ip4/0.0.0.0/udp/4001/quic-v1"],
+            "announce": ["<this-relay's-reachable-ip>:4001"],
+            "allow_same_network": true } }
+```
+
+Start it; it logs the dial multiaddr other nodes seed from:
+
+```
+AXON relay: other nodes can join through /ip4/<ip>/udp/4001/quic-v1/p2p/12D3Koo...
+```
+
+A **service node** (non-relay storage node that also hosts `/expert`), seeded to the
+relays' multiaddrs:
+
+```json
+{ "run_mode": "storage", "ui_listen": "",
+  "access_key": "DEV...", "secret_key": "<32+ chars>",
+  "axon": { "relay": false, "hops": 3, "allow_same_network": true,
+            "proxy_listen": "127.0.0.1:4480",
+            "seeds": ["/ip4/<relay1-ip>/udp/4001/quic-v1/p2p/12D3Koo...", "...×6"] } }
+```
+
+Seeds alone are enough to join — the signed bootstrap document at `node.rabbiit.io` is
+only the *default* source of that list, and when it is unreachable the fetch fails
+**non-fatally** and the node joins through `axon.seeds` anyway.
+
+### 4. (Optional) lend an AI expert to the network
+
+Point a service node's expert backend at any process that speaks
+`POST /expert/<uid>/forward`. The simplest is a thin adapter to a local model server
+(e.g. praxis): run it on `127.0.0.1:7777` and start the node with
+`RABBIIT_EXPERT_BACKEND=http://127.0.0.1:7777`. The node publishes `<addr>.key.axon`,
+and any peer reaches it as `http://<addr>.key.axon/expert/<uid>/forward` through the
+AXON proxy — the request is answered by the model with the requester's IP never exposed.
+A node behind a firewall still works: hidden services are reached by *outbound*
+rendezvous circuits, so no inbound port needs opening.
+
+### 5. Put names on it — deploy the registry
+
+`contracts/tld/` is a self-contained Foundry project (`AxonTLD.sol`) — the minimal,
+working form of the `.axon` name system (see `contracts/tld/README.md` and `ANONYMITY.md`
+§ "The naming layer leaks"). Locally:
+
+```sh
+export PATH=~/.foundry/bin:$PATH
+anvil --silent &                                  # local chain, chainId 31337, :8545
+cd deps/dendritic-node/contracts/tld && forge build
+forge create src/AxonTLD.sol:AxonTLD --rpc-url http://127.0.0.1:8545 \
+    --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 --broadcast
+# → note the "Deployed to: 0x..." address
+```
+
+For a shared network deploy to a public testnet (or mainnet) with your own funded
+wallet instead of the anvil dev key; the resolver reads any EVM chain.
+
+### 6. Register a name → a node's key
+
+A name binds to the **32-byte Ed25519 key** that is the node's Layer-1 identity — the
+key inside its `<56-base32>.key.axon` address. Derive it from the address (base32-decode
+the 56-char label, take the first 32 bytes) and register:
+
+```sh
+cast send <contract> "register(string,bytes32)" "ai.epin.axon" 0x<32-byte-key> \
+    --rpc-url http://127.0.0.1:8545 --private-key 0xac09...ff80
+cast call <contract> "resolveName(string)(bytes32,address,uint64)" "ai.epin.axon" \
+    --rpc-url http://127.0.0.1:8545      # → the key, owner, timestamp
+```
+
+### 7. Turn on resolution and use the name
+
+Add the registry to the proxy node's config and restart it:
+
+```json
+"axon": { "proxy_listen": "127.0.0.1:4480",
+          "name_rpc": "http://127.0.0.1:8545",
+          "name_contract": "0x<contract>" }
+```
+
+It logs `AXON names: resolving .axon names via ...`, and now:
+
+```sh
+curl -x http://127.0.0.1:4480 http://ai.epin.axon/expert/health
+# proxy: name → keccak256 → AxonTLD.resolve → key → <56>.key.axon → dial over AXON
+```
+
+Names off by default; both `name_rpc` and `name_contract` empty means only
+self-certifying `<56>.key.axon` addresses resolve — which never need a chain at all.
+Only nodes that can reach the RPC resolve names; a node with no registry configured
+still reaches everything by its self-certifying address.
+
+### 8. Spanning several machines, and persistence
+
+Give each machine's relays an `announce` of that machine's reachable IP, run some
+relays on each, and seed the service nodes with the full relay list. Keep
+`allow_same_network` on only while every machine is still inside one subnet. For
+reboot-persistence, run each host's nodes under systemd (a `Type=simple` unit whose
+`ExecStart` launches the relays + service node and `wait`s; see
+`packaging/dev-cluster/rabbiit-dev-cluster.service` for the shape).
+
+### 9. The storage DHT
+
+Service nodes (`run_mode: storage`) also run an S3 gateway (`s3_listen`) and publish a
+storage service on the overlay; objects are erasure-coded (`data_shards` + `parity_shards`,
+default 6 + 3) and the shards are placed on the closest storage holders over AXON. A full
+object round-trip therefore needs at least `data_shards + parity_shards` storage nodes;
+lower the shard counts (min `data_shards: 2`, `parity_shards: 1`) for a small test net.
+Use any AWS-SDK S3 client against `s3_listen` with the node's `access_key`/`secret_key`.
+
+### 10. The governed system vs. this one
+
+This registry is first-come and single-contract — enough to *run* a TLD. The full
+design (`roadmap/axon/09-naming-registry.md` in the sibling `dendritic` checkout) is a
+governed set of namespaces created by on-chain vote, each with its own registrar,
+commit-reveal registration, bonds, confusable-skeleton rules and blind-token anti-sybil.
+Those contracts (`TLDRegistry.sol`, per-namespace `AxonRegistry.sol`) live in that
+sibling and are not wired into this node's dial path; porting them is a larger project.

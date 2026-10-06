@@ -31,12 +31,14 @@
 #   NRELAY             number of relays                         (default: 6)
 #   HOST               address the nodes bind/announce          (default: 127.0.0.1)
 #   PROXY              svcB loopback AXON proxy                  (default: 127.0.0.1:4480)
+#   HOPS               circuit length: 3 = anonymous (default), 2 = faster, NOT anonymous
 set -u
 BIN="${RABBIIT_NODE_BIN:-./rabbiit-node}"
 DEV_DIR="${DEV_DIR:-$HOME/.rabbiit-dev}"
 NRELAY="${NRELAY:-6}"
 HOST="${HOST:-127.0.0.1}"
 PROXY="${PROXY:-127.0.0.1:4480}"
+HOPS="${HOPS:-3}"
 PIDS="$DEV_DIR/pids"
 
 die(){ echo "dev-cluster: $*" >&2; exit 1; }
@@ -61,16 +63,16 @@ PY
 }
 svccfg(){ # $1 dir  $2 seedsJSON  $3 proxy  $4 s3port
   mkdir -p "$1"
-  python3 - "$1/config.json" "$2" "$3" "$4" <<'PY'
+  python3 - "$1/config.json" "$2" "$3" "$4" "$HOPS" <<'PY'
 import json,sys,secrets
-out,seeds,proxy,s3=sys.argv[1],json.loads(sys.argv[2]),sys.argv[3],int(sys.argv[4])
+out,seeds,proxy,s3,hops=sys.argv[1],json.loads(sys.argv[2]),sys.argv[3],int(sys.argv[4]),int(sys.argv[5])
 # The storage role runs a loopback S3 gateway and requires credentials
 # (access_key non-empty, secret_key >= 32 chars); generate per-node ones that
 # never leave this host.
 c={"data_dir":out.rsplit("/",1)[0],"run_mode":"storage","ui_listen":"",
    "s3_listen":f"127.0.0.1:{s3}",
    "access_key":"DEV"+secrets.token_hex(8),"secret_key":secrets.token_hex(24),
-   "axon":{"relay":False,"allow_same_network":True,"hops":3,"proxy_listen":proxy,"seeds":seeds}}
+   "axon":{"relay":False,"allow_same_network":True,"hops":hops,"proxy_listen":proxy,"seeds":seeds}}
 json.dump(c,open(out,"w"),indent=2)
 PY
 }
@@ -96,7 +98,7 @@ do_start(){
   [ -x "$BIN" ] || die "rabbiit-node binary not found/executable at $BIN (set RABBIIT_NODE_BIN)"
   do_stop >/dev/null 2>&1; sleep 1
   mkdir -p "$DEV_DIR"; : >"$PIDS"
-  echo "dev-cluster: $NRELAY relays + 2 service nodes under $DEV_DIR (host $HOST)"
+  echo "dev-cluster: $NRELAY relays + 2 service nodes under $DEV_DIR (host $HOST, hops=$HOPS)"
 
   # Pass 1: mint relay identities and learn their dial multiaddrs.
   SEEDS=()
