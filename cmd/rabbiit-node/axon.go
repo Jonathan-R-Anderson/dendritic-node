@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rabbiit/maniwani/storage-client/internal/axon/names"
 	"github.com/rabbiit/maniwani/storage-client/internal/axon/proxy"
 	"github.com/rabbiit/maniwani/storage-client/internal/axon/runtime"
 	"github.com/rabbiit/maniwani/storage-client/internal/bootstrap"
@@ -200,11 +201,17 @@ func fetchOverlaySeeds(ctx context.Context, client *http.Client, url, pinnedKey 
 // startAxonProxy serves the loopback proxy onto the overlay until ctx ends. A
 // port already in use is logged, not fatal: the proxy is a convenience for the
 // person at this machine, and the node's own work does not depend on it.
-func startAxonProxy(ctx context.Context, listen string, rt *runtime.Runtime, selfExpert string, logger *log.Logger) {
+func startAxonProxy(ctx context.Context, listen string, rt *runtime.Runtime, selfExpert string, resolver *names.Resolver, logger *log.Logger) {
 	p := proxy.New(rt.DialContext)
 	// Back the /v1/axon/peers directory praxis uses for discovery: this node's own expert service
 	// (if up) plus any RABBIIT_EXPERT_PEERS the operator configured.
 	p.Peers = func() []string { return expertPeers(selfExpert) }
+	// Resolve human `.axon` names through the on-chain registry when one is configured,
+	// so the proxy dials the address a name points at (ai.epin.axon -> <56>.key.axon).
+	if resolver.Enabled() {
+		p.Resolve = resolver.Resolve
+		logger.Printf("AXON names: resolving .axon names via %s (contract %s)", resolver.RPC, resolver.Contract)
+	}
 	server := &http.Server{Addr: listen, Handler: p, ReadHeaderTimeout: 30 * time.Second}
 	go func() {
 		<-ctx.Done()

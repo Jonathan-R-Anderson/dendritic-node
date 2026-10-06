@@ -39,6 +39,12 @@ type Handler struct {
 	// can reach for services like /expert. Nil means an empty directory.
 	Peers func() []string
 
+	// Resolve, if set, turns a human `.axon` name (e.g. ai.epin.axon) into its
+	// canonical <56 base32>.key.axon address via the on-chain registry, so a
+	// request for a named host dials the self-certifying address it points at.
+	// Nil means only self-certifying addresses are reachable (the old behaviour).
+	Resolve func(ctx context.Context, host string) (string, error)
+
 	transport *http.Transport
 }
 
@@ -60,6 +66,19 @@ func (h *Handler) dial(ctx context.Context, hostport string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host, port = hostport, "80"
+	}
+	// A human `.axon` name that is not itself a self-certifying address is resolved
+	// through the on-chain registry to its <56 base32>.key.axon address first; the
+	// checks below then apply to that resolved, self-certifying host.
+	if h.Resolve != nil {
+		if _, perr := identity.ParseAddress(host); perr != nil &&
+			strings.HasSuffix(strings.ToLower(host), ".axon") {
+			resolved, rerr := h.Resolve(ctx, host)
+			if rerr != nil {
+				return nil, rerr
+			}
+			host = resolved
+		}
 	}
 	if _, err := identity.ParseAddress(host); err != nil || !strings.HasSuffix(strings.ToLower(host), ".key.axon") {
 		return nil, ErrNotAxon

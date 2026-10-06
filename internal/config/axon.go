@@ -54,6 +54,13 @@ type AxonConfig struct {
 	// cluster whose relays all sit on one LAN (e.g. a single /24), where the
 	// diversity rule would otherwise reject every path. Off by default.
 	AllowSameNetwork bool `json:"allow_same_network,omitempty"`
+	// NameRPC and NameContract enable name resolution: a human `.axon` name is
+	// looked up in the AxonTLD registry (contracts/tld) at NameContract over the
+	// Ethereum JSON-RPC NameRPC, and the loopback proxy dials the <56 base32>.key.axon
+	// it points at. Both empty disables names -- only self-certifying addresses
+	// are reachable (the default).
+	NameRPC      string `json:"name_rpc,omitempty"`
+	NameContract string `json:"name_contract,omitempty"`
 }
 
 // DefaultProxyListen is where the AXON proxy listens unless configured.

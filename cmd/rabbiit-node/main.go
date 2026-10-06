@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rabbiit/maniwani/storage-client/internal/axon/names"
 	"github.com/rabbiit/maniwani/storage-client/internal/bootstrap"
 	"github.com/rabbiit/maniwani/storage-client/internal/config"
 	"github.com/rabbiit/maniwani/storage-client/internal/directive"
@@ -193,7 +194,8 @@ func main() {
 			logger.Printf("expert: AXON hidden service unavailable (%v); loopback expert API still up", exErr)
 		}
 		if cfg.Axon.ProxyListen != "" {
-			startAxonProxy(ctx, cfg.Axon.ProxyListen, overlay, expertAddr, logger)
+			startAxonProxy(ctx, cfg.Axon.ProxyListen, overlay, expertAddr,
+				names.New(cfg.Axon.NameRPC, cfg.Axon.NameContract), logger)
 		}
 		node, err = p2p.Open(ctx, cfg.DataDir, p2p.Overlay{Runtime: overlay, Origin: origin}, storageNode, logger)
 		if err == nil {
