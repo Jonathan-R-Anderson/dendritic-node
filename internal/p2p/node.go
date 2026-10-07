@@ -44,6 +44,7 @@ import (
 	"github.com/rabbiit/maniwani/storage-client/internal/dcs"
 	"github.com/rabbiit/maniwani/storage-client/internal/gateway"
 	"github.com/rabbiit/maniwani/storage-client/internal/heartbeat"
+	"github.com/rabbiit/maniwani/storage-client/internal/mirrordisc"
 	"github.com/rabbiit/maniwani/storage-client/internal/place"
 	"github.com/rabbiit/maniwani/storage-client/internal/placement"
 	"github.com/rabbiit/maniwani/storage-client/internal/store"
@@ -695,6 +696,83 @@ func (n *Node) LookupDCSWorker(ctx context.Context, nodeID string) (dcs.WorkerRe
 // coordination.
 func dcsRendezvousCID() (cid.Cid, error) {
 	digest := sha256.Sum256([]byte("rabbiit-dcs-worker-rendezvous/1"))
+	mh, err := multihash.Encode(digest[:], multihash.SHA2_256)
+	if err != nil {
+		return cid.Undef, err
+	}
+	return cid.NewCidV1(cid.Raw, mh), nil
+}
+
+// ConfigureMirrorRecords registers the validator for availability-mirror
+// announcements, so a mirror's claim is validated and selected-by-sequence like
+// a worker record. Register it on every node -- a publisher to store, a client
+// to read.
+func (n *Node) ConfigureMirrorRecords(validator mirrordisc.DHTValidator) error {
+	namespaces, ok := n.dht.Validator.(record.NamespacedValidator)
+	if !ok {
+		return errors.New("DHT does not use namespaced validation")
+	}
+	namespaces[mirrordisc.DHTMirrorNamespace] = validator
+	return nil
+}
+
+// PublishMirror stores this node's signed mirror record under its own per-origin
+// key AND provides the per-origin rendezvous CID, so a client enumerates every
+// mirror of that origin with one FindProviders. Republish before RecordTTL;
+// expired-not-deleted, so a mirror that stops vanishes on its own.
+func (n *Node) PublishMirror(ctx context.Context, rec mirrordisc.MirrorRecord) error {
+	value, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if err := n.dht.PutValue(ctx, mirrordisc.MirrorDHTKey(rec.Origin, rec.NodeID), value); err != nil {
+		return err
+	}
+	rendezvous, err := mirrorRendezvousCID(rec.Origin)
+	if err != nil {
+		return err
+	}
+	return n.dht.Provide(ctx, rendezvous, true)
+}
+
+// FindMirrors discovers mirrors of an origin with no central directory: find the
+// providers of the origin's rendezvous CID, read and verify each one's signed
+// record, and return the valid, unexpired mirror addresses.
+func (n *Node) FindMirrors(ctx context.Context, origin string, limit int) ([]mirrordisc.MirrorRecord, error) {
+	rendezvous, err := mirrorRendezvousCID(origin)
+	if err != nil {
+		return nil, err
+	}
+	validator := mirrordisc.DHTValidator{}
+	seen := map[peer.ID]struct{}{}
+	var mirrors []mirrordisc.MirrorRecord
+	for provider := range n.dht.FindProvidersAsync(ctx, rendezvous, limit) {
+		if _, dup := seen[provider.ID]; dup {
+			continue
+		}
+		seen[provider.ID] = struct{}{}
+		key := mirrordisc.MirrorDHTKey(origin, provider.ID.String())
+		value, err := n.dht.GetValue(ctx, key)
+		if err != nil {
+			continue
+		}
+		if validator.Validate(key, value) != nil {
+			continue
+		}
+		var rec mirrordisc.MirrorRecord
+		if json.Unmarshal(value, &rec) != nil {
+			continue
+		}
+		mirrors = append(mirrors, rec)
+		if limit > 0 && len(mirrors) >= limit {
+			break
+		}
+	}
+	return mirrors, nil
+}
+
+func mirrorRendezvousCID(origin string) (cid.Cid, error) {
+	digest := sha256.Sum256([]byte(mirrordisc.RendezvousLabel(origin)))
 	mh, err := multihash.Encode(digest[:], multihash.SHA2_256)
 	if err != nil {
 		return cid.Undef, err

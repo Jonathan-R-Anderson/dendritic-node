@@ -14,17 +14,28 @@ import (
 	"github.com/rabbiit/maniwani/storage-client/internal/axon/mirror"
 	"github.com/rabbiit/maniwani/storage-client/internal/axon/runtime"
 	"github.com/rabbiit/maniwani/storage-client/internal/config"
+	"github.com/rabbiit/maniwani/storage-client/internal/mirrordisc"
+	"github.com/rabbiit/maniwani/storage-client/internal/p2p"
 )
+
+// startedMirror is a mirror this node is serving, to be announced for
+// decentralized discovery once the DHT-bearing node is open.
+type startedMirror struct {
+	Origin string
+	Addr   string // this node's .axon address for the mirror
+}
 
 // startMirrors brings up an availability mirror for each configured .axon site.
 // Each keeps a signed local snapshot of its origin and serves it -- over the
 // node's own .axon mirror service, and optionally a loopback port -- so the
-// site stays reachable when its origin is offline. Failures are logged and
-// skipped; a bad mirror entry never stops the node.
-func startMirrors(ctx context.Context, overlay *runtime.Runtime, cfg config.Config, logger *log.Logger) {
+// site stays reachable when its origin is offline. It returns the mirrors it
+// started so they can be announced in the DHT. Failures are logged and skipped;
+// a bad mirror entry never stops the node.
+func startMirrors(ctx context.Context, overlay *runtime.Runtime, cfg config.Config, logger *log.Logger) []startedMirror {
 	if len(cfg.Axon.Mirrors) == 0 {
-		return
+		return nil
 	}
+	var started []startedMirror
 	client := policyHTTPClient(overlay) // dials .axon origins over the overlay
 	for _, mc := range cfg.Axon.Mirrors {
 		origin := strings.TrimSpace(mc.Origin)
@@ -60,6 +71,7 @@ func startMirrors(ctx context.Context, overlay *runtime.Runtime, cfg config.Conf
 		if svc, err := overlay.Listen(mirrorSeed(cfg.DataDir, origin)); err == nil {
 			handler := m.Handler()
 			go func() { _ = http.Serve(svc.Listener(), handler) }()
+			started = append(started, startedMirror{Origin: origin, Addr: svc.Addr()})
 			logger.Printf("mirroring %s -> reachable at %s (serves the cached copy when the origin is down)",
 				origin, svc.Addr())
 		} else {
@@ -76,6 +88,59 @@ func startMirrors(ctx context.Context, overlay *runtime.Runtime, cfg config.Conf
 			logger.Printf("mirror %s also served on http://%s", origin, mc.Listen)
 		}
 	}
+	return started
+}
+
+// announceMirrors registers the mirror-discovery validator and, for each mirror
+// this node serves, publishes a signed announcement to the DHT and refreshes it
+// before it expires -- so other nodes find our mirror of an origin with no
+// central directory. Called once the DHT-bearing node is open.
+func announceMirrors(ctx context.Context, node *p2p.Node, started []startedMirror, logger *log.Logger) {
+	if node == nil {
+		return
+	}
+	// Register on every node (publisher or not) so FindMirrors can validate reads.
+	if err := node.ConfigureMirrorRecords(mirrordisc.DHTValidator{}); err != nil {
+		logger.Printf("mirror discovery: validator not registered: %v", err)
+		return
+	}
+	if len(started) == 0 {
+		return
+	}
+	go func() {
+		seq := uint64(time.Now().Unix())
+		publish := func() {
+			for _, sm := range started {
+				seq++
+				rec, err := mirrordisc.Sign(node, mirrordisc.MirrorRecord{
+					Origin: sm.Origin, MirrorAddr: sm.Addr,
+					IssuedAt:  time.Now().Unix(),
+					ExpiresAt: time.Now().Add(mirrordisc.RecordTTL).Unix(),
+					Sequence:  seq,
+				})
+				if err != nil {
+					logger.Printf("mirror discovery: sign %s: %v", sm.Origin, err)
+					continue
+				}
+				if err := node.PublishMirror(ctx, rec); err != nil {
+					logger.Printf("mirror discovery: announce %s: %v", sm.Origin, err)
+					continue
+				}
+				logger.Printf("mirror discovery: announced our mirror of %s (%s)", sm.Origin, sm.Addr)
+			}
+		}
+		publish()
+		t := time.NewTicker(mirrordisc.RecordTTL / 2)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				publish()
+			}
+		}
+	}()
 }
 
 // mirrorSeed derives a stable per-origin AXON service seed, so this node's
