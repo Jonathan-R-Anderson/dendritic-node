@@ -171,17 +171,21 @@ a suspension proposal and shrinks the recommended voting window as temperature
 climbs. Once a trailing window's report-frequency standard deviation drops below
 its mean (the burst has settled), the service COOLS back to a good grade. The
 function is deterministic, so every node derives the same temperature from the
-same shared reports — stigmergic swarm consensus, no coordinator. A policy
-authority still signs the resulting grades into the policy document, and that
-input depends on the decentralised content-report records (`dht/report.go`,
-`§89`) being propagated, which remains the open plumbing.
+same shared reports — stigmergic swarm consensus, no coordinator.
+
+**Reports propagate** over the Kademlia-over-AXON DHT (`internal/reportnet`):
+each reporter PUTs its signed `ContentReport` (`§89`) under a per-(subject,
+reporter) key and PROVIDEs a per-subject rendezvous, so a grader enumerates every
+report about a subject with one lookup (`Node.FindReports`) and feeds them to the
+thermal model (`reportnet.ToSwarmReports`). A policy authority signs the
+resulting grades into the policy document nodes read.
 
 **Mirror discovery is decentralised** (`internal/mirrordisc`): a mirror
-announces itself in the Kademlia-over-AXON DHT under a per-origin rendezvous,
-and a client finds every mirror of an origin with one lookup — no directory,
-reusing the same multi-provider scheme as the DCS worker and gateway registries.
-The transparent client fallback (dial the origin, and on failure fetch from a
-discovered mirror) is the remaining wiring on top of this discovery API.
+announces itself in the DHT under a per-origin rendezvous, and a client finds
+every mirror of an origin with one lookup — no directory. The client fallback is
+wired: the loopback proxy, when an origin is unreachable, retries the request
+against a discovered mirror (which answers from its signed snapshot while the
+origin is down), tagging the response `X-Rabbiit-Served-Via: mirror`.
 
 ## Local exposure
 

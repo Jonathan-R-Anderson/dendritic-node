@@ -54,6 +54,14 @@ type Handler struct {
 	// clearnet refused (ErrNotAxon) — there is no exit.
 	ExitVia string
 
+	// Mirrors, if set, returns the <56 base32>.key.axon addresses of availability
+	// mirrors for a .axon origin. When a plain-HTTP request to an origin fails,
+	// the proxy retries it against a mirror, which serves the origin's content
+	// (live, or from its signed snapshot when the origin is down). Nil disables
+	// the fallback. Only plain-HTTP (absolute-form) requests fall back; a CONNECT
+	// tunnel is opaque and cannot be mirrored.
+	Mirrors func(host string) []string
+
 	transport *http.Transport
 }
 
@@ -204,6 +212,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	out.RequestURI = ""
 	removeHopByHop(out.Header)
 	resp, err := h.transport.RoundTrip(out)
+	viaMirror := false
+	if err != nil && !errors.Is(err, ErrNotAxon) {
+		// The origin is unreachable. If it is a .axon service with known
+		// availability mirrors, serve the request from one instead — the mirror
+		// answers from its signed snapshot when the origin is down.
+		if mresp, ok := h.tryMirrors(out); ok {
+			resp, err, viaMirror = mresp, nil, true
+		}
+	}
 	if err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, ErrNotAxon) {
@@ -219,8 +236,43 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
+	if viaMirror {
+		w.Header().Set("X-Rabbiit-Served-Via", "mirror")
+	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// tryMirrors re-issues a failed request against each known mirror of its origin,
+// returning the first that answers. The mirror is a .axon service that serves
+// the origin's content, so the same path on the mirror returns the same page —
+// from the mirror's verified snapshot when the origin is offline.
+func (h *Handler) tryMirrors(out *http.Request) (*http.Response, bool) {
+	if h.Mirrors == nil {
+		return nil, false
+	}
+	origin := strings.ToLower(out.URL.Hostname())
+	if !strings.HasSuffix(origin, ".axon") {
+		return nil, false
+	}
+	port := out.URL.Port()
+	for _, m := range h.Mirrors(origin) {
+		m = strings.TrimRight(strings.ToLower(strings.TrimSpace(m)), ".")
+		if m == "" || m == origin {
+			continue
+		}
+		mreq := out.Clone(out.Context())
+		if port != "" {
+			mreq.URL.Host = net.JoinHostPort(m, port)
+		} else {
+			mreq.URL.Host = m
+		}
+		mreq.Host = mreq.URL.Host
+		if resp, err := h.transport.RoundTrip(mreq); err == nil {
+			return resp, true
+		}
+	}
+	return nil, false
 }
 
 func (h *Handler) connect(w http.ResponseWriter, r *http.Request) {

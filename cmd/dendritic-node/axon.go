@@ -211,8 +211,13 @@ func fetchOverlaySeeds(ctx context.Context, client *http.Client, url, pinnedKey 
 // startAxonProxy serves the loopback proxy onto the overlay until ctx ends. A
 // port already in use is logged, not fatal: the proxy is a convenience for the
 // person at this machine, and the node's own work does not depend on it.
-func startAxonProxy(ctx context.Context, listen string, rt *runtime.Runtime, selfExpert string, resolver *names.Resolver, exitVia string, logger *log.Logger) {
+func startAxonProxy(ctx context.Context, listen string, rt *runtime.Runtime, selfExpert string, resolver *names.Resolver, exitVia string, mirrors func(string) []string, logger *log.Logger) {
 	p := proxy.New(rt.DialContext)
+	// Transparent availability fallback: when an origin is unreachable, retry the
+	// request against a discovered mirror of it.
+	if mirrors != nil {
+		p.Mirrors = mirrors
+	}
 	// Back the /v1/axon/peers directory praxis uses for discovery: this node's own expert service
 	// (if up) plus any RABBIIT_EXPERT_PEERS the operator configured.
 	p.Peers = func() []string { return expertPeers(selfExpert) }

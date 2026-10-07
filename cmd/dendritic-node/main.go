@@ -211,8 +211,25 @@ func main() {
 		// sites and serve them when their origins are down.
 		startedMirrors := startMirrors(ctx, overlay, cfg, logger)
 		if cfg.Axon.ProxyListen != "" {
+			// Mirror finder: discovers availability mirrors for an origin via the
+			// DHT. node is opened just below, so this closure reads it lazily and
+			// is only ever called once a request is in flight.
+			findMirrors := func(origin string) []string {
+				if node == nil {
+					return nil
+				}
+				recs, err := node.FindMirrors(ctx, origin, 4)
+				if err != nil {
+					return nil
+				}
+				addrs := make([]string, 0, len(recs))
+				for _, r := range recs {
+					addrs = append(addrs, r.MirrorAddr)
+				}
+				return addrs
+			}
 			startAxonProxy(ctx, cfg.Axon.ProxyListen, overlay, expertAddr,
-				names.NewWithPolicy(cfg.Axon.NameRPC, cfg.Axon.NameContract, cfg.Axon.NameSuffixes, cfg.Axon.NameMissingFallback, cfg.Axon.NameLegacyContract), cfg.Axon.ExitVia, logger)
+				names.NewWithPolicy(cfg.Axon.NameRPC, cfg.Axon.NameContract, cfg.Axon.NameSuffixes, cfg.Axon.NameMissingFallback, cfg.Axon.NameLegacyContract), cfg.Axon.ExitVia, findMirrors, logger)
 		}
 		node, err = p2p.Open(ctx, cfg.DataDir, p2p.Overlay{Runtime: overlay, Origin: origin}, storageNode, logger)
 		if err == nil {
