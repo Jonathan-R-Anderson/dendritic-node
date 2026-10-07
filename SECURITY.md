@@ -126,6 +126,50 @@ gateway described below exists for a different purpose — bridging a hidden
 service to *clearnet* visitors over public HTTPS — not for DoS protection of the
 hidden service itself.
 
+### Availability mirrors
+
+A node can keep a signed local snapshot of an `.axon` site and serve it when the
+origin is offline — the hidden-service form of the reverse gateway
+(`internal/axon/mirror`, `axon.mirrors[]`). The origin publishes a
+publisher-signed `/.well-known/rabbiit/snapshot.json` plus its objects over its
+own AXON listener; each mirror node pulls and verifies them (the pinned
+publisher key means a relay cannot feed forged content), serves the origin while
+it is healthy, and falls back to the verified snapshot while it is down. Each
+mirror runs as its own `.axon` service with a stable address, so many nodes
+mirroring one site is what keeps the site reachable — no central CDN, and no DNS
+record anywhere.
+
+### Service routing policy (grades, allow/deny, DAO suspension)
+
+Each node decides which hidden services it will route to, keyed by the service's
+`.key.axon` identity and enforced at the one layer that can see that identity —
+the client's own dial path (`servicepolicy`, `runtime.remoteFor`). The decision
+composes, in order: the operator's deny list, the DAO suspension list, the
+operator's allow list (which bypasses the grade floor), and a per-service grade
+floor. Grades and suspensions arrive in a signed `NetworkPolicy` document
+(ed25519, monotonic sequence, expiry), so no node reads the chain on its dial
+path. Everything is **opt-in and permissive by default**: with nothing
+configured every service is admitted, and a configured-but-not-enforcing node
+logs what it *would* refuse without refusing — consistent with the rest of the
+overlay, where the DHT never moderates and reputation never bans. Because the
+service identity is visible only to the dialing client, this is necessarily the
+operator's own routing choice, not a takedown imposed on the network.
+
+**DAO suspension** of a self-certifying service is recorded on-chain in
+`ServiceSuspension` (`contracts/suspension`), keyed by the 32-byte service key
+and governed by `AxonGovernance` through the same `prune`/`seize`/`restore` seam
+it already drives — `prune` suspends (reversible), `seize` bans (permanent),
+`restore` lifts. A policy authority reads the on-chain suspension set and the
+proposals' evidence and publishes it in the signed document above; nodes apply
+it at the dial gate. This reaches bare `.key.axon` services that `AxonRegistry`
+(which keys on registered names) cannot.
+
+Not yet automated: **grade computation** still requires a policy authority to
+publish grades — the decentralised content-report records (`dht/report.go`,
+`§89`) that would feed an on-chain-free grade are not yet aggregated — and a
+node still learns a **mirror's address** out of band (there is no mirror
+discovery directory yet).
+
 ## Local exposure
 
 Configuration, identity, metadata, and master-key files use owner-only
