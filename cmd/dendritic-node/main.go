@@ -34,6 +34,7 @@ import (
 	"github.com/rabbiit/maniwani/storage-client/internal/heartbeat"
 	"github.com/rabbiit/maniwani/storage-client/internal/monitor"
 	"github.com/rabbiit/maniwani/storage-client/internal/p2p"
+	"github.com/rabbiit/maniwani/storage-client/internal/reportnet"
 	"github.com/rabbiit/maniwani/storage-client/internal/s3api"
 	"github.com/rabbiit/maniwani/storage-client/internal/store"
 	"github.com/rabbiit/maniwani/storage-client/internal/traffic"
@@ -219,6 +220,11 @@ func main() {
 			// Announce our mirrors in the DHT for decentralized discovery (and
 			// register the validator so this node can also find others').
 			announceMirrors(ctx, node, startedMirrors, logger)
+			// Register the content-report validator so reports propagate and can
+			// be graded, on every node (reporter or grader).
+			if err := node.ConfigureReportRecords(reportnet.DHTValidator{}); err != nil {
+				logger.Printf("report propagation: validator not registered: %v", err)
+			}
 		}
 	}
 	if err != nil {

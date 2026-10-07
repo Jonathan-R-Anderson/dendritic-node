@@ -38,6 +38,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 
+	axondht "github.com/rabbiit/maniwani/storage-client/internal/axon/dht"
 	axontransport "github.com/rabbiit/maniwani/storage-client/internal/axon/transport"
 	"github.com/rabbiit/maniwani/storage-client/internal/bootstrap"
 	"github.com/rabbiit/maniwani/storage-client/internal/config"
@@ -47,6 +48,7 @@ import (
 	"github.com/rabbiit/maniwani/storage-client/internal/mirrordisc"
 	"github.com/rabbiit/maniwani/storage-client/internal/place"
 	"github.com/rabbiit/maniwani/storage-client/internal/placement"
+	"github.com/rabbiit/maniwani/storage-client/internal/reportnet"
 	"github.com/rabbiit/maniwani/storage-client/internal/store"
 	"github.com/rabbiit/maniwani/storage-client/internal/traffic"
 )
@@ -773,6 +775,87 @@ func (n *Node) FindMirrors(ctx context.Context, origin string, limit int) ([]mir
 
 func mirrorRendezvousCID(origin string) (cid.Cid, error) {
 	digest := sha256.Sum256([]byte(mirrordisc.RendezvousLabel(origin)))
+	mh, err := multihash.Encode(digest[:], multihash.SHA2_256)
+	if err != nil {
+		return cid.Undef, err
+	}
+	return cid.NewCidV1(cid.Raw, mh), nil
+}
+
+// ConfigureReportRecords registers the validator for content-report DHT records,
+// so a report propagates and is selected-by-sequence like any other record.
+// Register it on every node — a reporter to store, a grader to read.
+func (n *Node) ConfigureReportRecords(validator reportnet.DHTValidator) error {
+	namespaces, ok := n.dht.Validator.(record.NamespacedValidator)
+	if !ok {
+		return errors.New("DHT does not use namespaced validation")
+	}
+	namespaces[reportnet.DHTReportNamespace] = validator
+	return nil
+}
+
+// PublishReport publishes this node's signed content report: PutValue under its
+// own per-subject key AND Provide the per-subject rendezvous CID, so any grader
+// enumerates every report about a subject with one FindReports. The report must
+// already be signed by this node's identity (SignReport), since the record's
+// reporter is bound to the storing node.
+func (n *Node) PublishReport(ctx context.Context, rec axondht.ContentReport) error {
+	value, err := axondht.Encode(&rec)
+	if err != nil {
+		return err
+	}
+	if err := n.dht.PutValue(ctx, reportnet.ReportDHTKey(rec.NameHash, n.ID()), value); err != nil {
+		return err
+	}
+	rendezvous, err := reportRendezvousCID(rec.NameHash)
+	if err != nil {
+		return err
+	}
+	return n.dht.Provide(ctx, rendezvous, true)
+}
+
+// FindReports discovers every valid, unexpired report about a subject: find the
+// providers of the subject's rendezvous CID, read and verify each one's signed
+// report. This is the grader's input — decentralized, with no collector.
+func (n *Node) FindReports(ctx context.Context, nameHash []byte, limit int) ([]*axondht.ContentReport, error) {
+	rendezvous, err := reportRendezvousCID(nameHash)
+	if err != nil {
+		return nil, err
+	}
+	validator := reportnet.DHTValidator{}
+	seen := map[peer.ID]struct{}{}
+	var reports []*axondht.ContentReport
+	for provider := range n.dht.FindProvidersAsync(ctx, rendezvous, limit) {
+		if _, dup := seen[provider.ID]; dup {
+			continue
+		}
+		seen[provider.ID] = struct{}{}
+		key := reportnet.ReportDHTKey(nameHash, provider.ID.String())
+		value, err := n.dht.GetValue(ctx, key)
+		if err != nil {
+			continue
+		}
+		if validator.Validate(key, value) != nil {
+			continue
+		}
+		rec, err := axondht.DecodeRecord(axondht.ClassReport, value)
+		if err != nil {
+			continue
+		}
+		cr, ok := rec.(*axondht.ContentReport)
+		if !ok {
+			continue
+		}
+		reports = append(reports, cr)
+		if limit > 0 && len(reports) >= limit {
+			break
+		}
+	}
+	return reports, nil
+}
+
+func reportRendezvousCID(nameHash []byte) (cid.Cid, error) {
+	digest := sha256.Sum256([]byte(reportnet.RendezvousLabel(nameHash)))
 	mh, err := multihash.Encode(digest[:], multihash.SHA2_256)
 	if err != nil {
 		return cid.Undef, err
