@@ -185,9 +185,12 @@ propagated reports, folds in the DAO's suspensions, signs the service-policy
 document, and serves it over HTTP and its own `.axon` service for other nodes to
 fetch and enforce. Its public key is what nodes pin as
 `service_policy.policy_key`; run several, pinned by different keys, for
-diversity. The on-chain suspension read (from `ServiceSuspension`) is a
-pluggable source — the grading half is wired; feeding on-chain suspensions in is
-the remaining connector.
+diversity. DAO suspensions flow in automatically: with
+`authority.suspension_rpc`/`suspension_contract` set, the authority reads the
+on-chain `ServiceSuspension` set over `eth_call` (`EthSuspensionSource`), maps
+each 32-byte service key to its `.key.axon` address, and folds it into the
+document. The whole governance loop — report → propagate → grade → DAO-suspend →
+sign → fetch → enforce — is now wired end to end.
 
 **Mirror discovery is decentralised** (`internal/mirrordisc`): a mirror
 announces itself in the DHT under a per-origin rendezvous, and a client finds

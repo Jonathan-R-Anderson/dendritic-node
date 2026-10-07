@@ -123,6 +123,11 @@ type AuthorityConfig struct {
 	RebuildSeconds int `json:"rebuild_seconds,omitempty"`
 	// DocTTLSeconds is how long a published document is valid (default 3600).
 	DocTTLSeconds int `json:"doc_ttl_seconds,omitempty"`
+	// SuspensionRPC and SuspensionContract, when both set, let the authority read
+	// the DAO's suspensions from the on-chain ServiceSuspension contract over
+	// JSON-RPC and fold them into the document. Empty publishes grades only.
+	SuspensionRPC      string `json:"suspension_rpc,omitempty"`
+	SuspensionContract string `json:"suspension_contract,omitempty"`
 }
 
 // ServicePolicyConfig is this node's hidden-service routing policy. It is the

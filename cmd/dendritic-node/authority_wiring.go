@@ -42,6 +42,12 @@ func startAuthority(ctx context.Context, overlay *runtime.Runtime, node *p2p.Nod
 		DocTTL:    time.Duration(ac.DocTTLSeconds) * time.Second,
 		Logger:    log.New(logger.Writer(), logger.Prefix()+"authority: ", logger.Flags()),
 	}
+	// Fold the DAO's on-chain suspensions into the document when a chain source
+	// is configured; otherwise the document carries grades only.
+	if ac.SuspensionRPC != "" && ac.SuspensionContract != "" {
+		a.Suspensions = &policyauthority.EthSuspensionSource{RPC: ac.SuspensionRPC, Contract: ac.SuspensionContract}
+		logger.Printf("policy authority: reading DAO suspensions from %s (contract %s)", ac.SuspensionRPC, ac.SuspensionContract)
+	}
 	go a.Run(ctx, time.Duration(ac.RebuildSeconds)*time.Second)
 
 	if ac.Listen != "" {
