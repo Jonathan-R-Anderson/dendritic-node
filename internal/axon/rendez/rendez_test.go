@@ -246,10 +246,15 @@ func TestT63IntroWithoutPuzzleIsDroppedFirst(t *testing.T) {
 	}
 }
 
+// demandingPuzzle always demands a proof and accepts only "right", so the T6.3
+// ordering (puzzle before circuit lookup) can be tested in isolation.
 type demandingPuzzle struct{}
 
-func (demandingPuzzle) Required() bool { return true }
-func (demandingPuzzle) Verify(_ [32]byte, proof []byte) error {
+func (demandingPuzzle) Observe([32]byte)          {}
+func (demandingPuzzle) Demanded([32]byte) bool    { return true }
+func (demandingPuzzle) Required() bool            { return true }
+func (demandingPuzzle) Challenge([32]byte) []byte { return []byte("solve-me") }
+func (demandingPuzzle) Verify(_ [32]byte, _ [32]byte, proof []byte) error {
 	if string(proof) != "right" {
 		return errors.New("bad proof")
 	}

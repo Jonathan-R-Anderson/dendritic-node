@@ -1,5 +1,11 @@
 # Volunteer gateway operations
 
+A gateway bridges a hidden service to **clearnet** visitors over public HTTPS. It
+is not required for denial-of-service protection: every `.axon` service is
+flood-resistant on its own through adaptive proof-of-work admission at its intro
+points (see "Hidden-service flood resistance" in `SECURITY.md`). Run a gateway
+only when you want clearnet users to reach a service by an ordinary web address.
+
 ## Architecture
 
 The storage client keeps one persistent libp2p Ed25519 identity. Kademlia and

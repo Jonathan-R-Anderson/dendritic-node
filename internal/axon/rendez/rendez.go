@@ -188,8 +188,10 @@ func DecodeIntroPlaintext(b []byte) (*IntroPlaintext, error) {
 type Introduce1 struct {
 	Version   uint8
 	AuthKeyID [authKeySize]byte
-	// PuzzleProof is the R10 admission proof. Its FORMAT belongs to P6a; this
-	// package carries it and hands it to a Verifier.
+	// PuzzleProof is the R10 admission proof: a hashcash solution (puzzle.go)
+	// bound to AuthKeyID and X, empty unless the intro point is demanding one
+	// under flood. It is not part of the AAD, so a client can attach it to an
+	// already-sealed INTRODUCE1 and retry without re-encrypting.
 	PuzzleProof []byte
 	// X is the client's ephemeral X25519 public key.
 	X [pubKeySize]byte

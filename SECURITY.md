@@ -97,6 +97,35 @@ The coordinator accepts lease requests only from configured origin peer IDs,
 verifies their embedded Ed25519 libp2p identity signature, applies clock-skew,
 nonce-replay, size, and per-minute limits, and binds each lease to one recipient.
 
+### Hidden-service flood resistance
+
+Every `.axon` service is flood-resistant by construction, with nothing to
+configure and no address to register anywhere. Two properties do the work:
+
+- **No address to attack.** A service is reached through a rendezvous point over
+  three-hop circuits; its intro and rendezvous points are structurally incapable
+  of holding an address (the types have no field for one). There is no origin IP
+  to point a flood at, which is most of what a clearnet reverse proxy buys a
+  conventional site.
+- **Priced introductions.** The one lever an attacker keeps is to pour
+  `INTRODUCE1` cells at a service's intro points. Each intro point caps those per
+  service with a token bucket and, when a service's introduction rate climbs,
+  demands a proof-of-work admission token (`internal/axon/rendez/puzzle.go`). The
+  proof is a hashcash solution bound to the service's auth key and the client's
+  fresh ephemeral, so every introduction needs its own solve and no solution can
+  be replayed onto another. The intro point verifies it in a single SHA-256 and
+  keeps no per-client state, so a flood costs the attacker CPU proportional to
+  its size while the relay's cost stays flat. The difficulty is adaptive and
+  per-service: it is zero while a service is unattacked — honest clients pay
+  nothing — and ramps up only under pressure, and only for the targeted service,
+  never its neighbours on the same relay.
+
+This is why a service does **not** need a volunteer clearnet gateway, nor any
+record under `rabbiit.io`'s DNS, to withstand a denial-of-service attempt. The
+gateway described below exists for a different purpose — bridging a hidden
+service to *clearnet* visitors over public HTTPS — not for DoS protection of the
+hidden service itself.
+
 ## Local exposure
 
 Configuration, identity, metadata, and master-key files use owner-only

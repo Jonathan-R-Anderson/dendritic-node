@@ -291,6 +291,45 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// Introduction admission puzzle (R10 / P6a)
+// ---------------------------------------------------------------------------
+//
+// A hidden service exposes no address: the intro point and rendezvous point are
+// structurally blind (T6.1, T6.2), so there is nothing to flood directly. The
+// ONE lever an attacker keeps is INTRODUCE1 pressure at a service's intro
+// points, hoping to exhaust its rendezvous machinery. The rate limiter caps
+// that per auth key; the puzzle PRICES it, turning a cheap flood into one that
+// costs the attacker CPU proportional to its size while the intro point pays a
+// single hash per arrival and holds no per-client state.
+//
+// It is adaptive on purpose. A puzzle that is always on taxes every honest
+// client to defend against an attack that may not be happening, so it stays OFF
+// while arrivals for a service hold below IntroPuzzleOnRate and ramps from
+// IntroPuzzleMinBits to IntroPuzzleMaxBits as the rate climbs to
+// IntroPuzzleFullRate. This is a defence knob, not wire format: changing it
+// changes how hard a service is to flood, not how an INTRODUCE1 is encoded.
+const (
+	// IntroPuzzleSeedPeriod rotates the public per-intro-point puzzle seed.
+	// Rotation bounds how far ahead an attacker can precompute solutions; the
+	// previous period's seed stays valid for one period to cover in-flight
+	// introductions and clock skew.
+	IntroPuzzleSeedPeriod = 10 * time.Minute
+	// IntroPuzzleMinBits is the difficulty (leading zero bits of SHA-256) the
+	// moment a service's introduction rate crosses IntroPuzzleOnRate.
+	IntroPuzzleMinBits = 8
+	// IntroPuzzleMaxBits caps the difficulty so an honest client's solve stays
+	// sub-second even under a maximal flood. 24 bits is ~16M hashes.
+	IntroPuzzleMaxBits = 24
+	// IntroPuzzleOnRate is the per-service introduction rate (per second) below
+	// which no proof is demanded -- the common case, where honest clients pay
+	// nothing.
+	IntroPuzzleOnRate = 20.0
+	// IntroPuzzleFullRate is the per-service introduction rate at which the full
+	// IntroPuzzleMaxBits difficulty is demanded.
+	IntroPuzzleFullRate = 200.0
+)
+
+// ---------------------------------------------------------------------------
 // Epochs and time periods (sections 5.4, 7.2)
 // ---------------------------------------------------------------------------
 

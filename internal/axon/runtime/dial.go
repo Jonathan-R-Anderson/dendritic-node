@@ -248,11 +248,29 @@ func (r *remote) introduce(ctx context.Context, pt *rendez.IntroPlaintext) ([32]
 			continue
 		}
 		rep, err := cc.request(ctx, circuit.RCmdIntroduce1, m.Encode(), circuit.RCmdIntroduceAck)
-		cc.close()
 		if err != nil {
+			cc.close()
 			continue
 		}
 		ack, err := rendez.DecodeIntroduceAck(rep.Data)
+		if err != nil {
+			cc.close()
+			continue
+		}
+		// The service is under a flood and its intro point is demanding a
+		// proof-of-work admission token. Solve it -- bound to this exact
+		// introduction (auth key + our ephemeral X) -- and retry once on the
+		// same circuit. The cost is ours, incurred only while the service is
+		// actually being attacked.
+		if ack.Status == rendez.AckPuzzleRequired {
+			if proof, ok := rendez.SolvePuzzle(ack.PuzzleParams, ip.authKey, m.X); ok {
+				m.PuzzleProof = proof
+				if rep, err = cc.request(ctx, circuit.RCmdIntroduce1, m.Encode(), circuit.RCmdIntroduceAck); err == nil {
+					ack, err = rendez.DecodeIntroduceAck(rep.Data)
+				}
+			}
+		}
+		cc.close()
 		if err != nil || ack.Status != rendez.AckOK {
 			continue
 		}

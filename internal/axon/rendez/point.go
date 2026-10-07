@@ -27,29 +27,43 @@ type CircuitRef uint64
 // Intro point
 // -----------------------------------------------------------------------------
 
-// PuzzleVerifier checks an INTRODUCE1 admission proof (R10).
-//
-// The puzzle itself is P6a / PAR-16 and is NOT built here. This interface is the
+// PuzzleVerifier prices an INTRODUCE1 flood (R10). It is the admission proof
 // seam: the IP must be able to reject before doing any work, and that decision
-// has to be somebody's, so it is named rather than inlined.
+// has to be somebody's, so it is named rather than inlined. AdaptivePuzzle in
+// puzzle.go is the production implementation (P6a); tests supply their own.
+//
+// Every method runs on the hot path, before the circuit lookup, so each must be
+// O(1) and hold no per-client state beyond a bounded per-service estimate --
+// otherwise the verifier becomes the very memory-exhaustion target it exists to
+// prevent.
 type PuzzleVerifier interface {
-	// Verify reports whether the proof admits this introduction. It must be
-	// cheap: it runs before anything else, on every INTRODUCE1, including the
-	// flood.
-	Verify(authKey [32]byte, proof []byte) error
-	// Required reports whether a proof is currently demanded. A puzzle that is
-	// always on taxes every honest client to defend against an attack that may
-	// not be happening.
+	// Observe records that an INTRODUCE1 for authKey arrived, updating the
+	// adaptive pressure estimate that drives Demanded and Challenge.
+	Observe(authKey [authKeySize]byte)
+	// Demanded reports whether a proof is currently required for authKey. It is
+	// false whenever that service's introduction rate is low, so honest clients
+	// of an unattacked service pay nothing.
+	Demanded(authKey [authKeySize]byte) bool
+	// Verify reports whether proof admits THIS introduction. The proof is bound
+	// to authKey and the client's fresh ephemeral x, so every introduction needs
+	// its own solve and a solved proof cannot be replayed onto another.
+	Verify(authKey [authKeySize]byte, x [pubKeySize]byte, proof []byte) error
+	// Challenge is the params a client needs to solve for authKey -- the public
+	// seed and the demanded difficulty -- carried in INTRODUCE_ACK.PuzzleParams.
+	// It returns nil when no proof is demanded.
+	Challenge(authKey [authKeySize]byte) []byte
+	// Required reports whether this verifier provides admission control at all;
+	// a verifier that can never demand a proof is as unsafe as none.
 	Required() bool
 }
 
 // UnsafeNoPuzzle is the declared mode when no verifier is configured.
 //
-// R10 REQUIRES INTRODUCE1 to be rate-limited by a puzzle or token. Running
-// without one is permitted while P6a is unbuilt, and it is a known-unsafe mode
-// rather than a default: the IP still rate-limits, but a flood costs the
-// attacker nothing but bandwidth.
-const UnsafeNoPuzzle = "no-intro-puzzle: INTRODUCE1 admission is rate-limited only (R10 unmet until P6a)"
+// R10 REQUIRES INTRODUCE1 to be priced by a puzzle or token. An intro point
+// wired with an AdaptivePuzzle is never in this mode; it is reported only for a
+// point left with a nil Puzzle (tests, and bring-up), where the limiter still
+// caps arrivals but a flood costs the attacker nothing but bandwidth.
+const UnsafeNoPuzzle = "no-intro-puzzle: INTRODUCE1 admission is rate-limited only (R10 unmet)"
 
 // IntroPoint is a relay hosting introductions for services.
 type IntroPoint struct {
@@ -100,12 +114,15 @@ func (ip *IntroPoint) Teardown(authKey [authKeySize]byte) {
 // implementation that looked up the circuit first would do work proportional to
 // the flood, which is the attack the puzzle exists to price.
 func (ip *IntroPoint) Admit(msg *Introduce1) (CircuitRef, AckStatus, error) {
-	if ip.Puzzle != nil && ip.Puzzle.Required() {
-		if len(msg.PuzzleProof) == 0 {
-			return 0, AckPuzzleRequired, ErrPuzzleRequired
-		}
-		if err := ip.Puzzle.Verify(msg.AuthKeyID, msg.PuzzleProof); err != nil {
-			return 0, AckPuzzleRequired, fmt.Errorf("%w: %v", ErrPuzzleInvalid, err)
+	if ip.Puzzle != nil {
+		ip.Puzzle.Observe(msg.AuthKeyID)
+		if ip.Puzzle.Demanded(msg.AuthKeyID) {
+			if len(msg.PuzzleProof) == 0 {
+				return 0, AckPuzzleRequired, ErrPuzzleRequired
+			}
+			if err := ip.Puzzle.Verify(msg.AuthKeyID, msg.X, msg.PuzzleProof); err != nil {
+				return 0, AckPuzzleRequired, fmt.Errorf("%w: %v", ErrPuzzleInvalid, err)
+			}
 		}
 	}
 	if ip.Limit != nil && !ip.Limit.Allow(msg.AuthKeyID) {
@@ -119,6 +136,15 @@ func (ip *IntroPoint) Admit(msg *Introduce1) (CircuitRef, AckStatus, error) {
 		return 0, AckUnknownAuthKey, ErrUnknownAuthKey
 	}
 	return c, AckOK, nil
+}
+
+// ChallengeParams is the puzzle challenge to attach to a PUZZLE_REQUIRED ack so
+// the client can solve, or nil when no verifier is configured.
+func (ip *IntroPoint) ChallengeParams(authKey [authKeySize]byte) []byte {
+	if ip.Puzzle == nil {
+		return nil
+	}
+	return ip.Puzzle.Challenge(authKey)
 }
 
 // Forward produces the INTRODUCE2 body: the INTRODUCE1 verbatim plus the IP's

@@ -64,6 +64,11 @@ func newRelay(rt *Runtime) *relay {
 		byRef: map[rendez.CircuitRef]*relayCirc{},
 	}
 	r.intro.Limit = rendez.NewRateLimiter(50, 100, nil)
+	// Every relay that hosts introductions prices a flood adaptively, so DoS
+	// resistance is a property of the overlay rather than something a service
+	// must arrange (R10). The puzzle stays off until a service is actually under
+	// pressure, so honest clients normally pay nothing.
+	r.intro.Puzzle = rendez.NewAdaptivePuzzle()
 	go r.housekeeping()
 	return r
 }
@@ -331,15 +336,19 @@ func (r *relay) terminal(c *relayCirc, msg *circuit.RelayCell) error {
 			return err
 		}
 		svcRef, status, _ := r.intro.Admit(m)
+		var puzzle []byte
 		if status == rendez.AckOK {
 			if svc := r.lookup(svcRef); svc != nil {
 				svc.sendBackward(rendez.RelayCell(circuit.RCmdIntroduce2, encodeIntroduce2(m, status)))
 			} else {
 				status = rendez.AckUnknownAuthKey
 			}
+		} else if status == rendez.AckPuzzleRequired {
+			// Hand the client the challenge it must solve to be admitted.
+			puzzle = r.intro.ChallengeParams(m.AuthKeyID)
 		}
 		return c.sendBackward(rendez.RelayCell(circuit.RCmdIntroduceAck,
-			(&rendez.IntroduceAck{Status: status}).Encode()))
+			(&rendez.IntroduceAck{Status: status, PuzzleParams: puzzle}).Encode()))
 	case circuit.RCmdEstablishRendezvous:
 		e, err := rendez.DecodeEstablishRendezvous(msg.Data)
 		if err != nil {
