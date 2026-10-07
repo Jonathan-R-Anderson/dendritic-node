@@ -242,6 +242,8 @@ func main() {
 			if err := node.ConfigureReportRecords(reportnet.DHTValidator{}); err != nil {
 				logger.Printf("report propagation: validator not registered: %v", err)
 			}
+			// Run the policy authority when this node is configured as one.
+			startAuthority(ctx, overlay, node, cfg, logger)
 		}
 	}
 	if err != nil {

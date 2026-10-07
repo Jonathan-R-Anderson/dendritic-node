@@ -98,6 +98,31 @@ type AxonConfig struct {
 	// Mirrors are AXON hidden services this node keeps an available local copy
 	// of (reverse-gateway snapshots). Empty: this node mirrors nothing.
 	Mirrors []MirrorConfig `json:"mirrors,omitempty"`
+	// Authority, when enabled, runs the policy authority on this node: it grades
+	// the watched services from their propagated reports, folds in DAO
+	// suspensions, and serves the signed service-policy document other nodes
+	// fetch. Most nodes leave this off. See AuthorityConfig.
+	Authority AuthorityConfig `json:"authority,omitempty"`
+}
+
+// AuthorityConfig runs the policy authority — the component that turns the
+// network's content reports into the signed grade/suspension document nodes
+// enforce. Run one (or several, each pinned by a different key); its public key
+// is what other nodes pin as service_policy.policy_key.
+type AuthorityConfig struct {
+	// Enabled turns the authority on for this node.
+	Enabled bool `json:"enabled,omitempty"`
+	// Listen is an HTTP address to serve the signed document on (e.g.
+	// 0.0.0.0:4600). The document is also served over this node's own .axon
+	// service regardless, so a node can fetch it over the overlay.
+	Listen string `json:"listen,omitempty"`
+	// Watchlist is the set of <56 base32>.key.axon services to grade. Empty
+	// publishes an empty document (only DAO suspensions, if any source is wired).
+	Watchlist []string `json:"watchlist,omitempty"`
+	// RebuildSeconds is how often to recompute and re-sign (default: half the TTL).
+	RebuildSeconds int `json:"rebuild_seconds,omitempty"`
+	// DocTTLSeconds is how long a published document is valid (default 3600).
+	DocTTLSeconds int `json:"doc_ttl_seconds,omitempty"`
 }
 
 // ServicePolicyConfig is this node's hidden-service routing policy. It is the

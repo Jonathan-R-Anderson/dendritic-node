@@ -43,6 +43,24 @@ type Suspension struct {
 
 const policySchema = "rabbiit/service-policy/1"
 
+// NewSignedDocument builds and signs a policy document — the call a policy
+// authority makes once it has computed grades and gathered suspensions. It sets
+// the schema, stamps the times, and signs with the authority key nodes pin.
+func NewSignedDocument(sequence uint64, issuedAt, expiresAt time.Time,
+	grades map[string]int, suspended map[string]Suspension, key ed25519.PrivateKey) (*NetworkPolicy, error) {
+	d := &NetworkPolicy{
+		Schema: policySchema, Sequence: sequence,
+		IssuedAt: issuedAt.Unix(), Grades: grades, Suspended: suspended,
+	}
+	if !expiresAt.IsZero() {
+		d.ExpiresAt = expiresAt.Unix()
+	}
+	if err := d.Sign(key); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
 func (d *NetworkPolicy) gradeOf(normAddr string) int {
 	if d == nil || d.Grades == nil {
 		return -1

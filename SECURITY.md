@@ -177,8 +177,17 @@ same shared reports — stigmergic swarm consensus, no coordinator.
 each reporter PUTs its signed `ContentReport` (`§89`) under a per-(subject,
 reporter) key and PROVIDEs a per-subject rendezvous, so a grader enumerates every
 report about a subject with one lookup (`Node.FindReports`) and feeds them to the
-thermal model (`reportnet.ToSwarmReports`). A policy authority signs the
-resulting grades into the policy document nodes read.
+thermal model (`reportnet.ToSwarmReports`).
+
+**The policy authority** (`internal/policyauthority`, `axon.authority`) closes
+the loop: a node configured as one grades its watched services from those
+propagated reports, folds in the DAO's suspensions, signs the service-policy
+document, and serves it over HTTP and its own `.axon` service for other nodes to
+fetch and enforce. Its public key is what nodes pin as
+`service_policy.policy_key`; run several, pinned by different keys, for
+diversity. The on-chain suspension read (from `ServiceSuspension`) is a
+pluggable source — the grading half is wired; feeding on-chain suspensions in is
+the remaining connector.
 
 **Mirror discovery is decentralised** (`internal/mirrordisc`): a mirror
 announces itself in the DHT under a per-origin rendezvous, and a client finds
