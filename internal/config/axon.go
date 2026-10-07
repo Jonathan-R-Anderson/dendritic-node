@@ -91,6 +91,42 @@ type AxonConfig struct {
 	// the loopback proxy) THROUGH the exit at this address, as <56 base32>.key.axon
 	// or <addr>:port. Empty keeps the default: clearnet is refused, there is no exit.
 	ExitVia string `json:"exit_via,omitempty"`
+	// ServicePolicy decides which hidden services THIS node will route to -- a
+	// grade floor, operator allow/deny, and the DAO suspension list. Empty/omitted
+	// admits every service (the default). See ServicePolicyConfig.
+	ServicePolicy ServicePolicyConfig `json:"service_policy,omitempty"`
+}
+
+// ServicePolicyConfig is this node's hidden-service routing policy. It is the
+// operator's own choice: a service's identity is visible only on the dialing
+// client, so there is nothing a node can enforce here except its OWN routing.
+// With nothing set the node routes to every service.
+type ServicePolicyConfig struct {
+	// Enforce makes refusals real. The default (false) is LOG-ONLY: the node
+	// records what it would refuse and routes anyway, so a new policy can be
+	// rolled out and watched before it can cut anyone off.
+	Enforce bool `json:"enforce,omitempty"`
+	// MinGrade refuses services graded below a floor: "" (no floor), a letter
+	// A–F, or a number 0–100. Grades come from the signed policy document.
+	MinGrade string `json:"min_grade,omitempty"`
+	// DenyUnknown refuses a service that has no grade in the document. Off by
+	// default -- on a young network most services are ungraded and legitimate.
+	DenyUnknown bool `json:"deny_unknown,omitempty"`
+	// Allow lists services (<56 base32>.key.axon) that bypass the grade floor.
+	// It does NOT override a DAO suspension or the Deny list.
+	Allow []string `json:"allow,omitempty"`
+	// Deny lists services this node always refuses, whatever their grade.
+	Deny []string `json:"deny,omitempty"`
+	// PolicyURL is where the signed grade+suspension document is fetched from:
+	// an https:// URL or an http://<56 base32>.key.axon/... URL served over the
+	// overlay. Empty means grades/suspensions come from no network source (only
+	// the local Allow/Deny lists apply).
+	PolicyURL string `json:"policy_url,omitempty"`
+	// PolicyKey is the base64 ed25519 public key the policy document must be
+	// signed with. Required when PolicyURL is set.
+	PolicyKey string `json:"policy_key,omitempty"`
+	// PollSeconds is how often to refresh the document (default 600).
+	PollSeconds int `json:"poll_seconds,omitempty"`
 }
 
 // DefaultProxyListen is where the AXON proxy listens unless configured.

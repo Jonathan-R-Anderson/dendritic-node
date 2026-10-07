@@ -49,6 +49,10 @@ func startOverlay(ctx context.Context, cfg config.Config, relay bool, logger *lo
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, "", err
 	}
+	policy, err := buildServicePolicy(cfg.Axon, logger)
+	if err != nil {
+		return nil, "", err
+	}
 	delay := 15 * time.Second
 	for {
 		seeds := overlaySeedsFor(ctx, cfg, dir, logger)
@@ -63,6 +67,9 @@ func startOverlay(ctx context.Context, cfg config.Config, relay bool, logger *lo
 			Hops:             cfg.Axon.Hops,
 			AllowSameNetwork: cfg.Axon.AllowSameNetwork,
 			Logger:           log.New(logger.Writer(), logger.Prefix()+"axon: ", logger.Flags()),
+		}
+		if policy != nil {
+			rc.Gate = policy
 		}
 		rt, err := runtime.Start(ctx, rc)
 		if err == nil {
@@ -79,6 +86,9 @@ func startOverlay(ctx context.Context, cfg config.Config, relay bool, logger *lo
 				for _, addr := range relayPublishAddrs(cfg.Axon.Announce, rt) {
 					logger.Printf("AXON relay: other nodes can join through %s", addr)
 				}
+			}
+			if err := startPolicyLoader(ctx, rt, cfg.Axon, policy, logger); err != nil {
+				logger.Printf("service policy document loader not started: %v", err)
 			}
 			return rt, seeds.Origin, nil
 		}

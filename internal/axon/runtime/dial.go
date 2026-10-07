@@ -80,6 +80,14 @@ func (rt *Runtime) remoteFor(ctx context.Context, addr string) (*remote, error) 
 		return nil, err
 	}
 	key := strings.ToLower(identity.FullAddress(pub))
+	// Routing policy is enforced here and only here: this is the one layer that
+	// knows the service's true identity (the HSDir and intro point do not), so a
+	// grade floor or a DAO suspension can act nowhere else.
+	if g := rt.cfg.Gate; g != nil {
+		if blocked, reason := g.Gate(key); blocked {
+			return nil, fmt.Errorf("axon/runtime: routing to %s refused by policy: %s", addr, reason)
+		}
+	}
 	rt.mu.Lock()
 	r := rt.dials[key]
 	if r != nil {

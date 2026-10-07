@@ -49,6 +49,17 @@ import (
 	"github.com/rabbiit/maniwani/storage-client/internal/axon/session"
 )
 
+// ServiceGate decides whether this node will route to a hidden service, keyed by
+// the service's <56 base32>.key.axon address. It is consulted on every dial, so
+// it must be cheap and must not block. A blocked verdict refuses the dial with
+// its reason. Implemented by internal/axon/servicepolicy; nil admits every
+// service (the default). This is the ONE enforcement point at which a grade
+// floor or a DAO suspension can act, because the client's dial path is the only
+// layer that sees the service's true identity.
+type ServiceGate interface {
+	Gate(addr string) (blocked bool, reason string)
+}
+
 // Config describes one node.
 type Config struct {
 	// DataDir holds node.key (the master seed), the pinned guard and service
@@ -75,6 +86,9 @@ type Config struct {
 	// test network on one machine, never for a real one.
 	AllowSameNetwork bool
 	Logger           *log.Logger
+	// Gate, when set, vets each service this node is about to dial (grade floor,
+	// DAO suspension, operator allow/deny). nil admits every service.
+	Gate ServiceGate
 }
 
 // Runtime is one running node.
