@@ -206,6 +206,9 @@ func main() {
 				logger.Printf("exit: AXON hidden service unavailable: %v", exErr)
 			}
 		}
+		// Availability mirrors: keep a signed local copy of configured .axon
+		// sites and serve them when their origins are down.
+		startMirrors(ctx, overlay, cfg, logger)
 		if cfg.Axon.ProxyListen != "" {
 			startAxonProxy(ctx, cfg.Axon.ProxyListen, overlay, expertAddr,
 				names.NewWithPolicy(cfg.Axon.NameRPC, cfg.Axon.NameContract, cfg.Axon.NameSuffixes, cfg.Axon.NameMissingFallback, cfg.Axon.NameLegacyContract), cfg.Axon.ExitVia, logger)

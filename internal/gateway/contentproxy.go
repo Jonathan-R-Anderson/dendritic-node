@@ -132,6 +132,15 @@ func NewContentProxy(origin *url.URL, serverName, nodeID string, originAddress s
 	}
 }
 
+// UseClient replaces the HTTP client the proxy fetches the origin with, so a
+// caller can reach an origin over the AXON overlay (an <56 base32>.key.axon
+// address) rather than a pinned clearnet address. A nil client is ignored.
+func (p *ContentProxy) UseClient(client *http.Client) {
+	if client != nil {
+		p.client = client
+	}
+}
+
 func (p *ContentProxy) denied(path string) bool {
 	lowered := strings.ToLower(path)
 	for _, prefix := range p.deniedPath {

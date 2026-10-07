@@ -95,6 +95,9 @@ type AxonConfig struct {
 	// grade floor, operator allow/deny, and the DAO suspension list. Empty/omitted
 	// admits every service (the default). See ServicePolicyConfig.
 	ServicePolicy ServicePolicyConfig `json:"service_policy,omitempty"`
+	// Mirrors are AXON hidden services this node keeps an available local copy
+	// of (reverse-gateway snapshots). Empty: this node mirrors nothing.
+	Mirrors []MirrorConfig `json:"mirrors,omitempty"`
 }
 
 // ServicePolicyConfig is this node's hidden-service routing policy. It is the
@@ -127,6 +130,33 @@ type ServicePolicyConfig struct {
 	PolicyKey string `json:"policy_key,omitempty"`
 	// PollSeconds is how often to refresh the document (default 600).
 	PollSeconds int `json:"poll_seconds,omitempty"`
+}
+
+// MirrorConfig makes this node an availability mirror for one AXON hidden
+// service: it keeps a signed local snapshot of that .axon site and serves it
+// (over its OWN .axon service, and optionally a loopback port) when the origin
+// is down. Many nodes mirroring one site is what keeps the site reachable.
+type MirrorConfig struct {
+	// Origin is the service to mirror, "<56 base32>.key.axon". The origin must
+	// publish a publisher-signed /.well-known/rabbiit/snapshot.json over its own
+	// AXON HTTP listener for the mirror to copy.
+	Origin string `json:"origin"`
+	// PublisherKey is the base64 ed25519 key the origin's snapshots are signed
+	// with. Required: it pins the snapshot so a relay cannot feed forged content.
+	PublisherKey string `json:"publisher_key"`
+	// CacheDir is where the local copy lives (default <data_dir>/mirror/<origin>).
+	CacheDir string `json:"cache_dir,omitempty"`
+	// PollSeconds is how often to look for a newer snapshot (default 600).
+	PollSeconds int `json:"poll_seconds,omitempty"`
+	// MaxObjectBytes caps one cached object (default 8 MiB).
+	MaxObjectBytes int64 `json:"max_object_bytes,omitempty"`
+	// Offload serves publisher-approved routes from the snapshot even while the
+	// origin is up, taking read load off it. Off by default (origin-first).
+	Offload bool `json:"offload,omitempty"`
+	// Listen optionally also serves the mirror on a loopback HTTP address
+	// (e.g. 127.0.0.1:4490) so a local browser can read it; empty serves only
+	// over the node's own .axon mirror service.
+	Listen string `json:"listen,omitempty"`
 }
 
 // DefaultProxyListen is where the AXON proxy listens unless configured.

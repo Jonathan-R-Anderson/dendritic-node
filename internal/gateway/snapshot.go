@@ -147,6 +147,16 @@ func (c *SnapshotCache) Enabled() bool {
 	return c != nil && len(c.PublisherKey) == ed25519.PublicKeySize && c.Dir != ""
 }
 
+// UseClient replaces the HTTP client manifests and objects are fetched with, so
+// a caller can point the cache at an origin reached over the AXON overlay (an
+// <56 base32>.key.axon address served plain HTTP) instead of clearnet. A nil
+// client is ignored, leaving the default.
+func (c *SnapshotCache) UseClient(client *http.Client) {
+	if client != nil {
+		c.client = client
+	}
+}
+
 // Manifest returns the currently held snapshot, or nil.
 func (c *SnapshotCache) Manifest() *SnapshotManifest {
 	c.mu.RLock()
