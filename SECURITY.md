@@ -164,11 +164,24 @@ proposals' evidence and publishes it in the signed document above; nodes apply
 it at the dial gate. This reaches bare `.key.axon` services that `AxonRegistry`
 (which keys on registered names) cannot.
 
-Not yet automated: **grade computation** still requires a policy authority to
-publish grades — the decentralised content-report records (`dht/report.go`,
-`§89`) that would feed an on-chain-free grade are not yet aggregated — and a
-node still learns a **mirror's address** out of band (there is no mirror
-discovery directory yet).
+**Grades are computed by a swarm/thermal model** (`internal/axon/swarmscore`).
+Report frequency HEATS a service — faster when the frequency is accelerating —
+which lowers its grade and accelerates the DAO: above a threshold it recommends
+a suspension proposal and shrinks the recommended voting window as temperature
+climbs. Once a trailing window's report-frequency standard deviation drops below
+its mean (the burst has settled), the service COOLS back to a good grade. The
+function is deterministic, so every node derives the same temperature from the
+same shared reports — stigmergic swarm consensus, no coordinator. A policy
+authority still signs the resulting grades into the policy document, and that
+input depends on the decentralised content-report records (`dht/report.go`,
+`§89`) being propagated, which remains the open plumbing.
+
+**Mirror discovery is decentralised** (`internal/mirrordisc`): a mirror
+announces itself in the Kademlia-over-AXON DHT under a per-origin rendezvous,
+and a client finds every mirror of an origin with one lookup — no directory,
+reusing the same multi-provider scheme as the DCS worker and gateway registries.
+The transparent client fallback (dial the origin, and on failure fetch from a
+discovered mirror) is the remaining wiring on top of this discovery API.
 
 ## Local exposure
 
